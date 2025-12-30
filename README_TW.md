@@ -239,7 +239,7 @@ docker-compose up -d --build
 ```powershell
 git clone https://github.com/brokermr810/QuantDinger.git
 cd QuantDinger
-Copy-Item docker.env.example backend_api_python/.env
+Copy-Item docker.env.example -Destination backend_api_python\.env
 docker-compose up -d --build
 ```
 
