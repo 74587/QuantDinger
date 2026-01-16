@@ -354,8 +354,16 @@ def summary():
                 """,
                 (user_id,)
             )
-            recent_trades = cur.fetchall() or []
+            recent_trades_raw = cur.fetchall() or []
             cur.close()
+        
+        # Convert datetime to timestamp for frontend compatibility
+        recent_trades = []
+        for t in recent_trades_raw:
+            trade = dict(t)
+            if trade.get('created_at') and hasattr(trade['created_at'], 'timestamp'):
+                trade['created_at'] = int(trade['created_at'].timestamp())
+            recent_trades.append(trade)
 
         # Compute performance statistics
         perf_stats = _compute_performance_stats(recent_trades)

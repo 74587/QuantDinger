@@ -992,12 +992,20 @@ export default {
     formatTime (timestamp) {
       if (!timestamp) return '-'
       try {
-        const raw = typeof timestamp === 'string' ? parseInt(timestamp, 10) : Number(timestamp)
-        if (!raw || Number.isNaN(raw)) return '-'
-        const ms = raw < 1e12 ? raw * 1000 : raw
-        const d = new Date(ms)
-        if (isNaN(d.getTime())) return '-'
-        return d.toLocaleString()
+        let date
+        // Handle ISO 8601 date strings (e.g., "2024-01-17T01:58:10.000Z")
+        if (typeof timestamp === 'string' && timestamp.includes('-') && timestamp.includes(':')) {
+          date = new Date(timestamp)
+        } else if (typeof timestamp === 'number' || (typeof timestamp === 'string' && /^\d+$/.test(timestamp))) {
+          // Handle numeric timestamps (seconds or milliseconds)
+          const numTimestamp = typeof timestamp === 'string' ? parseInt(timestamp, 10) : timestamp
+          const ms = numTimestamp < 1e12 ? numTimestamp * 1000 : numTimestamp
+          date = new Date(ms)
+        } else {
+          return '-'
+        }
+        if (isNaN(date.getTime())) return '-'
+        return date.toLocaleString()
       } catch (e) {
         return '-'
       }
