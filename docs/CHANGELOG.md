@@ -39,6 +39,8 @@ This document records version updates, new features, bug fixes, and database mig
 - Fixed A-share and H-share data fetching with multiple fallback sources
 - Fixed watchlist price batch fetch timeout handling
 - Fixed heatmap multi-language support for commodities and forex
+- **Fixed AI analysis history not filtered by user** - All users were seeing the same history records; now each user only sees their own analysis history
+- **Fixed "Missing Turnstile token" error when changing password** - Logged-in users no longer need Turnstile verification to request password change verification code
 
 ### 🎨 UI/UX Improvements
 - Reorganized left menu: Indicator Market moved below Indicator Analysis, Settings moved to bottom
@@ -92,9 +94,21 @@ BEGIN
     END IF;
 END $$;
 
+-- Add user_id column for user-specific history filtering
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_analysis_memory' AND column_name = 'user_id'
+    ) THEN
+        ALTER TABLE qd_analysis_memory ADD COLUMN user_id INT;
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_analysis_memory_symbol ON qd_analysis_memory(market, symbol);
 CREATE INDEX IF NOT EXISTS idx_analysis_memory_created ON qd_analysis_memory(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_analysis_memory_validated ON qd_analysis_memory(validated_at) WHERE validated_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_analysis_memory_user ON qd_analysis_memory(user_id);
 
 -- 2. Indicator Purchase Records
 CREATE TABLE IF NOT EXISTS qd_indicator_purchases (
