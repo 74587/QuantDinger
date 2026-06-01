@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from app.services.grid.exchange_orders import query_grid_order_fill
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bybit import BybitClient
@@ -54,9 +56,10 @@ def test_query_grid_order_fill_okx_filled():
     client.__class__ = OkxClient
     client.get_order.return_value = {
         "state": "filled",
-        "accFillSz": "0.05",
+        "accFillSz": "5",
         "avgPx": "65000.1",
     }
+    client.get_instrument.return_value = {"ctVal": "0.01"}
     filled, avg, status = query_grid_order_fill(
         client,
         symbol="BTC/USDT",
@@ -64,7 +67,7 @@ def test_query_grid_order_fill_okx_filled():
         exchange_order_id="okx-oid-1",
     )
     assert status == "filled"
-    assert filled == 0.05
+    assert filled == pytest.approx(0.05)
     assert avg == 65000.1
     client.get_order.assert_called_once()
     call_kw = client.get_order.call_args.kwargs

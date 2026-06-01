@@ -90,14 +90,14 @@ FILL_CONTRACT_CASES: Tuple[FillContractCase, ...] = (
     FillContractCase(
         "okx_filled",
         OkxClient,
-        {"state": "filled", "accFillSz": "0.05", "avgPx": "65000.1"},
+        {"state": "filled", "accFillSz": "5", "avgPx": "65000.1"},
         (0.05, 65000.1, "filled"),
         call_assert=_okx_call_assert,
     ),
     FillContractCase(
         "okx_partial",
         OkxClient,
-        {"state": "partially_filled", "accFillSz": "0.01", "avgPx": "64000"},
+        {"state": "partially_filled", "accFillSz": "1", "avgPx": "64000"},
         (0.01, 64000.0, "partial"),
     ),
     FillContractCase(
@@ -156,14 +156,21 @@ FILL_CONTRACT_CASES: Tuple[FillContractCase, ...] = (
         "gate_futures_finished",
         GateUsdtFuturesClient,
         {"status": "finished", "filled_size": "100", "fill_price": "65000"},
-        (100.0, 65000.0, "filled"),
+        (1.0, 65000.0, "filled"),
         call_assert=_gate_call_assert,
     ),
     FillContractCase(
         "kucoin_spot_wrapped_filled",
         KucoinSpotClient,
         {"data": {"isActive": False, "dealSize": "0.015", "dealFunds": "975.0", "status": "done"}},
-        (0.015, 0.0, "filled"),
+        (0.015, 65000.0, "filled"),
+        call_assert=_kucoin_call_assert,
+    ),
+    FillContractCase(
+        "kucoin_futures_wrapped_filled",
+        KucoinFuturesClient,
+        {"status": "done", "dealSize": "15", "dealValue": "975.0"},
+        (0.015, 65000.0, "filled"),
         call_assert=_kucoin_call_assert,
     ),
     FillContractCase(
@@ -176,19 +183,19 @@ FILL_CONTRACT_CASES: Tuple[FillContractCase, ...] = (
     FillContractCase(
         "deepcoin_filled",
         DeepcoinClient,
-        {"state": "filled", "accFillSz": "0.008", "avgPx": "68000"},
-        (0.008, 68000.0, "filled"),
+        {"state": "filled", "accFillSz": "8", "avgPx": "68000"},
+        (0.08, 68000.0, "filled"),
     ),
     FillContractCase(
         "htx_filled",
         HtxClient,
-        {"status": "filled", "filled_qty": "0.006", "trade_avg_price": "67500"},
+        {"status": 6, "trade_volume": "6", "trade_avg_price": "67500"},
         (0.006, 67500.0, "filled"),
     ),
     FillContractCase(
         "htx_open",
         HtxClient,
-        {"status": "open", "filled_qty": "0", "trade_avg_price": "0"},
+        {"status": 3, "trade_volume": "0", "trade_avg_price": "0"},
         (0.0, 0.0, "open"),
     ),
 )
@@ -204,6 +211,16 @@ def _make_client(client_cls: Type) -> MagicMock:
 def test_query_grid_order_fill_contract(case: FillContractCase):
     client = _make_client(case.client_cls)
     client.get_order.return_value = case.response
+    if case.client_cls is OkxClient and case.market_type != "spot":
+        client.get_instrument.return_value = {"ctVal": "0.01"}
+    if case.client_cls is GateUsdtFuturesClient:
+        client.get_contract.return_value = {"quanto_multiplier": "0.01"}
+    if case.client_cls is KucoinFuturesClient:
+        client.get_contract.return_value = {"multiplier": "0.001"}
+    if case.client_cls is DeepcoinClient:
+        client.get_instrument_info.return_value = {"ctVal": "0.01"}
+    if case.client_cls is HtxClient:
+        client.get_contract_info.return_value = {"contract_size": "0.001"}
     filled, avg, status = query_grid_order_fill(
         client,
         symbol="BTC/USDT",

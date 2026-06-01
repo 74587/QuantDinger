@@ -44,7 +44,18 @@ def _normalize_trade_row_for_api(trade: dict, *, leverage: float = 1.0, market_t
     except Exception:  # pragma: no cover
         Decimal = ()  # type: ignore
     out = dict(trade)
-    for k in ("price", "amount", "value", "commission", "profit"):
+    for k in (
+        "price",
+        "amount",
+        "value",
+        "commission",
+        "profit",
+        "profit_gross",
+        "net_pnl",
+        "open_commission_allocated",
+        "close_commission",
+        "total_commission",
+    ):
         v = out.get(k)
         if isinstance(v, Decimal):
             out[k] = float(v)
@@ -59,15 +70,35 @@ def _normalize_trade_row_for_api(trade: dict, *, leverage: float = 1.0, market_t
         out["margin_value"] = calc_margin_notional(value, leverage, market_type)
         profit = out.get("profit")
         if profit is not None:
-            commission = float(out.get("commission") or 0.0)
-            out["net_pnl"] = round(float(profit) - commission, 8)
+            gross = out.get("profit_gross")
+            if gross is None:
+                gross = profit
+            try:
+                gross_f = float(gross)
+            except Exception:
+                gross_f = float(profit or 0.0)
+            open_comm = float(out.get("open_commission_allocated") or 0.0)
+            close_comm = float(
+                out.get("close_commission")
+                if out.get("close_commission") is not None
+                else out.get("commission") or 0.0
+            )
+            net = float(profit)
+            if out.get("net_pnl") is None:
+                net = gross_f - close_comm - open_comm
+                out["net_pnl"] = round(net, 8)
+            if out.get("profit_gross") is None:
+                out["profit_gross"] = gross_f
+            if out.get("total_commission") is None:
+                out["total_commission"] = round(close_comm + open_comm, 8)
+            out["profit"] = round(net, 8)
             margin = float(out.get("margin_value") or 0.0)
             if margin > 0:
-                out["profit_pct_on_margin"] = round(float(profit) / margin * 100.0, 4)
+                out["profit_pct_on_margin"] = round(net / margin * 100.0, 4)
             else:
                 out["profit_pct_on_margin"] = 0.0
             if value > 0:
-                out["profit_pct_on_notional"] = round(float(profit) / value * 100.0, 4)
+                out["profit_pct_on_notional"] = round(net / value * 100.0, 4)
             else:
                 out["profit_pct_on_notional"] = 0.0
     except Exception:
@@ -390,6 +421,16 @@ def run_strategy_backtest():
             result=result,
             code=snapshot.get('code') or '',
         )
+        try:
+            get_strategy_service().patch_trading_config(
+                strategy_id,
+                {
+                    'lifecycle_backtested_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                },
+                user_id=user_id,
+            )
+        except Exception as _lc_err:
+            logger.warning(f"lifecycle_backtested patch skipped: {_lc_err}")
         return jsonify({'code': 1, 'msg': 'success', 'data': {'runId': run_id, 'result': result}})
     except ValueError as e:
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
@@ -780,8 +821,16 @@ def get_trades():
                     except Exception:
                         pass
             from app.utils.trade_close_reason import enrich_trade_row
+            from app.utils.trade_net_pnl import enrich_trades_net_pnl
+
             trade = enrich_trade_row(trade, bot_type=bot_type, lang=lang)
-            processed_rows.append(_normalize_trade_row_for_api(trade, leverage=leverage, market_type=market_type))
+            processed_rows.append(trade)
+
+        enrich_trades_net_pnl(processed_rows)
+        processed_rows = [
+            _normalize_trade_row_for_api(trade, leverage=leverage, market_type=market_type)
+            for trade in processed_rows
+        ]
         
         # Frontend expects data.trades; keep data.items for compatibility with list-style components.
         return jsonify({'code': 1, 'msg': 'success', 'data': {'trades': processed_rows, 'items': processed_rows}})
@@ -989,6 +1038,42 @@ def get_positions():
             except Exception as e:
                 logger.warning(
                     "account reconciliation failed for strategy %s: %s", strategy_id, e
+                )
+
+        # Live strategies: when L3 ledger is empty but exchange has legs, surface account mirror
+        # so the UI is not blank while grid initial fills are still syncing.
+        if execution_mode == "live" and not out and account_legs:
+            for leg in account_legs:
+                sym = str(leg.get("symbol") or "").strip()
+                side = str(leg.get("side") or "").strip().lower()
+                try:
+                    size = float(leg.get("size") or 0.0)
+                except Exception:
+                    size = 0.0
+                if not sym or side not in ("long", "short") or size <= 1e-12:
+                    continue
+                entry = float(leg.get("entry_price") or 0.0)
+                cp = float(sym_to_price.get(sym) or leg.get("mark_price") or entry or 0.0)
+                pnl = calc_unrealized_pnl(side, entry, cp, size)
+                pct = calc_pnl_percent(entry, size, pnl, leverage=leverage, market_type=market_type)
+                notional = calc_notional_value(entry, size)
+                out.append(
+                    {
+                        "id": 0,
+                        "strategy_id": int(strategy_id),
+                        "symbol": sym,
+                        "side": side,
+                        "size": size,
+                        "entry_price": entry,
+                        "current_price": cp,
+                        "highest_price": entry,
+                        "unrealized_pnl": pnl,
+                        "pnl_percent": pct,
+                        "notional_value": notional,
+                        "margin_value": calc_margin_notional(notional, leverage, market_type),
+                        "updated_at": now,
+                        "source": "account_mirror",
+                    }
                 )
 
         return jsonify({
@@ -1216,10 +1301,14 @@ def _build_strategy_equity_curve(user_id: int, strategy_id: int):
     if rows:
         anchor_ts = _trade_row_timestamp(rows[0])
         curve.append({"time": anchor_ts, "equity": round(initial, 2)})
-    for r in rows:
+
+    from app.utils.trade_net_pnl import enrich_trades_net_pnl, net_pnl_for_equity_step
+
+    trade_rows = [dict(r) for r in rows]
+    enrich_trades_net_pnl(trade_rows)
+    for r in trade_rows:
         try:
-            # Net equity step: gross trade P&L minus exchange-synced fee.
-            equity += float(r.get('profit') or 0) - float(r.get('commission') or 0)
+            equity += float(net_pnl_for_equity_step(r))
         except Exception:
             pass
         curve.append({'time': _trade_row_timestamp(r), 'equity': round(equity, 2)})
@@ -1721,10 +1810,133 @@ def verify_strategy_code():
             return jsonify({'success': False, 'message': 'Code is empty'})
 
         validation = _validate_strategy_code_internal(code)
+        if validation.get('success'):
+            strategy_id = int(payload.get('strategyId') or payload.get('strategy_id') or 0)
+            if strategy_id:
+                try:
+                    get_strategy_service().patch_trading_config(
+                        strategy_id,
+                        {
+                            'lifecycle_verified': True,
+                            'script_verified': True,
+                            'lifecycle_verified_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        },
+                        user_id=g.user_id,
+                    )
+                except Exception as _lc_err:
+                    logger.warning(f"lifecycle_verified patch skipped: {_lc_err}")
         return jsonify(validation)
     except Exception as e:
         logger.error(f"verify_strategy_code failed: {str(e)}")
         return jsonify({'success': False, 'message': str(e)})
+
+
+@strategy_blp.route('/strategies/publish-template', methods=['POST'])
+@login_required
+def publish_strategy_template():
+    """Publish script strategy code to marketplace as script_template asset."""
+    try:
+        payload = request.get_json() or {}
+        strategy_id = int(payload.get('strategyId') or payload.get('strategy_id') or 0)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'strategyId is required', 'data': None}), 400
+
+        strategy = get_strategy_service().get_strategy(strategy_id, user_id=g.user_id)
+        if not strategy:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        code = (strategy.get('strategy_code') or '').strip()
+        if not code:
+            return jsonify({'code': 0, 'msg': 'Strategy has no script code', 'data': None}), 400
+
+        validation = _validate_strategy_code_internal(code)
+        if not validation.get('success'):
+            return jsonify({
+                'code': 0,
+                'msg': validation.get('message') or 'Code verification failed',
+                'data': validation,
+            }), 400
+
+        name = (payload.get('name') or strategy.get('strategy_name') or '').strip()
+        description = (payload.get('description') or '').strip()
+        pricing_type = (payload.get('pricingType') or payload.get('pricing_type') or 'free').strip() or 'free'
+        try:
+            price = float(payload.get('price') or 0)
+        except Exception:
+            price = 0.0
+        existing_indicator_id = int(payload.get('indicatorId') or payload.get('indicator_id') or 0)
+
+        user_role = getattr(g, 'user_role', 'user')
+        is_admin = user_role == 'admin'
+
+        from app.services.community_service import get_community_service
+        ok, msg, data = get_community_service().publish_script_template_from_strategy(
+            user_id=g.user_id,
+            strategy_id=strategy_id,
+            code=code,
+            name=name,
+            description=description,
+            pricing_type=pricing_type,
+            price=price,
+            is_admin=is_admin,
+            existing_indicator_id=existing_indicator_id,
+        )
+        if not ok:
+            return jsonify({'code': 0, 'msg': msg, 'data': data}), 400
+        return jsonify({'code': 1, 'msg': 'success', 'data': data})
+    except Exception as e:
+        logger.error(f"publish_strategy_template failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_blp.route('/strategies/publish-bot-preset', methods=['POST'])
+@login_required
+def publish_bot_preset():
+    """Publish a bot strategy configuration to marketplace as bot_preset asset."""
+    try:
+        payload = request.get_json() or {}
+        strategy_id = int(payload.get('strategyId') or payload.get('strategy_id') or 0)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'strategyId is required', 'data': None}), 400
+
+        strategy = get_strategy_service().get_strategy(strategy_id, user_id=g.user_id)
+        if not strategy:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        strategy_mode = str(strategy.get('strategy_mode') or '').strip().lower()
+        if strategy_mode != 'bot':
+            return jsonify({'code': 0, 'msg': 'Only bot strategies can be published as presets', 'data': None}), 400
+
+        name = (payload.get('name') or strategy.get('strategy_name') or '').strip()
+        description = (payload.get('description') or '').strip()
+        pricing_type = (payload.get('pricingType') or payload.get('pricing_type') or 'free').strip() or 'free'
+        try:
+            price = float(payload.get('price') or 0)
+        except Exception:
+            price = 0.0
+        existing_indicator_id = int(payload.get('indicatorId') or payload.get('indicator_id') or 0)
+
+        user_role = getattr(g, 'user_role', 'user')
+        is_admin = user_role == 'admin'
+
+        from app.services.community_service import get_community_service
+        ok, msg, data = get_community_service().publish_bot_preset_from_strategy(
+            user_id=g.user_id,
+            strategy_id=strategy_id,
+            name=name,
+            description=description,
+            pricing_type=pricing_type,
+            price=price,
+            is_admin=is_admin,
+            existing_indicator_id=existing_indicator_id,
+            strategy=strategy,
+        )
+        if not ok:
+            return jsonify({'code': 0, 'msg': msg, 'data': data}), 400
+        return jsonify({'code': 1, 'msg': 'success', 'data': data})
+    except Exception as e:
+        logger.error(f"publish_bot_preset failed: {str(e)}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
 @strategy_blp.route('/strategies/ai-generate', methods=['POST'])

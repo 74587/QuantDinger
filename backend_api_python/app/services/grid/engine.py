@@ -10,6 +10,7 @@ from app.services.grid.exchange_orders import (
     cancel_grid_order,
     execute_grid_market_order,
     make_grid_client_order_id,
+    make_grid_initial_client_order_id,
     place_grid_limit_order,
 )
 from app.services.grid.fill_handler import record_grid_market_fill
@@ -55,6 +56,8 @@ class GridEngine:
             self._initial_done = True
         self._consecutive_order_errors = 0
         self._stop_requested = False
+        self._last_initial_attempt_ts = 0.0
+        self._initial_retry_sec = 30.0
 
     @property
     def stop_requested(self) -> bool:
@@ -174,11 +177,85 @@ class GridEngine:
             logger.debug("grid leg position qty sid=%s %s: %s", self.strategy_id, pos_side, e)
             return 0.0
 
-    def _sync_initial_market_leg(self, signal_type: str, usdt: float, price: float, reason: str) -> bool:
+    def _target_initial_usdt(self) -> float:
+        return self._initial_capital_usdt() * self.cfg.initial_position_pct
+
+    def _target_initial_base_qty(self, price: float) -> float:
+        return self._qty_from_usdt(self._target_initial_usdt(), price)
+
+    def _pos_side_for_signal(self, signal_type: str) -> str:
+        sig = str(signal_type or "").strip().lower()
+        if "short" in sig:
+            return "short"
+        return "long"
+
+    def _try_recover_initial_from_exchange(
+        self,
+        current_price: float,
+        signal_type: str,
+        reason: str,
+    ) -> bool:
+        """When fill polling fails but the exchange already holds the initial leg, sync local state."""
+        if current_price <= 0:
+            return False
+        pos_side = self._pos_side_for_signal(signal_type)
+        target_qty = self._target_initial_base_qty(current_price)
+        if target_qty <= 0:
+            return False
+        exch_qty = self._leg_position_qty(pos_side)
+        if exch_qty <= 0:
+            return False
+        if exch_qty < target_qty * 0.85:
+            return False
+        record_qty = min(exch_qty, target_qty)
+        if exch_qty > target_qty * 1.15:
+            append_strategy_log(
+                self.strategy_id,
+                "error",
+                f"Grid initial over-filled on exchange: {exch_qty:.6f} > target {target_qty:.6f}; "
+                "stopping initial retries (check OKX position manually)",
+            )
+        if self._has_initial_market_trade():
+            self._initial_done = True
+            persist_grid_resting_state(self.strategy_id, {"initial_market_done": True})
+            return True
+        record_grid_market_fill(
+            self.strategy_id,
+            self.symbol,
+            signal_type,
+            record_qty,
+            current_price,
+            self.trading_config,
+            reason=reason,
+        )
+        append_strategy_log(
+            self.strategy_id,
+            "info",
+            f"Grid initial market recovered from exchange: {record_qty:.6f} {pos_side} @ ~{current_price:.4f}",
+        )
+        self._initial_done = True
+        persist_grid_resting_state(self.strategy_id, {"initial_market_done": True})
+        return True
+
+    def _sync_initial_market_leg(
+        self,
+        signal_type: str,
+        usdt: float,
+        price: float,
+        reason: str,
+        *,
+        client_order_id: Optional[str] = None,
+    ) -> bool:
         lev = self.cfg.leverage if self.cfg.market_type != "spot" else 1.0
         qty = float(usdt or 0) * lev / float(price) if price > 0 else 0.0
         if qty <= 0:
             return False
+        if self._try_recover_initial_from_exchange(price, signal_type, reason):
+            return True
+        coid = str(client_order_id or "").strip() or make_grid_initial_client_order_id(
+            self.strategy_id,
+            leg=self._pos_side_for_signal(signal_type),
+        )
         try:
             client = self._create_client()
             ok, filled, avg = execute_grid_market_order(
@@ -189,12 +266,15 @@ class GridEngine:
                 market_type=self.cfg.market_type,
                 exchange_config=self.exchange_config,
                 leverage=self.cfg.leverage,
+                client_order_id=coid,
             )
         except Exception as e:
             logger.warning("grid initial market sid=%s %s: %s", self.strategy_id, signal_type, e)
             append_strategy_log(self.strategy_id, "error", f"Grid initial market failed {signal_type}: {e}")
-            return False
+            return self._try_recover_initial_from_exchange(price, signal_type, reason)
         if not ok or filled <= 0:
+            if self._try_recover_initial_from_exchange(price, signal_type, reason):
+                return True
             append_strategy_log(
                 self.strategy_id,
                 "warning",
@@ -235,11 +315,47 @@ class GridEngine:
             return True
         direction = self.cfg.grid_direction
         if direction == "short":
-            ok = self._sync_initial_market_leg("open_short", usdt, current_price, "grid_initial_short")
+            sig = "open_short"
+            reason = "grid_initial_short"
+        elif direction == "neutral":
+            sig = "open_long"
+            reason = "grid_initial_long"
+        else:
+            sig = "open_long"
+            reason = "grid_initial_long"
+
+        if self._try_recover_initial_from_exchange(current_price, sig, reason):
+            return True
+
+        now = time.time()
+        if now - float(self._last_initial_attempt_ts or 0.0) < float(self._initial_retry_sec):
+            return False
+        self._last_initial_attempt_ts = now
+
+        if direction == "short":
+            ok = self._sync_initial_market_leg(
+                "open_short",
+                usdt,
+                current_price,
+                "grid_initial_short",
+                client_order_id=make_grid_initial_client_order_id(self.strategy_id, leg="short"),
+            )
         elif direction == "neutral":
             half = usdt / 2.0
-            ok_long = self._sync_initial_market_leg("open_long", half, current_price, "grid_initial_long")
-            ok_short = self._sync_initial_market_leg("open_short", half, current_price, "grid_initial_short")
+            ok_long = self._sync_initial_market_leg(
+                "open_long",
+                half,
+                current_price,
+                "grid_initial_long",
+                client_order_id=make_grid_initial_client_order_id(self.strategy_id, leg="long"),
+            )
+            ok_short = self._sync_initial_market_leg(
+                "open_short",
+                half,
+                current_price,
+                "grid_initial_short",
+                client_order_id=make_grid_initial_client_order_id(self.strategy_id, leg="short"),
+            )
             ok = ok_long or ok_short
             if ok:
                 append_strategy_log(
@@ -248,7 +364,13 @@ class GridEngine:
                     f"Grid initial neutral market: {usdt:.2f} USDT split @ {current_price:.4f}",
                 )
         else:
-            ok = self._sync_initial_market_leg("open_long", usdt, current_price, "grid_initial_long")
+            ok = self._sync_initial_market_leg(
+                "open_long",
+                usdt,
+                current_price,
+                "grid_initial_long",
+                client_order_id=make_grid_initial_client_order_id(self.strategy_id, leg="long"),
+            )
         if ok:
             self._initial_done = True
             persist_grid_resting_state(self.strategy_id, {"initial_market_done": True})

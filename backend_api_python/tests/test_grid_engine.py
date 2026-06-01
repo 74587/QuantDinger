@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.services.grid.config import GridBotConfig
 from app.services.grid.levels import generate_cells, generate_levels
 from app.services.grid.validator import validate_grid_config
@@ -76,3 +78,78 @@ def test_config_from_trading_config_initial_pct():
     cfg = GridBotConfig.from_trading_config(tc)
     assert cfg.initial_position_pct == 0.3
     assert cfg.grid_direction == "long"
+
+
+def test_initial_market_target_qty_100u_20pct_20x():
+    """100 USDT * 20% margin * 20x leverage ≈ 400 USDT notional at 72710."""
+    from app.services.grid.engine import GridEngine
+    from app.services.grid.exchange_orders import make_grid_initial_client_order_id
+
+    tc = {
+        "initial_capital": 100,
+        "leverage": 20,
+        "market_type": "swap",
+        "bot_params": {
+            "upperPrice": 80200,
+            "lowerPrice": 69800,
+            "gridCount": 24,
+            "amountPerGrid": 4,
+            "gridDirection": "long",
+            "initialPositionPct": 20,
+        },
+    }
+    engine = GridEngine(
+        42,
+        "BTC/USDT",
+        tc,
+        {},
+        create_client_fn=lambda: None,
+        enqueue_market=lambda *a, **k: False,
+    )
+    qty = engine._target_initial_base_qty(72710.0)
+    assert qty == pytest.approx(400.0 / 72710.0, rel=1e-4)
+    assert make_grid_initial_client_order_id(42, leg="long") == make_grid_initial_client_order_id(42, leg="long")
+    assert make_grid_initial_client_order_id(42, leg="long") != make_grid_initial_client_order_id(42, leg="short")
+
+
+def test_initial_market_recovers_from_exchange_without_new_order(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    tc = {
+        "initial_capital": 100,
+        "leverage": 20,
+        "market_type": "swap",
+        "bot_params": {
+            "upperPrice": 80200,
+            "lowerPrice": 69800,
+            "gridCount": 24,
+            "amountPerGrid": 4,
+            "gridDirection": "long",
+            "initialPositionPct": 20,
+        },
+    }
+    recorded = {"calls": 0}
+
+    def fake_record(*args, **kwargs):
+        recorded["calls"] += 1
+
+    monkeypatch.setattr("app.services.grid.engine.record_grid_market_fill", fake_record)
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.grid.engine.persist_grid_resting_state", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.grid.engine.GridEngine._has_initial_market_trade", lambda self: False)
+
+    engine = GridEngine(
+        7,
+        "BTC/USDT",
+        tc,
+        {},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *a, **k: False,
+    )
+    target = engine._target_initial_base_qty(72710.0)
+    monkeypatch.setattr("app.services.grid.engine.GridEngine._leg_position_qty", lambda self, side: target)
+
+    ok = engine.run_initial_market_position(72710.0)
+    assert ok is True
+    assert engine._initial_done is True
+    assert recorded["calls"] == 1

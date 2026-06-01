@@ -83,6 +83,29 @@ _BEARISH_IF_HIGHER_PATTERNS = (
     "job cuts",
 )
 
+# Macro releases we keep even when estimate/prev are not yet published.
+_MACRO_EVENT_HINTS = (
+    "non farm payroll",
+    "nonfarm payroll",
+    "jobless claims",
+    "interest rate",
+    "rate decision",
+    "fomc",
+    "federal funds",
+    "cpi",
+    "ppi",
+    "gdp",
+    "retail sales",
+    "pmi",
+    "ism ",
+    "unemployment",
+    "trade balance",
+    "consumer confidence",
+    "industrial production",
+    "housing starts",
+    "opec",
+)
+
 
 def get_economic_calendar() -> List[Dict[str, Any]]:
     """Return macro calendar events from Finnhub, or an empty list if unavailable."""
@@ -124,14 +147,32 @@ def _fetch_finnhub_calendar() -> List[Dict[str, Any]]:
         return []
 
     events: List[Dict[str, Any]] = []
+    seen_keys: set = set()
     for idx, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
+        event_en = (row.get("event") or row.get("title") or row.get("name") or "").strip()
+        if not event_en or not _should_include_finnhub_row(row, event_en):
+            continue
         normalized = _normalize_finnhub_event(row, idx)
-        if normalized:
-            events.append(normalized)
+        if not normalized:
+            continue
+        dedupe_key = (
+            f"{normalized['date']}|{normalized['time']}|"
+            f"{(normalized.get('name_en') or '').strip().lower()}"
+        )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        events.append(normalized)
 
-    events.sort(key=lambda item: (item["date"], item["time"]))
+    events.sort(
+        key=lambda item: (
+            _importance_rank(item.get("importance")),
+            item["date"],
+            item["time"],
+        )
+    )
     return events
 
 
@@ -172,7 +213,13 @@ def _normalize_finnhub_event(row: Dict[str, Any], idx: int) -> Optional[Dict[str
         event_id = int(hashlib.md5(dedupe_key.encode()).hexdigest()[:8], 16)
 
     display_forecast = forecast or previous or "-"
-    expected_impact = "neutral" if is_released else impact_if_above
+    has_figures = any(v is not None for v in (forecast, previous, actual))
+    if is_released:
+        expected_impact = actual_impact or "neutral"
+    elif has_figures or importance == "high" or _is_macro_event_name(event_en):
+        expected_impact = impact_if_above
+    else:
+        expected_impact = "neutral"
 
     return {
         "id": event_id if isinstance(event_id, int) else idx + 1,
@@ -189,7 +236,7 @@ def _normalize_finnhub_event(row: Dict[str, Any], idx: int) -> Optional[Dict[str
         "impact_if_below": impact_if_below,
         "impact_desc": "",
         "impact_desc_en": "",
-        "expected_impact": actual_impact if is_released else expected_impact,
+        "expected_impact": expected_impact,
         "actual_impact": actual_impact,
         "is_released": is_released,
         "source": "finnhub",
@@ -269,6 +316,36 @@ def _parse_numeric(text: Optional[str]) -> Optional[float]:
         return float(cleaned) * multiplier
     except ValueError:
         return None
+
+
+def _importance_rank(importance: Optional[str]) -> int:
+    order = {"high": 0, "medium": 1, "low": 2}
+    return order.get(str(importance or "medium").lower(), 1)
+
+
+def _row_has_figures(row: Dict[str, Any]) -> bool:
+    for key in ("estimate", "forecast", "prev", "previous", "actual"):
+        val = row.get(key)
+        if val not in (None, "", "-"):
+            return True
+    return False
+
+
+def _is_macro_event_name(event_en: str) -> bool:
+    lowered = event_en.strip().lower()
+    return any(hint in lowered for hint in _MACRO_EVENT_HINTS)
+
+
+def _should_include_finnhub_row(row: Dict[str, Any], event_en: str) -> bool:
+    """Drop market holidays / empty rows; keep scheduled macro releases."""
+    importance = _map_importance(row.get("impact"))
+    if _row_has_figures(row):
+        return True
+    if importance == "high":
+        return True
+    if _is_macro_event_name(event_en):
+        return True
+    return False
 
 
 def _impact_rules(event_name: str) -> Tuple[str, str]:

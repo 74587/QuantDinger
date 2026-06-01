@@ -232,6 +232,15 @@ def query_exchange_position_size(
     if isinstance(client, DeepcoinClient):
         resp = client.get_positions(symbol=sym) or {}
         data = _extract_position_rows(resp)
+        ct_val = 1.0
+        if getattr(client, "market_type", "swap") != "spot":
+            try:
+                info = client.get_instrument_info(symbol=sym) or {}
+                ct = float(info.get("ctVal") or info.get("contractSize") or 0.0)
+                if ct > 0:
+                    ct_val = ct
+            except Exception:
+                pass
         for p in data:
             if not isinstance(p, dict):
                 continue
@@ -243,12 +252,23 @@ def query_exchange_position_size(
                 continue
             sz = abs(float(p.get("pos") or p.get("availPos") or p.get("size") or 0.0))
             if sz > 0:
+                if getattr(client, "market_type", "swap") != "spot":
+                    return sz * ct_val
                 return sz
         return 0.0
 
     if isinstance(client, HtxClient):
         resp = client.get_positions(symbol=sym) or {}
         data = (resp.get("data") or []) if isinstance(resp, dict) else []
+        contract_size = 1.0
+        if getattr(client, "market_type", "swap") != "spot":
+            try:
+                info = client.get_contract_info(symbol=sym) or {}
+                cs = float(info.get("contract_size") or info.get("contractSize") or 0.0)
+                if cs > 0:
+                    contract_size = cs
+            except Exception:
+                pass
         for p in data:
             if not isinstance(p, dict):
                 continue
@@ -267,6 +287,8 @@ def query_exchange_position_size(
             contract = str(p.get("contract_code") or p.get("symbol") or "")
             if sym and contract and not symbols_equivalent(contract.replace("-", "/"), sym):
                 continue
+            if getattr(client, "market_type", "swap") != "spot" and contract_size != 1.0:
+                return vol * contract_size
             return vol
         return 0.0
 

@@ -1407,6 +1407,23 @@ class PendingOrderWorker:
 
         side, pos_side, reduce_only = _signal_to_side_pos_reduce(signal_type)
 
+        from app.services.live_trading.position_query import query_exchange_position_size
+
+        pre_position_qty = 0.0
+        try:
+            pre_position_qty = float(
+                query_exchange_position_size(
+                    client=client,
+                    symbol=str(symbol),
+                    pos_side=str(pos_side or ""),
+                    market_type=str(market_type or "swap"),
+                    exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+                )
+                or 0.0
+            )
+        except Exception as e:
+            logger.debug("pre_position_qty snapshot failed pending_id=%s: %s", order_id, e)
+
         # Leverage handling (best-effort):
         # - For OKX swap, leverage must be set via private endpoint; otherwise exchange defaults apply.
         # - For other exchanges, leverage setting is not implemented yet in this local client.
@@ -1429,7 +1446,7 @@ class PendingOrderWorker:
             logger.warning(f"Pre-execution sync failed: {e}")
 
         # Collect raw exchange interactions / intermediate states for debugging & persistence.
-        phases: Dict[str, Any] = {}
+        phases: Dict[str, Any] = {"pre_position_qty": pre_position_qty}
 
         # Close/reduce: cap to DB size; if DB empty, fall back to live exchange position.
         if reduce_only:
@@ -1612,6 +1629,7 @@ class PendingOrderWorker:
 
         # Phase 1: limit (hang order)
         limit_order_id = ""
+        limit_client_oid = ""
         if use_limit_first:
             try:
                 # price adjustment to reduce immediate taker fills (best-effort)
@@ -2279,6 +2297,41 @@ class PendingOrderWorker:
         # Build final result (best-effort) — live path never fabricates fill qty from request amount.
         filled_final = float(total_base or 0.0)
         avg_final = float(_current_avg() or 0.0)
+
+        ex_oid_for_recovery = str(market_order_id or limit_order_id or "")
+        coid_for_recovery = str(
+            market_client_oid if market_order_id else (limit_client_oid if limit_order_id else "")
+        )
+        if filled_final <= 0 and ex_oid_for_recovery:
+            from app.services.live_trading.fill_recovery import try_recover_zero_fill
+
+            rec_filled, rec_avg, rec_src = try_recover_zero_fill(
+                client,
+                symbol=str(symbol),
+                market_type=str(market_type or "swap"),
+                exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+                exchange_order_id=ex_oid_for_recovery,
+                client_order_id=coid_for_recovery,
+                requested_qty=float(amount or 0.0),
+                signal_type=str(signal_type or ""),
+                pos_side=str(pos_side or ""),
+                pre_position_qty=float(pre_position_qty or 0.0),
+                ref_price=float(ref_price or 0.0),
+            )
+            if rec_filled > 0:
+                filled_final = rec_filled
+                avg_final = rec_avg if rec_avg > 0 else float(ref_price or 0.0)
+                phases["fill_recovery"] = {
+                    "source": rec_src,
+                    "filled": rec_filled,
+                    "avg_price": avg_final,
+                    "exchange_order_id": ex_oid_for_recovery,
+                }
+                append_strategy_log(
+                    strategy_id,
+                    "info",
+                    f"Fill recovered ({rec_src}): {signal_type} {symbol} qty={rec_filled:.6f} @ ~{avg_final:.4f}",
+                )
 
         res = type("Tmp", (), {"exchange_id": str(exchange_config.get("exchange_id") or ""), "exchange_order_id": str(market_order_id or limit_order_id), "raw": phases, "filled": filled_final, "avg_price": avg_final})()
 

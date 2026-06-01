@@ -3971,13 +3971,15 @@ class TradingExecutor:
             
             executed_df = exec_env.get('df', df)
 
-            # Validation: if chart signals are provided, df['buy']/df['sell'] must exist for execution normalization.
+            # Validation: chart markers in output['signals'] require df execution columns.
             output_obj = exec_env.get('output')
             has_output_signals = isinstance(output_obj, dict) and isinstance(output_obj.get('signals'), list) and len(output_obj.get('signals')) > 0
-            if has_output_signals and not all(col in executed_df.columns for col in ['buy', 'sell']):
+            has_four_way = all(col in executed_df.columns for col in ['open_long', 'close_long', 'open_short', 'close_short'])
+            has_buy_sell = all(col in executed_df.columns for col in ['buy', 'sell'])
+            if has_output_signals and not has_four_way and not has_buy_sell:
                 raise ValueError(
-                    "Invalid indicator script: output['signals'] is provided, but df['buy'] and df['sell'] are missing. "
-                    "Please set df['buy'] and df['sell'] as boolean columns (len == len(df))."
+                    "Invalid indicator script: output['signals'] is provided, but df execution columns are missing. "
+                    "Set df['buy'] and df['sell'], or four-way df['open_long'/'close_long'/'open_short'/'close_short']."
                 )
             
             return executed_df, exec_env

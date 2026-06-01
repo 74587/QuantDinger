@@ -1169,13 +1169,14 @@ class StrategyService:
         # tightening a rule should only need a change in one place.
         from app.services.broker_market_policy import validate_strategy_config
         exchange_id = (resolved_ex_cfg.get('exchange_id') or '').strip().lower() if isinstance(resolved_ex_cfg, dict) else ''
+        marketplace_delivery = bool(payload.get('marketplace_delivery'))
         validate_strategy_config(
             exchange_id=exchange_id,
             market_category=market_category,
             market_type=(trading_config or {}).get('market_type'),
             trade_direction=(trading_config or {}).get('trade_direction'),
             bot_type=(trading_config or {}).get('bot_type'),
-            require_exchange=(execution_mode == 'live'),
+            require_exchange=(execution_mode == 'live') and not marketplace_delivery,
         )
         if market_category == 'MOEX':
             raise ValueError(
@@ -1380,7 +1381,7 @@ class StrategyService:
         """Batch start strategies. If user_id is provided, verify ownership."""
         success_ids = []
         failed_ids = []
-        
+
         for sid in strategy_ids:
             try:
                 self.update_strategy_status(sid, 'running', user_id=user_id)
@@ -1388,7 +1389,7 @@ class StrategyService:
             except Exception as e:
                 logger.error(f"Failed to start strategy {sid}: {e}")
                 failed_ids.append({'id': sid, 'error': str(e)})
-        
+
         return {
             'success': len(success_ids) > 0,
             'success_ids': success_ids,
@@ -1399,7 +1400,7 @@ class StrategyService:
         """Batch stop strategies. If user_id is provided, verify ownership."""
         success_ids = []
         failed_ids = []
-        
+
         for sid in strategy_ids:
             try:
                 self.update_strategy_status(sid, 'stopped', user_id=user_id)
@@ -1407,12 +1408,45 @@ class StrategyService:
             except Exception as e:
                 logger.error(f"Failed to stop strategy {sid}: {e}")
                 failed_ids.append({'id': sid, 'error': str(e)})
-        
+
         return {
             'success': len(success_ids) > 0,
             'success_ids': success_ids,
             'failed_ids': failed_ids
         }
+
+    def patch_trading_config(self, strategy_id: int, patch: Dict[str, Any], user_id: int = None) -> bool:
+        """Merge keys into trading_config without touching other strategy fields."""
+        if not patch or not isinstance(patch, dict):
+            return False
+        existing = self.get_strategy(strategy_id, user_id=user_id)
+        if not existing:
+            return False
+        tc = dict(existing.get('trading_config') or {})
+        tc.update(patch)
+        with get_db_connection() as db:
+            cur = db.cursor()
+            if user_id is not None:
+                cur.execute(
+                    """
+                    UPDATE qd_strategies_trading
+                    SET trading_config = ?, updated_at = NOW()
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (self._dump_json_or_encrypt(tc, encrypt=False), strategy_id, user_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE qd_strategies_trading
+                    SET trading_config = ?, updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (self._dump_json_or_encrypt(tc, encrypt=False), strategy_id),
+                )
+            db.commit()
+            cur.close()
+        return True
 
     def batch_delete_strategies(self, strategy_ids: List[int], user_id: int = None) -> Dict[str, Any]:
         """Batch delete strategies. If user_id is provided, verify ownership."""

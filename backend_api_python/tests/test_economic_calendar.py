@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from app.data_providers.economic_calendar import (
+    _fetch_finnhub_calendar,
     _normalize_finnhub_event,
+    _should_include_finnhub_row,
     get_economic_calendar,
 )
 
@@ -95,3 +97,64 @@ def test_get_economic_calendar_fetches_from_finnhub(monkeypatch):
     assert events[0]["name_en"] == "Non Farm Payrolls"
     assert events[0]["forecast"] == "180K"
     assert events[0]["source"] == "finnhub"
+
+
+def test_should_exclude_market_holidays_without_figures():
+    row = {
+        "event": "Eid Al-Adha",
+        "country": "NG",
+        "date": "2026-05-29",
+        "time": "00:00",
+        "impact": "low",
+    }
+    assert _should_include_finnhub_row(row, "Eid Al-Adha") is False
+
+
+def test_fetch_finnhub_calendar_dedupes_same_holiday_across_countries(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "economicCalendar": [
+                    {
+                        "event": "Non Farm Payrolls",
+                        "country": "US",
+                        "date": "2026-06-05",
+                        "time": "08:30",
+                        "impact": "high",
+                        "unit": "k",
+                        "estimate": 180,
+                        "prev": 175,
+                    },
+                    {
+                        "event": "Eid Al-Adha",
+                        "country": "NG",
+                        "date": "2026-05-29",
+                        "time": "00:00",
+                        "impact": "low",
+                    },
+                    {
+                        "event": "Eid Al-Adha",
+                        "country": "ID",
+                        "date": "2026-05-29",
+                        "time": "00:00",
+                        "impact": "low",
+                    },
+                ]
+            }
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setenv("FINNHUB_API_KEY", "test_finnhub_key")
+    monkeypatch.setattr(
+        "app.data_providers.economic_calendar.requests.get",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    events = _fetch_finnhub_calendar()
+    assert len(events) == 1
+    assert events[0]["name_en"] == "Non Farm Payrolls"
