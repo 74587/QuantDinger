@@ -2372,28 +2372,43 @@ def save_local_chat_message():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-def _register_report_pdf_font() -> str:
+def _has_cjk_text(value: Any) -> bool:
+    text = _plain_text(value)
+    return bool(re.search(r"[\u2e80-\u9fff\uac00-\ud7af\u3040-\u30ff]", text))
+
+
+def _register_report_pdf_font(prefer_cjk: bool = False) -> str:
     from pathlib import Path
 
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
 
     candidates = [
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/msyh.ttf",
-        "C:/Windows/Fonts/simsun.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ("C:/Windows/Fonts/msyh.ttc", True),
+        ("C:/Windows/Fonts/msyh.ttf", True),
+        ("C:/Windows/Fonts/simsun.ttc", True),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", True),
+        ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", True),
+        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", True),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False),
     ]
-    for path in candidates:
+    for path, is_cjk in candidates:
+        if prefer_cjk and not is_cjk:
+            continue
         try:
             if Path(path).exists():
                 pdfmetrics.registerFont(TTFont("QuantDingerSans", path))
                 return "QuantDingerSans"
         except Exception as e:
             logger.debug(f"Failed to register PDF font {path}: {e}")
+    if prefer_cjk:
+        try:
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+            return "STSong-Light"
+        except Exception as e:
+            logger.debug(f"Failed to register built-in CJK PDF font: {e}")
     return "Helvetica"
 
 
@@ -2406,7 +2421,8 @@ def _build_ai_report_pdf(report: dict, target: dict | None = None, language: str
 
     target = target or {}
     zh = str(language or "").lower().startswith("zh")
-    font_name = _register_report_pdf_font()
+    prefer_cjk = zh or _has_cjk_text(report) or _has_cjk_text(target)
+    font_name = _register_report_pdf_font(prefer_cjk=prefer_cjk)
     title_font = font_name
     width, height = A4
     margin = 18 * mm
