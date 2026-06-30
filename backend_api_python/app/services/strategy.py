@@ -17,6 +17,21 @@ from app.services.symbol_name import normalize_crypto_symbol
 logger = get_logger(__name__)
 
 _strategy_service_singleton: Optional["StrategyService"] = None
+MIN_STRATEGY_INVESTMENT_AMOUNT = 10.0
+MAX_STRATEGY_INVESTMENT_AMOUNT = 1_000_000.0
+
+
+def validate_strategy_investment_amount(value: Any) -> float:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("Investment amount must be a number")
+    if amount < MIN_STRATEGY_INVESTMENT_AMOUNT or amount > MAX_STRATEGY_INVESTMENT_AMOUNT:
+        raise ValueError(
+            f"Investment amount must be between {MIN_STRATEGY_INVESTMENT_AMOUNT:g} "
+            f"and {MAX_STRATEGY_INVESTMENT_AMOUNT:g}"
+        )
+    return amount
 
 
 def get_strategy_service() -> "StrategyService":
@@ -589,9 +604,23 @@ class StrategyService:
                         "UPDATE qd_strategies_trading SET status = ?, updated_at = NOW() WHERE id = ?",
                         (status, strategy_id)
                     )
+                affected = int(getattr(cur, "rowcount", 0) or 0)
+                if affected <= 0:
+                    if user_id is not None:
+                        cur.execute(
+                            "SELECT status FROM qd_strategies_trading WHERE id = ? AND user_id = ?",
+                            (strategy_id, user_id)
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT status FROM qd_strategies_trading WHERE id = ?",
+                            (strategy_id,)
+                        )
+                    row = cur.fetchone()
+                    affected = 1 if row and str((row or {}).get('status') or '').lower() == str(status).lower() else 0
                 db.commit()
                 cur.close()
-            return True
+            return affected > 0
         except Exception as e:
             logger.error(f"update_strategy_status failed: {e}")
             return False
@@ -994,7 +1023,11 @@ class StrategyService:
             if isinstance(trading_config, dict):
                 trading_config['symbol'] = symbol
         timeframe = (trading_config or {}).get('timeframe')
-        initial_capital = (trading_config or {}).get('initial_capital') or payload.get('initial_capital') or 1000
+        initial_capital = validate_strategy_investment_amount(
+            (trading_config or {}).get('initial_capital') or payload.get('initial_capital') or 1000
+        )
+        trading_config['initial_capital'] = initial_capital
+        trading_config['investment_amount'] = initial_capital
         leverage = (trading_config or {}).get('leverage') or 1
         market_type = (trading_config or {}).get('market_type') or 'swap'
         
@@ -1047,7 +1080,7 @@ class StrategyService:
                     payload.get('status') or 'stopped',
                     symbol,
                     timeframe,
-                    float(initial_capital or 1000),
+                    initial_capital,
                     int(leverage or 1),
                     market_type,
                     self._dump_json_or_encrypt(exchange_config, encrypt=False) if exchange_config else '',
@@ -1197,8 +1230,11 @@ class StrategyService:
 
         for sid in strategy_ids:
             try:
-                self.update_strategy_status(sid, 'stopped', user_id=user_id)
-                success_ids.append(sid)
+                ok = self.update_strategy_status(sid, 'stopped', user_id=user_id)
+                if ok:
+                    success_ids.append(sid)
+                else:
+                    failed_ids.append({'id': sid, 'error': 'status update affected 0 rows'})
             except Exception as e:
                 logger.error(f"Failed to stop strategy {sid}: {e}")
                 failed_ids.append({'id': sid, 'error': str(e)})
@@ -1218,9 +1254,35 @@ class StrategyService:
             return False
         tc = dict(existing.get('trading_config') or {})
         tc.update(patch)
+        amount_changed = 'initial_capital' in patch or 'investment_amount' in patch
+        initial_capital = None
+        if amount_changed:
+            initial_capital = validate_strategy_investment_amount(
+                tc.get('initial_capital') or tc.get('investment_amount') or existing.get('initial_capital') or 1000
+            )
+            tc['initial_capital'] = initial_capital
+            tc['investment_amount'] = initial_capital
         with get_db_connection() as db:
             cur = db.cursor()
-            if user_id is not None:
+            if amount_changed and user_id is not None:
+                cur.execute(
+                    """
+                    UPDATE qd_strategies_trading
+                    SET initial_capital = ?, trading_config = ?, updated_at = NOW()
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (initial_capital, self._dump_json_or_encrypt(tc, encrypt=False), strategy_id, user_id),
+                )
+            elif amount_changed:
+                cur.execute(
+                    """
+                    UPDATE qd_strategies_trading
+                    SET initial_capital = ?, trading_config = ?, updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (initial_capital, self._dump_json_or_encrypt(tc, encrypt=False), strategy_id),
+                )
+            elif user_id is not None:
                 cur.execute(
                     """
                     UPDATE qd_strategies_trading
@@ -1412,7 +1474,11 @@ class StrategyService:
             if isinstance(trading_config, dict):
                 trading_config['symbol'] = symbol
         timeframe = (trading_config or {}).get('timeframe')
-        initial_capital = (trading_config or {}).get('initial_capital') or existing.get('initial_capital') or 1000
+        initial_capital = validate_strategy_investment_amount(
+            (trading_config or {}).get('initial_capital') or existing.get('initial_capital') or 1000
+        )
+        trading_config['initial_capital'] = initial_capital
+        trading_config['investment_amount'] = initial_capital
         leverage = (trading_config or {}).get('leverage') or existing.get('leverage') or 1
         market_type = (trading_config or {}).get('market_type') or existing.get('market_type') or 'swap'
 
@@ -1468,7 +1534,7 @@ class StrategyService:
                     self._dump_json_or_encrypt(notification_config, encrypt=False),
                     symbol,
                     timeframe,
-                    float(initial_capital or 1000),
+                    initial_capital,
                     int(leverage or 1),
                     market_type,
                     self._dump_json_or_encrypt(exchange_config, encrypt=False) if exchange_config else '',

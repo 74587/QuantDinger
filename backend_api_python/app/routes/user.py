@@ -1409,8 +1409,27 @@ def admin_toggle_system_strategy():
                 admin_user_id, strategy_id, st.get('user_id'),
             )
         else:
-            executor.stop_strategy(strategy_id)
-            svc.update_strategy_status(strategy_id, 'stopped')
+            status_ok = svc.update_strategy_status(strategy_id, 'stopped')
+            if not status_ok:
+                return jsonify({
+                    'code': 0,
+                    'msg': 'Failed to persist stopped status; strategy may resume on restart',
+                    'data': None,
+                }), 500
+            executor_ok = executor.stop_strategy(strategy_id, persist_status=False)
+            if not executor_ok:
+                return jsonify({
+                    'code': 0,
+                    'msg': 'Stopped status was saved, but runtime thread stop failed; please refresh and retry',
+                    'data': {'id': strategy_id, 'status': 'stopped'},
+                }), 500
+            latest = svc.get_strategy(strategy_id)
+            if not latest or str(latest.get('status') or '').strip().lower() != 'stopped':
+                return jsonify({
+                    'code': 0,
+                    'msg': 'Stop verification failed; strategy status is not stopped',
+                    'data': {'id': strategy_id, 'status': latest.get('status') if latest else None},
+                }), 500
             logger.info(
                 'Admin %s stopped strategy %s (owner user_id=%s)',
                 admin_user_id, strategy_id, st.get('user_id'),
@@ -1423,6 +1442,50 @@ def admin_toggle_system_strategy():
         })
     except Exception as e:
         logger.error(f"admin_toggle_system_strategy failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_blp.route('/system-strategies/delete', methods=['DELETE'])
+@login_required
+@admin_required
+def admin_delete_system_strategy():
+    """Delete any strategy from the system overview (admin only)."""
+    try:
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            data = request.get_json(silent=True) or {}
+            try:
+                strategy_id = int(data.get('strategy_id') or data.get('id') or 0)
+            except (TypeError, ValueError):
+                strategy_id = 0
+        if strategy_id <= 0:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id', 'data': None}), 400
+
+        from app import get_trading_executor
+        from app.routes.strategy import get_strategy_service
+
+        svc = get_strategy_service()
+        st = svc.get_strategy(strategy_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        if str(st.get('status') or '').strip().lower() == 'running':
+            svc.update_strategy_status(strategy_id, 'stopped')
+            get_trading_executor().stop_strategy(strategy_id, persist_status=False)
+
+        ok = svc.delete_strategy(strategy_id)
+        if not ok:
+            return jsonify({'code': 0, 'msg': 'Failed to delete strategy', 'data': None}), 500
+
+        logger.info(
+            'Admin %s deleted strategy %s (owner user_id=%s)',
+            getattr(g, 'user_id', None), strategy_id, st.get('user_id'),
+        )
+        return jsonify({'code': 1, 'msg': 'Deleted successfully', 'data': {'id': strategy_id}})
+    except Exception as e:
+        logger.error(f"admin_delete_system_strategy failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500

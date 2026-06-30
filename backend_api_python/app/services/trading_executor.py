@@ -33,8 +33,15 @@ from app.services.strategy_script_runtime import (
     StrategyScriptContext,
     compile_strategy_script_handlers,
 )
+from app.utils.safe_exec import TimeoutError as SafeExecTimeoutError, timeout_context
 
 logger = get_logger(__name__)
+
+
+class ScriptCallbackTimeout(RuntimeError):
+    """Raised when user script callbacks exceed the live runtime budget."""
+
+    pass
 
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
@@ -85,6 +92,14 @@ class TradingExecutor:
             self._console_tick_interval_sec = 60
         
         self.max_threads = int(os.getenv('STRATEGY_MAX_THREADS', '64'))
+        try:
+            self.script_callback_timeout_sec = max(1, int(os.getenv("STRATEGY_SCRIPT_CALLBACK_TIMEOUT_SEC", "5")))
+        except Exception:
+            self.script_callback_timeout_sec = 5
+        try:
+            self.script_max_consecutive_timeouts = max(1, int(os.getenv("STRATEGY_SCRIPT_MAX_CONSECUTIVE_TIMEOUTS", "3")))
+        except Exception:
+            self.script_max_consecutive_timeouts = 3
         self._last_start_failure: str = ""
         self._last_exit_reason: Dict[int, str] = {}
 
@@ -93,6 +108,21 @@ class TradingExecutor:
         self._exchange_fee_cache_lock = threading.Lock()
         
         self._ensure_db_columns()
+
+    def _run_script_callback_with_timeout(self, strategy_id: int, phase: str, callback, *args):
+        """Run user script callbacks with a live-loop timeout budget."""
+        timeout_sec = int(getattr(self, "script_callback_timeout_sec", 5) or 5)
+        try:
+            with timeout_context(timeout_sec):
+                return callback(*args)
+        except SafeExecTimeoutError as exc:
+            message = f"Script {phase} timed out after {timeout_sec}s"
+            logger.error("Strategy %s %s", strategy_id, message)
+            try:
+                append_strategy_log(strategy_id, "error", message)
+            except Exception:
+                pass
+            raise ScriptCallbackTimeout(message) from exc
 
     def _estimate_indicator_warmup_bars(
         self,
@@ -204,6 +234,12 @@ class TradingExecutor:
             ensure_position_ledger_schema()
         except Exception as e:
             logger.warning("ensure_position_ledger_schema failed: %s", e)
+        try:
+            from app.services.strategy_runtime.schema import ensure_strategy_runtime_schema
+
+            ensure_strategy_runtime_schema()
+        except Exception as e:
+            logger.warning("ensure_strategy_runtime_schema failed: %s", e)
 
     def _normalize_trade_symbol(self, exchange: Any, symbol: str, market_type: str, exchange_id: str) -> str:
         """Normalize a trade symbol for exchange operations."""
@@ -781,21 +817,22 @@ class TradingExecutor:
             reason = self._fetch_recent_strategy_log_hint(sid)
         return False, reason or "Execution thread exited before it reported running."
     
-    def stop_strategy(self, strategy_id: int) -> bool:
+    def stop_strategy(self, strategy_id: int, *, persist_status: bool = True) -> bool:
         """Stop a strategy worker thread."""
         try:
             with self.lock:
                 had_thread = strategy_id in self.running_strategies
 
-                # Always mark DB stopped (also when auto-stop runs without a live thread).
-                with get_db_connection() as db:
-                    cursor = db.cursor()
-                    cursor.execute(
-                        "UPDATE qd_strategies_trading SET status = 'stopped' WHERE id = %s",
-                        (strategy_id,),
-                    )
-                    db.commit()
-                    cursor.close()
+                if persist_status:
+                    # Always mark DB stopped (also when auto-stop runs without a live thread).
+                    with get_db_connection() as db:
+                        cursor = db.cursor()
+                        cursor.execute(
+                            "UPDATE qd_strategies_trading SET status = 'stopped' WHERE id = %s",
+                            (strategy_id,),
+                        )
+                        db.commit()
+                        cursor.close()
 
                 if had_thread:
                     del self.running_strategies[strategy_id]
@@ -974,15 +1011,28 @@ class TradingExecutor:
         df: pd.DataFrame,
         trading_config: Dict[str, Any],
         initial_capital: float,
+        strategy_run_id: int = 0,
+        symbol: str = "",
     ) -> Tuple[StrategyScriptContext, Optional[pd.Timestamp]]:
         df_exec = self._df_to_script_exec_df(df)
-        ctx = StrategyScriptContext(df_exec, float(initial_capital or 0))
+        ctx = StrategyScriptContext(
+            df_exec,
+            float(initial_capital or 0),
+            strategy_id=int(strategy_id or 0),
+            strategy_run_id=int(strategy_run_id or 0),
+            symbol=str(symbol or ""),
+        )
         raw = (trading_config or {}).get('script_runtime_state') or {}
         params = raw.get('params') if isinstance(raw, dict) else {}
         persisted = dict(params) if isinstance(params, dict) else {}
+        tp = (trading_config or {}).get('script_template_params')
+        template_params = dict(tp) if isinstance(tp, dict) else {}
         bp = (trading_config or {}).get('bot_params')
         bot_params = dict(bp) if isinstance(bp, dict) else {}
-        ctx._params = {**persisted, **bot_params}
+        ctx._params = {**persisted, **template_params, **bot_params}
+        ctx.set_runtime_config(trading_config or {}, initial_balance=initial_capital)
+        if ctx.direction in ('long', 'short', 'both'):
+            ctx._params['direction'] = ctx.direction
         last_ts = None
         ts_s = raw.get('last_closed_bar_ts') if isinstance(raw, dict) else None
         if ts_s:
@@ -1091,6 +1141,7 @@ class TradingExecutor:
                 signal_ts=int(time.time()),
                 price_exchange_id=kline_exchange_id,
                 order_mode=order_mode if order_mode != "maker" else "market",
+                strategy_run_id=int((trading_config or {}).get("_strategy_run_id") or 0),
             )
             return bool(res and res.get("success"))
         except Exception as e:
@@ -1278,6 +1329,19 @@ class TradingExecutor:
         def _to_local_qty(value: float, ref_price: float, *, from_order_amount: bool) -> float:
             if ref_price is None or ref_price <= 0 or value is None or value <= 0:
                 return 0.0
+            try:
+                explicit_quote = float(order.get('script_quote_amount') or 0.0)
+                if explicit_quote > 0:
+                    lev = leverage if market_type != 'spot' else 1.0
+                    return explicit_quote * lev / float(ref_price)
+            except Exception:
+                pass
+            try:
+                explicit_base = float(order.get('script_base_qty') or 0.0)
+                if explicit_base > 0:
+                    return explicit_base
+            except Exception:
+                pass
             if is_bot_script and from_order_amount:
                 lev = leverage if market_type != 'spot' else 1.0
                 return float(value) * lev / float(ref_price)
@@ -1288,6 +1352,12 @@ class TradingExecutor:
 
         def _script_quote_extra() -> Dict[str, Any]:
             """Bot scripts pass quote notional via ctx.buy/sell(amount=...)."""
+            try:
+                explicit_quote = float(order.get('script_quote_amount') or 0.0)
+                if explicit_quote > 0:
+                    return {'script_quote_amount': explicit_quote}
+            except Exception:
+                pass
             if (not is_bot_script) or raw_amt is None:
                 return {}
             try:
@@ -1299,6 +1369,17 @@ class TradingExecutor:
 
         def _script_qty_extra() -> Dict[str, Any]:
             """Non-bot scripts pass base-asset qty via ctx.buy/sell; honor it live like backtest."""
+            try:
+                explicit_base = float(order.get('script_base_qty') or 0.0)
+                if explicit_base > 0:
+                    return {'script_base_qty': explicit_base}
+            except Exception:
+                pass
+            try:
+                if float(order.get('script_quote_amount') or 0.0) > 0:
+                    return {}
+            except Exception:
+                pass
             if is_bot_script or raw_amt is None:
                 return {}
             try:
@@ -1313,12 +1394,26 @@ class TradingExecutor:
                 sig.setdefault('reason', reason_override)
             sig.update(_script_quote_extra())
             sig.update(_script_qty_extra())
+            if runtime_extra:
+                sig.update(runtime_extra)
             out.append(sig)
 
         for order in list(ctx._orders or []):
             action = str(order.get('action') or '').lower()
             intent = str(order.get('intent') or 'auto').lower()
             reason_hint = order.get('reason')
+            runtime_extra = {}
+            for meta_key in (
+                'strategy_run_id',
+                'basket_id',
+                'basket_order_db_id',
+                'order_intent_id',
+                'idempotency_key',
+                'layer_index',
+                'order_index',
+            ):
+                if order.get(meta_key) not in (None, ''):
+                    runtime_extra[meta_key] = order.get(meta_key)
             try:
                 order_price = float(order.get('price') or bar_close or 0)
             except Exception:
@@ -1525,7 +1620,9 @@ class TradingExecutor:
             is_closed_bar=True,
         )
         try:
-            on_bar(ctx, bar)
+            self._run_script_callback_with_timeout(strategy_id, "on_bar", on_bar, ctx, bar)
+        except ScriptCallbackTimeout:
+            raise
         except Exception as e:
             logger.error(f"Strategy {strategy_id} script on_bar error: {e}")
             logger.error(traceback.format_exc())
@@ -1542,6 +1639,7 @@ class TradingExecutor:
             pending, ctx, trading_config, price=bar_close, timestamp=ts_i,
         )
         self._persist_script_runtime_state(strategy_id, closed_ts, ctx._params)
+        ctx.flush_state()
         logger.info(f"Strategy {strategy_id} script closed bar {closed_ts} -> {len(pending)} signal(s)")
         return pending, closed_ts
 
@@ -1634,7 +1732,9 @@ class TradingExecutor:
             is_closed_bar=False,
         )
         try:
-            on_bar(ctx, bar)
+            self._run_script_callback_with_timeout(strategy_id, "in-progress on_bar", on_bar, ctx, bar)
+        except ScriptCallbackTimeout:
+            raise
         except Exception as e:
             logger.error(f"Strategy {strategy_id} script in-progress on_bar error: {e}")
             logger.error(traceback.format_exc())
@@ -1653,6 +1753,7 @@ class TradingExecutor:
             pending, ctx, trading_config, price=bar_close, timestamp=ts_i,
         )
         self._persist_script_runtime_state(strategy_id, None, ctx._params)
+        ctx.flush_state()
         if pending:
             logger.info(
                 f"Strategy {strategy_id} script in-progress bar {bar_ts} -> {len(pending)} signal(s)"
@@ -1672,6 +1773,7 @@ class TradingExecutor:
         if max_consecutive_errors < 1:
             max_consecutive_errors = 1
         consecutive_errors = 0
+        consecutive_script_timeouts = 0
         exit_reason: str = ""
 
         def _set_db_stopped_best_effort(reason: str) -> None:
@@ -1841,6 +1943,7 @@ class TradingExecutor:
             strategy_code = ''
             on_init_script = None
             on_bar_script = None
+            strategy_run_id = 0
 
             if is_script:
                 strategy_code = (strategy.get('strategy_code') or '').strip()
@@ -1877,6 +1980,35 @@ class TradingExecutor:
                     _abort_loop(f"script compile failed: {e}")
                     logger.error(traceback.format_exc())
                     return
+                try:
+                    from app.services.strategy_runtime.identity import ensure_strategy_run
+
+                    ex_cfg_for_run = strategy.get('exchange_config') or {}
+                    if isinstance(ex_cfg_for_run, str) and ex_cfg_for_run.strip():
+                        try:
+                            ex_cfg_for_run = json.loads(ex_cfg_for_run)
+                        except Exception:
+                            ex_cfg_for_run = {}
+                    if not isinstance(ex_cfg_for_run, dict):
+                        ex_cfg_for_run = {}
+                    strategy_runtime_run = ensure_strategy_run(
+                        strategy_id=int(strategy_id),
+                        user_id=int(strategy.get('user_id') or 1),
+                        code=strategy_code,
+                        parameter_snapshot=trading_config if isinstance(trading_config, dict) else {},
+                        source_version_id=str((trading_config or {}).get('script_source_id') or (trading_config or {}).get('scriptSourceId') or ''),
+                        exchange_id=str(ex_cfg_for_run.get('exchange_id') or ex_cfg_for_run.get('exchangeId') or ''),
+                        credential_id=int(ex_cfg_for_run.get('credential_id') or ex_cfg_for_run.get('credentials_id') or 0),
+                        symbol=str(symbol or ''),
+                        market_type=str(market_type or 'swap'),
+                        position_mode=str((trading_config or {}).get('position_mode') or (trading_config or {}).get('positionMode') or ''),
+                    )
+                    strategy_run_id = int(strategy_runtime_run.strategy_run_id or 0)
+                    if isinstance(trading_config, dict):
+                        trading_config['_strategy_run_id'] = strategy_run_id
+                        trading_config['_strategy_runtime_epoch'] = int(strategy_runtime_run.runtime_epoch or 0)
+                except Exception as e:
+                    logger.warning(f"Strategy {strategy_id} runtime run init failed: {e}")
             else:
                 indicator_config = strategy['indicator_config']
                 indicator_id = indicator_config.get('indicator_id')
@@ -2028,7 +2160,7 @@ class TradingExecutor:
             last_script_closed_ts = None
             if is_script:
                 script_ctx, last_script_closed_ts = self._init_script_strategy_context(
-                    strategy_id, df, trading_config, initial_capital
+                    strategy_id, df, trading_config, initial_capital, strategy_run_id, symbol
                 )
                 if on_init_script:
                     self._hydrate_script_ctx_from_positions(
@@ -2038,16 +2170,23 @@ class TradingExecutor:
                         trading_config=trading_config,
                     )
                     try:
-                        on_init_script(script_ctx)
+                        self._run_script_callback_with_timeout(strategy_id, "on_init", on_init_script, script_ctx)
+                    except ScriptCallbackTimeout as e:
+                        _abort_loop(str(e))
+                        return
                     except Exception as e:
                         logger.error(f"Strategy {strategy_id} on_init error: {e}")
                         logger.error(traceback.format_exc())
                     finally:
                         self._flush_ctx_logs(strategy_id, script_ctx)
-                pending_signals, last_script_closed_ts = self._script_evaluate_new_closed_bar(
-                    df, script_ctx, on_bar_script, trade_direction,
-                    last_script_closed_ts, strategy_id, symbol, trading_config,
-                )
+                try:
+                    pending_signals, last_script_closed_ts = self._script_evaluate_new_closed_bar(
+                        df, script_ctx, on_bar_script, trade_direction,
+                        last_script_closed_ts, strategy_id, symbol, trading_config,
+                    )
+                except ScriptCallbackTimeout as e:
+                    _abort_loop(str(e))
+                    return
                 if not strict_mode and len(df) > 0:
                     try:
                         init_price = float(df['close'].iloc[-1])
@@ -2060,6 +2199,9 @@ class TradingExecutor:
                         )
                         if ip_sig:
                             pending_signals = ip_sig
+                    except ScriptCallbackTimeout as e:
+                        _abort_loop(str(e))
+                        return
                     except Exception as e:
                         logger.warning(
                             f"Strategy {strategy_id} script init in-progress eval failed: {e}"
@@ -2287,6 +2429,8 @@ class TradingExecutor:
                                                     )
                                                     if ip_sig:
                                                         pending_signals = ip_sig
+                                                except ScriptCallbackTimeout:
+                                                    raise
                                                 except Exception as e:
                                                     logger.warning(
                                                         f"Strategy {strategy_id} script kline in-progress eval failed: {e}"
@@ -2408,7 +2552,9 @@ class TradingExecutor:
                                     is_closed_bar=False,
                                 )
                                 try:
-                                    on_bar_script(script_ctx, tick_bar)
+                                    self._run_script_callback_with_timeout(
+                                        strategy_id, "bot tick on_bar", on_bar_script, script_ctx, tick_bar
+                                    )
                                 finally:
                                     self._flush_ctx_logs(strategy_id, script_ctx)
                                 if script_ctx._orders:
@@ -2427,12 +2573,17 @@ class TradingExecutor:
                                     if new_sig:
                                         pending_signals = new_sig
                                         self._persist_script_runtime_state(strategy_id, tick_ts, script_ctx._params)
+                                        script_ctx.flush_state()
                                         logger.info(f"Strategy {strategy_id} bot tick -> {len(new_sig)} signal(s)")
                                     else:
                                         self._persist_script_runtime_state(strategy_id, None, script_ctx._params)
+                                        script_ctx.flush_state()
                                 else:
                                     self._persist_script_runtime_state(strategy_id, None, script_ctx._params)
+                                    script_ctx.flush_state()
                             except Exception as e:
+                                if isinstance(e, ScriptCallbackTimeout):
+                                    raise
                                 logger.warning(f"Strategy {strategy_id} bot tick on_bar error: {e}")
 
                         # 3a2. Non-bot scripts: evaluate forming bar when strict mode is off
@@ -2456,6 +2607,8 @@ class TradingExecutor:
                                 )
                                 if new_sig:
                                     pending_signals = new_sig
+                            except ScriptCallbackTimeout:
+                                raise
                             except Exception as e:
                                 logger.warning(
                                     f"Strategy {strategy_id} script in-progress recompute failed: {e}"
@@ -2656,6 +2809,11 @@ class TradingExecutor:
                             pending_signals.remove(signal_info)
                         
                     if triggered_signals:
+                        if not self._is_strategy_running(strategy_id):
+                            exit_reason = exit_reason or "run flag cleared before signal execution"
+                            logger.info(f"Strategy {strategy_id} stop requested before signal execution; dropping triggered signals")
+                            break
+
                         logger.info(f"Strategy {strategy_id} triggered signals: {triggered_signals}")
 
                         current_positions = self._get_current_positions(strategy_id, symbol)
@@ -2714,7 +2872,13 @@ class TradingExecutor:
                             if not is_bot_mode:
                                 break
 
+                        stop_requested_during_execution = False
                         for selected in execution_batch:
+                            if not self._is_strategy_running(strategy_id):
+                                exit_reason = exit_reason or "run flag cleared during signal execution"
+                                stop_requested_during_execution = True
+                                logger.info(f"Strategy {strategy_id} stop requested during signal execution; remaining signals dropped")
+                                break
                             signal_type = selected.get('type')
                             position_size = selected.get('position_size', 0)
                             trigger_price = selected.get('trigger_price', current_price)
@@ -2756,6 +2920,13 @@ class TradingExecutor:
                                 trailing_stop_price=selected.get("trailing_stop_price"),
                                 script_base_qty=selected.get("script_base_qty"),
                                 script_quote_amount=selected.get("script_quote_amount"),
+                                strategy_run_id=int(selected.get("strategy_run_id") or ((trading_config or {}).get("_strategy_run_id") if isinstance(trading_config, dict) else 0) or 0),
+                                order_intent_id=int(selected.get("order_intent_id") or 0),
+                                idempotency_key=str(selected.get("idempotency_key") or ""),
+                                basket_id=str(selected.get("basket_id") or ""),
+                                basket_order_db_id=int(selected.get("basket_order_db_id") or 0),
+                                layer_index=int(selected.get("layer_index") or 0),
+                                order_index=int(selected.get("order_index") or 0),
                             )
                             if ok:
                                 logger.info(f"Strategy {strategy_id} signal executed: {signal_type} @ {execute_price}")
@@ -2793,6 +2964,8 @@ class TradingExecutor:
                                     "error",
                                     f"Signal rejected or not executed: {signal_type}",
                                 )
+                        if stop_requested_during_execution:
+                            break
 
                     # Update positions once per tick.
                     self._update_positions(strategy_id, symbol, current_price)
@@ -2805,10 +2978,15 @@ class TradingExecutor:
 
                     # Successful tick: reset consecutive error counter.
                     consecutive_errors = 0
+                    consecutive_script_timeouts = 0
                     
                 except Exception as e:
                     msg = str(e)
                     consecutive_errors += 1
+                    if isinstance(e, ScriptCallbackTimeout):
+                        consecutive_script_timeouts += 1
+                    else:
+                        consecutive_script_timeouts = 0
                     logger.error(f"Strategy {strategy_id} loop error ({consecutive_errors}/{max_consecutive_errors}): {msg}")
                     logger.error(traceback.format_exc())
                     self._console_print(f"[strategy:{strategy_id}] loop error: {e}")
@@ -2818,12 +2996,21 @@ class TradingExecutor:
                         pass
 
                     fatal = _is_fatal_error(e, msg)
-                    if fatal or consecutive_errors >= max_consecutive_errors:
+                    script_timeout_limit_hit = (
+                        isinstance(e, ScriptCallbackTimeout)
+                        and consecutive_script_timeouts >= self.script_max_consecutive_timeouts
+                    )
+                    if fatal or script_timeout_limit_hit or consecutive_errors >= max_consecutive_errors:
                         if fatal and isinstance(e, UnsupportedMarketError):
                             exit_reason = (
                                 f"Unsupported market type: {getattr(e, 'market', '')}. "
                                 f"Please set strategy market_category/market to one of: "
                                 f"Crypto/USStock/CNStock/HKStock/Forex/Futures/MOEX."
+                            )
+                        elif script_timeout_limit_hit:
+                            exit_reason = (
+                                f"script callback timeout threshold reached: "
+                                f"{consecutive_script_timeouts}/{self.script_max_consecutive_timeouts}"
                             )
                         else:
                             exit_reason = msg if fatal else f"too many consecutive errors: {consecutive_errors}/{max_consecutive_errors}"
@@ -4158,6 +4345,13 @@ class TradingExecutor:
         price_exchange_id: Optional[str] = None,
         script_base_qty: Optional[float] = None,
         script_quote_amount: Optional[float] = None,
+        strategy_run_id: int = 0,
+        order_intent_id: int = 0,
+        idempotency_key: str = "",
+        basket_id: str = "",
+        basket_order_db_id: int = 0,
+        layer_index: int = 0,
+        order_index: int = 0,
     ):
         """Generate and persist a trading signal when state checks allow it."""
         try:
@@ -4562,6 +4756,13 @@ class TradingExecutor:
                 signal_ts=int(signal_ts or 0),
                 order_mode=bot_order_mode,
                 sizing_meta=sizing_meta if sizing_meta else None,
+                strategy_run_id=int(strategy_run_id or ((trading_config or {}).get('_strategy_run_id') if isinstance(trading_config, dict) else 0) or 0),
+                order_intent_id=int(order_intent_id or 0),
+                idempotency_key=str(idempotency_key or ""),
+                basket_id=str(basket_id or ""),
+                basket_order_db_id=int(basket_order_db_id or 0),
+                layer_index=int(layer_index or 0),
+                order_index=int(order_index or 0),
             )
             
             if order_result and order_result.get('success'):
@@ -4909,6 +5110,13 @@ class TradingExecutor:
         signal_ts: int = 0,
         price_exchange_id: Optional[str] = None,
         sizing_meta: Optional[Dict[str, Any]] = None,
+        strategy_run_id: int = 0,
+        order_intent_id: int = 0,
+        idempotency_key: str = "",
+        basket_id: str = "",
+        basket_order_db_id: int = 0,
+        layer_index: int = 0,
+        order_index: int = 0,
     ) -> Optional[Dict[str, Any]]:
         """Enqueue a pending order record; this method does not call exchanges directly."""
         try:
@@ -4940,6 +5148,26 @@ class TradingExecutor:
                 extra_payload["order_mode"] = order_mode
             if sizing_meta and isinstance(sizing_meta, dict):
                 extra_payload["sizing"] = sizing_meta
+            runtime_meta = self._ensure_order_intent_for_enqueue(
+                strategy_id=int(strategy_id or 0),
+                strategy_run_id=int(strategy_run_id or 0),
+                symbol=str(symbol or ""),
+                signal_type=str(signal_type or ""),
+                signal_ts=int(signal_ts or 0),
+                market_type=str(market_type or "swap"),
+                amount=float(amount or 0.0),
+                ref_price=float(ref_price or 0.0),
+                leverage=float(leverage or 1.0),
+                order_intent_id=int(order_intent_id or 0),
+                idempotency_key=str(idempotency_key or ""),
+                basket_id=str(basket_id or ""),
+                basket_order_db_id=int(basket_order_db_id or 0),
+                layer_index=int(layer_index or 0),
+                order_index=int(order_index or 0),
+                extra_payload=extra_payload,
+            )
+            if runtime_meta:
+                extra_payload.update(runtime_meta)
             pending_id = self._enqueue_pending_order(
                 strategy_id=strategy_id,
                 symbol=symbol,
@@ -4971,6 +5199,102 @@ class TradingExecutor:
         except Exception as e:
              logger.error(f"Signal execution failed: {e}")
              return {'success': False, 'error': str(e)}
+
+    def _ensure_order_intent_for_enqueue(
+        self,
+        *,
+        strategy_id: int,
+        strategy_run_id: int,
+        symbol: str,
+        signal_type: str,
+        signal_ts: int,
+        market_type: str,
+        amount: float,
+        ref_price: float,
+        leverage: float,
+        order_intent_id: int = 0,
+        idempotency_key: str = "",
+        basket_id: str = "",
+        basket_order_db_id: int = 0,
+        layer_index: int = 0,
+        order_index: int = 0,
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create or reuse a runtime order intent before queueing work."""
+        run_id = int(strategy_run_id or 0)
+        if run_id <= 0 and not idempotency_key:
+            return {}
+        sig = str(signal_type or "").strip().lower()
+        side = "buy" if sig in ("open_long", "add_long", "close_short", "reduce_short") else "sell"
+        pos_side = "short" if "short" in sig else "long" if "long" in sig else ""
+        reduce_only = sig.startswith("close_") or sig.startswith("reduce_")
+        notional = abs(float(amount or 0.0) * float(ref_price or 0.0))
+        if notional <= 0 and extra_payload:
+            try:
+                quote_amount = float(extra_payload.get("script_quote_amount") or 0.0)
+                if quote_amount > 0:
+                    notional = quote_amount * (float(leverage or 1.0) if str(market_type or "").lower() != "spot" else 1.0)
+            except Exception:
+                pass
+        try:
+            from app.services.strategy_runtime.order_intents import OrderIntentService
+
+            svc = OrderIntentService(strategy_id=int(strategy_id or 0), strategy_run_id=run_id)
+            key = str(idempotency_key or "").strip()
+            if not key:
+                key = svc.build_signal_idempotency_key(
+                    strategy_run_id=run_id,
+                    strategy_id=int(strategy_id or 0),
+                    symbol=str(symbol or ""),
+                    signal_type=str(signal_type or ""),
+                    signal_ts=int(signal_ts or 0),
+                    basket_id=str(basket_id or ""),
+                    layer_index=int(layer_index or 0),
+                    order_index=int(order_index or 0),
+                    action=sig,
+                )
+            if int(order_intent_id or 0) > 0:
+                return {
+                    "strategy_run_id": run_id,
+                    "order_intent_id": int(order_intent_id or 0),
+                    "idempotency_key": key,
+                    "basket_id": str(basket_id or ""),
+                    "basket_order_db_id": int(basket_order_db_id or 0),
+                    "layer_index": int(layer_index or 0),
+                    "order_index": int(order_index or 0),
+                }
+            intent = svc.create_intent(
+                idempotency_key=key,
+                symbol=str(symbol or ""),
+                side=side,
+                market_type=str(market_type or "swap"),
+                position_side=pos_side,
+                reduce_only=reduce_only,
+                order_type="market",
+                quantity=abs(float(amount or 0.0)),
+                notional=notional,
+                execution_algo="market",
+                basket_id=str(basket_id or ""),
+                basket_order_id=int(basket_order_db_id or 0),
+                payload={
+                    **(extra_payload or {}),
+                    "signal_type": str(signal_type or ""),
+                    "signal_ts": int(signal_ts or 0),
+                    "source": "trading_executor",
+                },
+            )
+            return {
+                "strategy_run_id": run_id,
+                "order_intent_id": int(intent.id or 0),
+                "idempotency_key": key,
+                "basket_id": str(basket_id or ""),
+                "basket_order_db_id": int(basket_order_db_id or 0),
+                "layer_index": int(layer_index or 0),
+                "order_index": int(order_index or 0),
+            }
+        except Exception as e:
+            logger.debug("ensure order intent skipped: %s", e)
+            return {}
 
     def _enqueue_pending_order(
         self,
@@ -5008,6 +5332,9 @@ class TradingExecutor:
             }
             if extra_payload and isinstance(extra_payload, dict):
                 payload.update(extra_payload)
+            strategy_run_id = int(payload.get("strategy_run_id") or 0)
+            order_intent_id = int(payload.get("order_intent_id") or 0)
+            idempotency_key = str(payload.get("idempotency_key") or "").strip()
 
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -5033,7 +5360,18 @@ class TradingExecutor:
                     sig_norm = str(signal_type or "").strip().lower()
                     strict_candle_dedup = stsig > 0 and sig_norm in ("open_long", "open_short", "close_long", "close_short")
 
-                    if strict_candle_dedup:
+                    if idempotency_key:
+                        cur.execute(
+                            """
+                            SELECT id, status, created_at
+                            FROM pending_orders
+                            WHERE idempotency_key = %s
+                            ORDER BY id DESC
+                            LIMIT 1
+                            """,
+                            (idempotency_key,),
+                        )
+                    elif strict_candle_dedup:
                         cur.execute(
                             """
                             SELECT id, status, created_at
@@ -5065,6 +5403,13 @@ class TradingExecutor:
                     last_status = str(last.get("status") or "").strip().lower()
                     last_created = int(last.get("created_at") or 0)
                     if last_id > 0:
+                        if idempotency_key:
+                            logger.info(
+                                f"enqueue_pending_order skipped (idempotency): existing id={last_id} "
+                                f"strategy_id={strategy_id} key={idempotency_key} status={last_status}"
+                            )
+                            cur.close()
+                            return None
                         if strict_candle_dedup:
                             logger.info(
                                 f"enqueue_pending_order skipped (same candle): existing id={last_id} "
@@ -5105,10 +5450,12 @@ class TradingExecutor:
                     INSERT INTO pending_orders
                     (user_id, strategy_id, symbol, signal_type, signal_ts, market_type, order_type, amount, price,
                      execution_mode, status, priority, attempts, max_attempts, last_error, payload_json,
+                     strategy_run_id, order_intent_id, idempotency_key,
                      created_at, updated_at, processed_at, sent_at)
                     VALUES
                     (%s, %s, %s, %s, %s, %s, %s, %s, %s,
                      %s, %s, %s, %s, %s, %s, %s,
+                     %s, %s, %s,
                      NOW(), NOW(), NULL, NULL)
                     """,
                     (
@@ -5128,6 +5475,9 @@ class TradingExecutor:
                         10,
                         '',
                         json.dumps(payload, ensure_ascii=False),
+                        strategy_run_id,
+                        order_intent_id,
+                        idempotency_key,
                     ),
                 )
                 pending_id = cur.lastrowid

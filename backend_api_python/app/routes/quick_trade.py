@@ -38,6 +38,7 @@ from app.services.quick_trade.symbols import (
     is_supported_crypto_exchange,
     symbols_match as quick_trade_symbols_match,
 )
+from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 
 logger = get_logger(__name__)
 
@@ -680,61 +681,74 @@ def get_balance():
         if qt_rej is not None:
             return qt_rej
 
-        swap_bal = empty_balance_dict()
-        spot_bal = empty_balance_dict()
+        def _compute_balance() -> Dict[str, Any]:
+            swap_bal = empty_balance_dict()
+            spot_bal = empty_balance_dict()
 
-        for mt in ("swap", "spot"):
-            try:
-                cfg = build_exchange_config(credential_id, user_id, {"market_type": mt})
-                client = create_exchange_client(cfg, market_type=mt)
-                parsed = fetch_balance_raw(
-                    client,
-                    exchange_id=exchange_id,
-                    market_type=mt,
-                    exchange_config=cfg,
-                )
-                if mt == "spot":
-                    spot_bal = parsed
-                else:
-                    swap_bal = parsed
-                logger.info(
-                    "Balance for %s/%s: available=%.4f total=%.4f",
-                    exchange_id,
-                    mt,
-                    float(parsed.get("available") or 0),
-                    float(parsed.get("total") or 0),
-                )
-            except Exception as be:
-                logger.warning("Balance leg failed (%s/%s): %s", exchange_id, mt, be)
-                leg = empty_balance_dict()
-                leg["error"] = str(be)
-                if mt == "spot":
-                    spot_bal = leg
-                else:
-                    swap_bal = leg
+            for mt in ("swap", "spot"):
+                try:
+                    cfg = build_exchange_config(credential_id, user_id, {"market_type": mt})
+                    client = create_exchange_client(cfg, market_type=mt)
+                    parsed = fetch_balance_raw(
+                        client,
+                        exchange_id=exchange_id,
+                        market_type=mt,
+                        exchange_config=cfg,
+                    )
+                    if mt == "spot":
+                        spot_bal = parsed
+                    else:
+                        swap_bal = parsed
+                    logger.info(
+                        "Balance for %s/%s: available=%.4f total=%.4f",
+                        exchange_id,
+                        mt,
+                        float(parsed.get("available") or 0),
+                        float(parsed.get("total") or 0),
+                    )
+                except Exception as be:
+                    logger.warning("Balance leg failed (%s/%s): %s", exchange_id, mt, be)
+                    leg = empty_balance_dict()
+                    leg["error"] = str(be)
+                    if mt == "spot":
+                        spot_bal = leg
+                    else:
+                        swap_bal = leg
 
-        active = spot_bal if market_type == "spot" else swap_bal
-        balance_data = {
-            "available": float(active.get("available") or 0),
-            "total": float(active.get("total") or 0),
-            "currency": str(active.get("currency") or "USDT"),
-            "market_type": market_type,
-            "swap": swap_bal,
-            "spot": spot_bal,
-        }
-        err_meta = merge_balance_leg_errors(swap_bal, spot_bal, exchange_id=exchange_id)
-        if not err_meta and active.get("error"):
-            err_meta = exchange_error_user_message(exchange_id=exchange_id, err=str(active.get("error")))
-            if err_meta.get("message"):
-                balance_data["error"] = err_meta["message"]
-            if err_meta.get("hint_key"):
-                balance_data["error_hint_key"] = err_meta["hint_key"]
-            if err_meta.get("request_ip"):
-                balance_data["request_ip"] = err_meta["request_ip"]
-        elif err_meta:
-            balance_data.update(err_meta)
+            active = spot_bal if market_type == "spot" else swap_bal
+            balance_data = {
+                "available": float(active.get("available") or 0),
+                "total": float(active.get("total") or 0),
+                "currency": str(active.get("currency") or "USDT"),
+                "market_type": market_type,
+                "swap": swap_bal,
+                "spot": spot_bal,
+            }
+            err_meta = merge_balance_leg_errors(swap_bal, spot_bal, exchange_id=exchange_id)
+            if not err_meta and active.get("error"):
+                err_meta = exchange_error_user_message(exchange_id=exchange_id, err=str(active.get("error")))
+                if err_meta.get("message"):
+                    balance_data["error"] = err_meta["message"]
+                if err_meta.get("hint_key"):
+                    balance_data["error_hint_key"] = err_meta["hint_key"]
+                if err_meta.get("request_ip"):
+                    balance_data["request_ip"] = err_meta["request_ip"]
+            elif err_meta:
+                balance_data.update(err_meta)
+            return balance_data
 
+        balance_data = guarded_cached(
+            cache_key("quick_trade_balance", user_id, credential_id, market_type),
+            _compute_balance,
+            ttl_sec=8,
+            stale_ttl_sec=90,
+            timeout_sec=10,
+            namespace="quick_trade_balance",
+            max_concurrent=4,
+        )
         return jsonify({"code": 1, "msg": "success", "data": balance_data})
+    except RequestGuardError as e:
+        return jsonify({"code": 0, "msg": str(e)}), e.status_code
     except Exception as e:
         logger.error(f"get_balance failed: {e}")
         return jsonify({"code": 0, "msg": str(e)}), 500
@@ -1085,27 +1099,41 @@ def get_position():
 
         client = create_exchange_client(exchange_config, market_type=market_type)
 
-        positions = []
-        try:
-            raw = _fetch_exchange_positions_raw(
-                client, exchange_config, symbol=symbol, market_type=market_type
-            )
-            positions = _parse_positions(raw)
-            if market_type == "spot" and positions:
-                positions = _enrich_spot_positions(
-                    positions,
-                    client=client,
-                    symbol=symbol,
-                    user_id=user_id,
-                    credential_id=credential_id,
-                    market_type=market_type,
+        def _compute_position() -> List[Dict[str, Any]]:
+            positions: List[Dict[str, Any]] = []
+            try:
+                raw = _fetch_exchange_positions_raw(
+                    client, exchange_config, symbol=symbol, market_type=market_type
                 )
-        except Exception as pe:
-            logger.warning(f"Position fetch failed: {pe}")
-            logger.warning(traceback.format_exc())
+                positions = _parse_positions(raw)
+                if market_type == "spot" and positions:
+                    positions = _enrich_spot_positions(
+                        positions,
+                        client=client,
+                        symbol=symbol,
+                        user_id=user_id,
+                        credential_id=credential_id,
+                        market_type=market_type,
+                    )
+            except Exception as pe:
+                logger.warning(f"Position fetch failed: {pe}")
+                logger.warning(traceback.format_exc())
+            return positions
+
+        positions = guarded_cached(
+            cache_key("quick_trade_position", user_id, credential_id, market_type, symbol),
+            _compute_position,
+            ttl_sec=8,
+            stale_ttl_sec=90,
+            timeout_sec=10,
+            namespace="quick_trade_position",
+            max_concurrent=6,
+        )
 
         logger.info(f"Returning {len(positions)} positions for symbol={symbol}, market_type={market_type}")
         return jsonify({"code": 1, "msg": "success", "data": {"positions": positions}})
+    except RequestGuardError as e:
+        return jsonify({"code": 0, "msg": str(e), "data": {"positions": []}}), e.status_code
     except Exception as e:
         logger.error(f"get_position failed: {e}")
         return jsonify({"code": 0, "msg": str(e)}), 500

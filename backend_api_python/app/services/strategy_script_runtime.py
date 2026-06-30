@@ -4,6 +4,7 @@ Python 策略脚本（on_init / on_bar + ctx.buy/sell/close_position）运行时
 """
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -12,6 +13,14 @@ import pandas as pd
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except Exception:
+        value = default
+    return max(int(minimum), int(value))
 
 
 class ScriptBar(dict):
@@ -315,17 +324,147 @@ class ScriptPosition(dict):
 class StrategyScriptContext:
     """Live script context with behavior aligned to ScriptBacktestContext."""
 
-    def __init__(self, bars_df: Optional[pd.DataFrame] = None, initial_balance: float = 0.0):
+    def __init__(
+        self,
+        bars_df: Optional[pd.DataFrame] = None,
+        initial_balance: float = 0.0,
+        *,
+        strategy_id: int = 0,
+        strategy_run_id: int = 0,
+        symbol: str = "",
+    ):
         if bars_df is None:
             bars_df = pd.DataFrame(columns=["open", "high", "low", "close", "volume", "time"])
         self._bars_df = bars_df
         self._params: Dict[str, Any] = {}
         self._orders: List[Dict[str, Any]] = []
         self._logs: List[str] = []
+        self._max_bars_per_call = _env_int("STRATEGY_SCRIPT_MAX_BARS_PER_CALL", 1000, 1)
+        self._max_logs_per_flush = _env_int("STRATEGY_SCRIPT_MAX_LOGS_PER_FLUSH", 50, 0)
+        self._max_log_chars = _env_int("STRATEGY_SCRIPT_MAX_LOG_CHARS", 500, 1)
         self.current_index = -1
         self.position = ScriptPosition()
         self.balance = float(initial_balance)
         self.equity = float(initial_balance)
+        self.strategy_id = int(strategy_id or 0)
+        self.strategy_run_id = int(strategy_run_id or 0)
+        self.symbol = str(symbol or "")
+        self._baskets: Dict[str, Any] = {}
+        self.runtime: Dict[str, Any] = {}
+        self.direction = "long"
+        self.trade_direction = "long"
+        self.market_type = "swap"
+        self.leverage = 1.0
+        self.investment_amount = float(initial_balance or 0.0)
+        self.timeframe = "1m"
+        self.tick_interval_sec = 10
+        self.set_runtime_config({}, initial_balance=initial_balance)
+        self._bind_runtime_state()
+
+    def _bind_runtime_state(self) -> None:
+        try:
+            from app.services.strategy_runtime.state import RuntimeStateProxy, RuntimeStateStore
+
+            store = None
+            if self.strategy_id > 0:
+                store = RuntimeStateStore(
+                    strategy_id=self.strategy_id,
+                    strategy_run_id=self.strategy_run_id,
+                    state_key="script",
+                )
+            self.state = RuntimeStateProxy(store=store)
+        except Exception:
+            # Keep scripts usable even if DB/runtime schema is unavailable.
+            from app.services.strategy_runtime.state import RuntimeStateProxy
+
+            self.state = RuntimeStateProxy()
+
+    def bind_runtime(
+        self,
+        *,
+        strategy_id: int = 0,
+        strategy_run_id: int = 0,
+        symbol: str = "",
+        trading_config: Optional[Dict[str, Any]] = None,
+        initial_balance: Optional[float] = None,
+    ) -> None:
+        self.strategy_id = int(strategy_id or 0)
+        self.strategy_run_id = int(strategy_run_id or 0)
+        if symbol:
+            self.symbol = str(symbol or "")
+        self._baskets = {}
+        if trading_config is not None or initial_balance is not None:
+            self.set_runtime_config(trading_config or {}, initial_balance=initial_balance)
+        self._bind_runtime_state()
+
+    def set_runtime_config(
+        self,
+        trading_config: Optional[Dict[str, Any]] = None,
+        *,
+        initial_balance: Optional[float] = None,
+    ) -> None:
+        tc = trading_config if isinstance(trading_config, dict) else {}
+
+        def _float(value: Any, default: float) -> float:
+            try:
+                out = float(value)
+                return out if np.isfinite(out) else default
+            except Exception:
+                return default
+
+        direction = str(
+            tc.get("trade_direction")
+            or tc.get("tradeDirection")
+            or tc.get("direction")
+            or self.direction
+            or "long"
+        ).strip().lower()
+        if direction not in ("long", "short", "both"):
+            direction = "long"
+
+        market_type = str(tc.get("market_type") or tc.get("marketType") or self.market_type or "swap").strip().lower()
+        if market_type not in ("spot", "swap"):
+            market_type = "swap"
+
+        leverage = _float(tc.get("leverage", self.leverage), 1.0)
+        if leverage < 1:
+            leverage = 1.0
+
+        fallback_amount = initial_balance if initial_balance is not None else self.balance
+        investment_amount = _float(
+            tc.get("investment_amount", tc.get("initial_capital", fallback_amount)),
+            _float(fallback_amount, 0.0),
+        )
+
+        if market_type == "spot":
+            leverage = 1.0
+            if direction != "long":
+                direction = "long"
+
+        timeframe = str(tc.get("timeframe") or self.timeframe or "1m").strip() or "1m"
+        tick_interval_sec = int(_float(tc.get("tick_interval_sec", self.tick_interval_sec), 10.0) or 10)
+        if tick_interval_sec < 1:
+            tick_interval_sec = 10
+
+        self.direction = direction
+        self.trade_direction = direction
+        self.market_type = market_type
+        self.leverage = leverage
+        self.investment_amount = investment_amount
+        self.timeframe = timeframe
+        self.tick_interval_sec = tick_interval_sec
+        self.runtime = {
+            "contract_version": str(tc.get("runtime_contract_version") or "simple_script_v1"),
+            "symbol": str(tc.get("symbol") or self.symbol or ""),
+            "direction": direction,
+            "trade_direction": direction,
+            "market_type": market_type,
+            "leverage": leverage,
+            "investment_amount": investment_amount,
+            "initial_capital": investment_amount,
+            "timeframe": timeframe,
+            "tick_interval_sec": tick_interval_sec,
+        }
 
     def param(self, name: str, default: Any = None) -> Any:
         if name not in self._params:
@@ -333,7 +472,15 @@ class StrategyScriptContext:
         return self._params[name]
 
     def bars(self, n: int = 1):
-        start = max(0, self.current_index - int(n) + 1)
+        try:
+            count = int(n)
+        except Exception:
+            count = 1
+        if count < 1:
+            count = 1
+        if count > self._max_bars_per_call:
+            count = self._max_bars_per_call
+        start = max(0, self.current_index - count + 1)
         out = []
         for _, row in self._bars_df.iloc[start:self.current_index + 1].iterrows():
             out.append(ScriptBar(
@@ -347,12 +494,46 @@ class StrategyScriptContext:
         return out
 
     def log(self, message: Any):
-        self._logs.append(str(message))
+        if self._max_logs_per_flush <= 0:
+            return
+        text = str(message)
+        if len(text) > self._max_log_chars:
+            text = text[:self._max_log_chars] + "... [truncated]"
+        limit = self._max_logs_per_flush
+        if len(self._logs) < max(0, limit - 1):
+            self._logs.append(text)
+        elif len(self._logs) == max(0, limit - 1):
+            self._logs.append(f"ctx.log limit reached; further logs dropped (max={limit} per flush)")
 
     def flush_logs(self) -> List[str]:
         logs = self._logs.copy()
         self._logs = []
         return logs
+
+    def flush_state(self) -> None:
+        try:
+            self.state.flush()
+        except Exception:
+            pass
+
+    def basket(self, side: str = "long"):
+        side_norm = "short" if str(side or "").strip().lower() == "short" else "long"
+        if side_norm not in self._baskets:
+            from app.services.strategy_runtime.basket import BasketRuntime
+            from app.services.strategy_runtime.order_intents import OrderIntentService
+
+            self._baskets[side_norm] = BasketRuntime(
+                strategy_id=self.strategy_id,
+                strategy_run_id=self.strategy_run_id,
+                symbol=self.symbol,
+                side=side_norm,
+                order_intents=OrderIntentService(
+                    strategy_id=self.strategy_id,
+                    strategy_run_id=self.strategy_run_id,
+                ),
+                signal_sink=self._orders.append,
+            )
+        return self._baskets[side_norm]
 
     def buy(self, price: Any = None, amount: Any = None, *, intent: str = 'auto', reason: Optional[str] = None):
         # ``intent`` lets hedge-aware bot scripts disambiguate between

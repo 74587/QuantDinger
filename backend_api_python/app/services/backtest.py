@@ -2736,6 +2736,18 @@ class BacktestService:
         close_short = pd.Series(False, index=df.index)
         add_long = pd.Series(False, index=df.index)
         add_short = pd.Series(False, index=df.index)
+        open_long_quote_amount = pd.Series(0.0, index=df.index)
+        open_short_quote_amount = pd.Series(0.0, index=df.index)
+        add_long_quote_amount = pd.Series(0.0, index=df.index)
+        add_short_quote_amount = pd.Series(0.0, index=df.index)
+        open_long_base_qty = pd.Series(0.0, index=df.index)
+        open_short_base_qty = pd.Series(0.0, index=df.index)
+        add_long_base_qty = pd.Series(0.0, index=df.index)
+        add_short_base_qty = pd.Series(0.0, index=df.index)
+        open_long_price = pd.Series(0.0, index=df.index)
+        open_short_price = pd.Series(0.0, index=df.index)
+        add_long_price = pd.Series(0.0, index=df.index)
+        add_short_price = pd.Series(0.0, index=df.index)
 
         # Share the live-trading hedge-aware ctx implementation so the two
         # paths can't drift apart (P0-1, May 2026). ScriptBar is still needed
@@ -2749,7 +2761,21 @@ class BacktestService:
         try:
             from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
 
+            strategy_config = runtime.get('strategy_config') if isinstance(runtime.get('strategy_config'), dict) else {}
             ctx = ScriptBacktestContext(df_exec, float(runtime.get('initial_capital') or 10000))
+            runtime_config = {
+                **strategy_config,
+                'initial_capital': runtime.get('initial_capital') or 10000,
+                'investment_amount': runtime.get('investment_amount') or runtime.get('initial_capital') or 10000,
+                'leverage': runtime.get('leverage') or 1.0,
+                'trade_direction': runtime.get('trade_direction') or 'long',
+            }
+            ctx.set_runtime_config(runtime_config, initial_balance=float(runtime.get('initial_capital') or 10000))
+            template_params = strategy_config.get('script_template_params') or {}
+            if isinstance(template_params, dict):
+                ctx._params = {**ctx._params, **template_params}
+            if ctx.direction in ('long', 'short', 'both'):
+                ctx._params['direction'] = ctx.direction
             exec_env = {
                 '__builtins__': build_safe_builtins(),
                 'np': np,
@@ -2775,6 +2801,44 @@ class BacktestService:
             trade_direction = str(runtime.get('trade_direction') or 'both').lower()
             if trade_direction not in ('long', 'short', 'both'):
                 trade_direction = 'both'
+            leverage = float(runtime.get('leverage') or 1.0)
+            market_type = str((runtime.get('strategy_config') or {}).get('market_type') or '').strip().lower()
+            qty_leverage = 1.0 if market_type == 'spot' else max(1.0, leverage)
+
+            def _positive_float(value: Any) -> float:
+                try:
+                    out = float(value or 0.0)
+                    return out if out > 0 else 0.0
+                except Exception:
+                    return 0.0
+
+            def _order_sizing(order: Dict[str, Any], ref_price: float) -> tuple[float, float, float]:
+                quote = _positive_float(order.get('script_quote_amount'))
+                base_qty = _positive_float(order.get('script_base_qty'))
+                raw_amount = _positive_float(order.get('amount'))
+                if quote > 0 and ref_price > 0:
+                    return quote * qty_leverage / ref_price, quote, 0.0
+                if base_qty > 0:
+                    return base_qty, 0.0, base_qty
+                return raw_amount, 0.0, raw_amount
+
+            def _set_sizing(prefix: str, idx: int, price: float, quote: float, base_qty: float) -> None:
+                if prefix == 'open_long':
+                    open_long_price.iloc[idx] = price
+                    open_long_quote_amount.iloc[idx] = quote
+                    open_long_base_qty.iloc[idx] = base_qty
+                elif prefix == 'open_short':
+                    open_short_price.iloc[idx] = price
+                    open_short_quote_amount.iloc[idx] = quote
+                    open_short_base_qty.iloc[idx] = base_qty
+                elif prefix == 'add_long':
+                    add_long_price.iloc[idx] = price
+                    add_long_quote_amount.iloc[idx] = quote
+                    add_long_base_qty.iloc[idx] = base_qty
+                elif prefix == 'add_short':
+                    add_short_price.iloc[idx] = price
+                    add_short_quote_amount.iloc[idx] = quote
+                    add_short_base_qty.iloc[idx] = base_qty
 
             for i, row in df_exec.iterrows():
                 ctx.current_index = int(i)
@@ -2793,7 +2857,7 @@ class BacktestService:
                     action = str(order.get('action') or '').lower()
                     intent = str(order.get('intent') or 'auto').lower()
                     order_price = float(order.get('price') or bar['close'] or 0)
-                    order_amount = float(order.get('amount') or 0)
+                    order_amount, order_quote, order_base_qty = _order_sizing(order, order_price)
 
                     if action == 'close':
                         if ctx.position.has_long():
@@ -2820,16 +2884,20 @@ class BacktestService:
                         if trade_direction in ('long', 'both'):
                             if ctx.position.has_long():
                                 add_long.iloc[i] = True
+                                _set_sizing('add_long', i, order_price, order_quote, order_base_qty)
                             else:
                                 open_long.iloc[i] = True
+                                _set_sizing('open_long', i, order_price, order_quote, order_base_qty)
                             ctx.position.open_long(order_price, order_amount)
                         continue
                     if intent == 'open_short':
                         if trade_direction in ('short', 'both'):
                             if ctx.position.has_short():
                                 add_short.iloc[i] = True
+                                _set_sizing('add_short', i, order_price, order_quote, order_base_qty)
                             else:
                                 open_short.iloc[i] = True
+                                _set_sizing('open_short', i, order_price, order_quote, order_base_qty)
                             ctx.position.open_short(order_price, order_amount)
                         continue
 
@@ -2841,8 +2909,10 @@ class BacktestService:
                         if trade_direction in ('long', 'both'):
                             if ctx.position.has_long():
                                 add_long.iloc[i] = True
+                                _set_sizing('add_long', i, order_price, order_quote, order_base_qty)
                             else:
                                 open_long.iloc[i] = True
+                                _set_sizing('open_long', i, order_price, order_quote, order_base_qty)
                             ctx.position.open_long(order_price, order_amount)
                         continue
 
@@ -2853,8 +2923,10 @@ class BacktestService:
                         if trade_direction in ('short', 'both'):
                             if ctx.position.has_short():
                                 add_short.iloc[i] = True
+                                _set_sizing('add_short', i, order_price, order_quote, order_base_qty)
                             else:
                                 open_short.iloc[i] = True
+                                _set_sizing('open_short', i, order_price, order_quote, order_base_qty)
                             ctx.position.open_short(order_price, order_amount)
 
             return {
@@ -2864,6 +2936,18 @@ class BacktestService:
                 'close_short': close_short,
                 'add_long': add_long,
                 'add_short': add_short,
+                'open_long_quote_amount': open_long_quote_amount,
+                'open_short_quote_amount': open_short_quote_amount,
+                'add_long_quote_amount': add_long_quote_amount,
+                'add_short_quote_amount': add_short_quote_amount,
+                'open_long_base_qty': open_long_base_qty,
+                'open_short_base_qty': open_short_base_qty,
+                'add_long_base_qty': add_long_base_qty,
+                'add_short_base_qty': add_short_base_qty,
+                'open_long_price': open_long_price,
+                'open_short_price': open_short_price,
+                'add_long_price': add_long_price,
+                'add_short_price': add_short_price,
                 'logs': ctx.flush_logs(),
             }
         except Exception as e:
@@ -3151,6 +3235,11 @@ class BacktestService:
             close_long_arr = np.insert(close_long_arr[:-1], 0, False)
             open_short_arr = np.insert(open_short_arr[:-1], 0, False)
             close_short_arr = np.insert(close_short_arr[:-1], 0, False)
+            def _shift_float_arr(arr):
+                return np.insert(arr[:-1], 0, 0.0)
+        else:
+            def _shift_float_arr(arr):
+                return arr
         
         # Filter signals by trade direction
         if trade_direction == 'long':
@@ -3169,24 +3258,68 @@ class BacktestService:
             add_long_arr = signals['add_long'].values
             add_short_arr = signals['add_short'].values
             position_size_arr = signals.get('position_size', pd.Series([0.0] * len(df))).values
+            if signal_timing in ['next_bar_open', 'next_open', 'nextopen', 'next']:
+                add_long_arr = np.insert(add_long_arr[:-1], 0, False)
+                add_short_arr = np.insert(add_short_arr[:-1], 0, False)
+                position_size_arr = _shift_float_arr(position_size_arr)
             
             # Filter add signals by trade direction
             if trade_direction == 'long':
                 add_short_arr = np.zeros(len(df), dtype=bool)
             elif trade_direction == 'short':
                 add_long_arr = np.zeros(len(df), dtype=bool)
+        else:
+            position_size_arr = np.zeros(len(df), dtype=float)
         
         # Entry trigger price (if indicator provides)
-        open_long_price_arr = signals.get('open_long_price', pd.Series([0.0] * len(df))).values
-        open_short_price_arr = signals.get('open_short_price', pd.Series([0.0] * len(df))).values
+        open_long_price_arr = _shift_float_arr(signals.get('open_long_price', pd.Series([0.0] * len(df))).values)
+        open_short_price_arr = _shift_float_arr(signals.get('open_short_price', pd.Series([0.0] * len(df))).values)
         
         # Exit target price (if indicator provides)
-        close_long_price_arr = signals.get('close_long_price', pd.Series([0.0] * len(df))).values
-        close_short_price_arr = signals.get('close_short_price', pd.Series([0.0] * len(df))).values
+        close_long_price_arr = _shift_float_arr(signals.get('close_long_price', pd.Series([0.0] * len(df))).values)
+        close_short_price_arr = _shift_float_arr(signals.get('close_short_price', pd.Series([0.0] * len(df))).values)
         
         # Add position price (if indicator provides)
-        add_long_price_arr = signals.get('add_long_price', pd.Series([0.0] * len(df))).values
-        add_short_price_arr = signals.get('add_short_price', pd.Series([0.0] * len(df))).values
+        add_long_price_arr = _shift_float_arr(signals.get('add_long_price', pd.Series([0.0] * len(df))).values)
+        add_short_price_arr = _shift_float_arr(signals.get('add_short_price', pd.Series([0.0] * len(df))).values)
+
+        open_long_quote_arr = _shift_float_arr(signals.get('open_long_quote_amount', pd.Series([0.0] * len(df))).values)
+        open_short_quote_arr = _shift_float_arr(signals.get('open_short_quote_amount', pd.Series([0.0] * len(df))).values)
+        add_long_quote_arr = _shift_float_arr(signals.get('add_long_quote_amount', pd.Series([0.0] * len(df))).values)
+        add_short_quote_arr = _shift_float_arr(signals.get('add_short_quote_amount', pd.Series([0.0] * len(df))).values)
+        open_long_base_qty_arr = _shift_float_arr(signals.get('open_long_base_qty', pd.Series([0.0] * len(df))).values)
+        open_short_base_qty_arr = _shift_float_arr(signals.get('open_short_base_qty', pd.Series([0.0] * len(df))).values)
+        add_long_base_qty_arr = _shift_float_arr(signals.get('add_long_base_qty', pd.Series([0.0] * len(df))).values)
+        add_short_base_qty_arr = _shift_float_arr(signals.get('add_short_base_qty', pd.Series([0.0] * len(df))).values)
+
+        market_type_cfg = str((cfg.get('market_type') or cfg.get('marketType') or '')).strip().lower()
+        sizing_leverage = 1.0 if market_type_cfg == 'spot' else max(1.0, float(leverage or 1))
+
+        def _shares_from_explicit_or_pct(
+            *,
+            exec_price: float,
+            capital_now: float,
+            quote_amount: float = 0.0,
+            base_qty: float = 0.0,
+            fallback_pct: Optional[float] = None,
+            fallback_full: bool = True,
+        ) -> float:
+            try:
+                if float(base_qty or 0.0) > 0:
+                    return float(base_qty)
+            except Exception:
+                pass
+            try:
+                if float(quote_amount or 0.0) > 0 and exec_price > 0:
+                    return (float(quote_amount) * sizing_leverage) / float(exec_price)
+            except Exception:
+                pass
+            position_pct = fallback_pct
+            if position_pct is not None and position_pct > 0 and position_pct < 1:
+                return (float(capital_now) * position_pct * float(leverage or 1)) / float(exec_price)
+            if fallback_full:
+                return (float(capital_now) * float(leverage or 1)) / float(exec_price)
+            return 0.0
         
         for i, (timestamp, row) in enumerate(df.iterrows()):
             if is_liquidated:
@@ -3781,10 +3914,18 @@ class BacktestService:
                     target_price = add_long_price_arr[i] if add_long_price_arr[i] > 0 else close
                     exec_price = target_price * (1 + slippage)
                     
-                    # Use specified pct to add
+                    # Use explicit script sizing first; fallback to pct scale-in.
                     position_pct = position_size_arr[i] if position_size_arr[i] > 0 else 0.1
-                    use_capital = capital * position_pct
-                    shares = (use_capital * leverage) / exec_price
+                    shares = _shares_from_explicit_or_pct(
+                        exec_price=exec_price,
+                        capital_now=capital,
+                        quote_amount=add_long_quote_arr[i],
+                        base_qty=add_long_base_qty_arr[i],
+                        fallback_pct=position_pct,
+                        fallback_full=False,
+                    )
+                    if shares <= 0:
+                        continue
                     commission_fee = shares * exec_price * commission
                     
                     # Update average cost
@@ -3813,10 +3954,18 @@ class BacktestService:
                     target_price = add_short_price_arr[i] if add_short_price_arr[i] > 0 else close
                     exec_price = target_price * (1 - slippage)
                     
-                    # Use specified pct to add
+                    # Use explicit script sizing first; fallback to pct scale-in.
                     position_pct = position_size_arr[i] if position_size_arr[i] > 0 else 0.1
-                    use_capital = capital * position_pct
-                    shares = (use_capital * leverage) / exec_price
+                    shares = _shares_from_explicit_or_pct(
+                        exec_price=exec_price,
+                        capital_now=capital,
+                        quote_amount=add_short_quote_arr[i],
+                        base_qty=add_short_base_qty_arr[i],
+                        fallback_pct=position_pct,
+                        fallback_full=False,
+                    )
+                    if shares <= 0:
+                        continue
                     commission_fee = shares * exec_price * commission
                     
                     # Update average cost
@@ -3887,17 +4036,22 @@ class BacktestService:
                         base_price = open_long_price_arr[i] if open_long_price_arr[i] > 0 else close
                     exec_price = base_price * (1 + slippage)
                     
-                    # Use specified pct (entryPct > position_size > full)
+                    # Use explicit script sizing first; fallback to pct/full.
                     position_pct = None
-                    if entry_pct_cfg and entry_pct_cfg > 0:
+                    if open_long_quote_arr[i] <= 0 and open_long_base_qty_arr[i] <= 0 and entry_pct_cfg and entry_pct_cfg > 0:
                         position_pct = entry_pct_cfg
-                    elif has_position_management and position_size_arr[i] > 0:
+                    elif open_long_quote_arr[i] <= 0 and open_long_base_qty_arr[i] <= 0 and has_position_management and position_size_arr[i] > 0:
                         position_pct = position_size_arr[i]
-                    if position_pct is not None and position_pct > 0 and position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
+                    shares = _shares_from_explicit_or_pct(
+                        exec_price=exec_price,
+                        capital_now=capital,
+                        quote_amount=open_long_quote_arr[i],
+                        base_qty=open_long_base_qty_arr[i],
+                        fallback_pct=position_pct,
+                        fallback_full=True,
+                    )
+                    if shares <= 0:
+                        continue
                     
                     commission_fee = shares * exec_price * commission
                     
@@ -4011,17 +4165,22 @@ class BacktestService:
                         base_price = open_short_price_arr[i] if open_short_price_arr[i] > 0 else close
                     exec_price = base_price * (1 - slippage)
                     
-                    # Use specified pct (entryPct > position_size > full)
+                    # Use explicit script sizing first; fallback to pct/full.
                     position_pct = None
-                    if entry_pct_cfg and entry_pct_cfg > 0:
+                    if open_short_quote_arr[i] <= 0 and open_short_base_qty_arr[i] <= 0 and entry_pct_cfg and entry_pct_cfg > 0:
                         position_pct = entry_pct_cfg
-                    elif has_position_management and position_size_arr[i] > 0:
+                    elif open_short_quote_arr[i] <= 0 and open_short_base_qty_arr[i] <= 0 and has_position_management and position_size_arr[i] > 0:
                         position_pct = position_size_arr[i]
-                    if position_pct is not None and position_pct > 0 and position_pct < 1:
-                        use_capital = capital * position_pct
-                        shares = (use_capital * leverage) / exec_price
-                    else:
-                        shares = (capital * leverage) / exec_price
+                    shares = _shares_from_explicit_or_pct(
+                        exec_price=exec_price,
+                        capital_now=capital,
+                        quote_amount=open_short_quote_arr[i],
+                        base_qty=open_short_base_qty_arr[i],
+                        fallback_pct=position_pct,
+                        fallback_full=True,
+                    )
+                    if shares <= 0:
+                        continue
                     
                     commission_fee = shares * exec_price * commission
                     

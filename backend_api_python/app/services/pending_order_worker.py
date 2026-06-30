@@ -127,6 +127,12 @@ class PendingOrderWorker:
                 ensure_position_ledger_schema()
             except Exception as e:
                 logger.warning("ensure_position_ledger_schema failed: %s", e)
+            try:
+                from app.services.strategy_runtime.schema import ensure_strategy_runtime_schema
+
+                ensure_strategy_runtime_schema()
+            except Exception as e:
+                logger.warning("ensure_strategy_runtime_schema failed: %s", e)
             if self._thread and self._thread.is_alive():
                 return True
             self._stop_event.clear()
@@ -901,6 +907,12 @@ class PendingOrderWorker:
                 order_id=order_id,
                 fill_source="worker_alpaca_fill_sync",
                 close_reason=trade_close_reason_from_payload(payload, str(signal_type or "")),
+                strategy_run_id=int(payload.get("strategy_run_id") or row.get("strategy_run_id") or 0),
+                order_intent_id=int(payload.get("order_intent_id") or row.get("order_intent_id") or 0),
+                basket_id=str(payload.get("basket_id") or ""),
+                exchange_id="alpaca",
+                exchange_order_id=str(exchange_order_id or ""),
+                raw_fill=result.raw or {},
             )
             _pstr = f", profit={profit:.4f}" if profit is not None else ""
             append_strategy_log(
@@ -963,6 +975,22 @@ class PendingOrderWorker:
                     float(avg_price or 0.0),
                     str(exchange_response_json or ""),
                     bool(final and float(filled or 0.0) > 0),
+                    int(order_id),
+                ),
+            )
+            cur.execute(
+                """
+                UPDATE strategy_order_intents soi
+                SET status = CASE WHEN %s > 0 THEN 'filled' ELSE 'submitted' END,
+                    exchange_order_id = COALESCE(NULLIF(%s, ''), exchange_order_id),
+                    updated_at = NOW()
+                FROM pending_orders po
+                WHERE po.id = %s
+                  AND po.order_intent_id = soi.id
+                """,
+                (
+                    float(filled or 0.0),
+                    str(exchange_order_id or ""),
                     int(order_id),
                 ),
             )
@@ -1927,6 +1955,12 @@ class PendingOrderWorker:
                         commission=float(fills.total_fee or 0.0),
                         commission_ccy=str(fills.fee_ccy or "").strip().upper(),
                         close_reason=_close_reason,
+                        strategy_run_id=int(payload.get("strategy_run_id") or order_row.get("strategy_run_id") or 0),
+                        order_intent_id=int(payload.get("order_intent_id") or order_row.get("order_intent_id") or 0),
+                        basket_id=str(payload.get("basket_id") or ""),
+                        exchange_id=str(res.exchange_id or ""),
+                        exchange_order_id=str(res.exchange_order_id or ""),
+                        raw_fill=post_query or {},
                     )
                 logger.info(f"live record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} signal={signal_type}")
                 _profit_str = f", profit={profit:.4f}" if profit is not None else ""
@@ -2077,6 +2111,12 @@ class PendingOrderWorker:
                         order_id=int(order_id),
                         fill_source="worker_ibkr",
                         close_reason=trade_close_reason_from_payload(payload, str(signal_type)),
+                        strategy_run_id=int(payload.get("strategy_run_id") or order_row.get("strategy_run_id") or 0),
+                        order_intent_id=int(payload.get("order_intent_id") or order_row.get("order_intent_id") or 0),
+                        basket_id=str(payload.get("basket_id") or ""),
+                        exchange_id="ibkr",
+                        exchange_order_id=str(exchange_order_id or ""),
+                        raw_fill=result.raw or {},
                     )
                     logger.info(f"IBKR record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
                     _pstr = f", profit={profit:.4f}" if profit is not None else ""
@@ -2214,6 +2254,12 @@ class PendingOrderWorker:
                         order_id=int(order_id),
                         fill_source="worker_alpaca",
                         close_reason=trade_close_reason_from_payload(payload, str(signal_type)),
+                        strategy_run_id=int(payload.get("strategy_run_id") or order_row.get("strategy_run_id") or 0),
+                        order_intent_id=int(payload.get("order_intent_id") or order_row.get("order_intent_id") or 0),
+                        basket_id=str(payload.get("basket_id") or ""),
+                        exchange_id="alpaca",
+                        exchange_order_id=str(exchange_order_id or ""),
+                        raw_fill=result.raw or {},
                     )
                     logger.info(f"Alpaca record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol}")
                     _pstr = f", profit={profit:.4f}" if profit is not None else ""
@@ -2301,6 +2347,17 @@ class PendingOrderWorker:
                 WHERE id = %s
                 """,
                 (str(error or "failed"), int(order_id)),
+            )
+            cur.execute(
+                """
+                UPDATE strategy_order_intents soi
+                SET status = 'rejected',
+                    updated_at = NOW()
+                FROM pending_orders po
+                WHERE po.id = %s
+                  AND po.order_intent_id = soi.id
+                """,
+                (int(order_id),),
             )
             db.commit()
             cur.close()

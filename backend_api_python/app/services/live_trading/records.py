@@ -312,12 +312,17 @@ def ensure_position_ledger_schema() -> None:
         "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS symbol_canonical VARCHAR(50) DEFAULT ''",
         "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS fill_source VARCHAR(32) DEFAULT ''",
         "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS pending_order_id INTEGER DEFAULT 0",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS strategy_run_id INTEGER DEFAULT 0",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS order_intent_id INTEGER DEFAULT 0",
         "ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) DEFAULT 'swap'",
         "ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS credential_id INTEGER DEFAULT 0",
         "ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS inst_id VARCHAR(80) DEFAULT ''",
         "ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS symbol_canonical VARCHAR(50) DEFAULT ''",
         "ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS credential_id INTEGER DEFAULT 0",
         "ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS inst_id VARCHAR(80) DEFAULT ''",
+        "ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS strategy_run_id INTEGER DEFAULT 0",
+        "ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS order_intent_id INTEGER DEFAULT 0",
+        "ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(180) DEFAULT ''",
         """
         CREATE TABLE IF NOT EXISTS qd_account_positions (
             id SERIAL PRIMARY KEY,
@@ -373,6 +378,8 @@ def record_trade(
     inst_id: str = "",
     fill_source: str = "",
     pending_order_id: int = 0,
+    strategy_run_id: int = 0,
+    order_intent_id: int = 0,
 ) -> None:
     value = float(amount or 0.0) * float(price or 0.0)
     if user_id is None:
@@ -403,9 +410,10 @@ def record_trade(
             (user_id, strategy_id, symbol, symbol_canonical, type, price, amount, value, commission,
              commission_ccy, profit, close_reason,
              matched_entry_price, grid_matched_profit,
-             market_type, credential_id, inst_id, fill_source, pending_order_id, created_at)
+             market_type, credential_id, inst_id, fill_source, pending_order_id,
+             strategy_run_id, order_intent_id, created_at)
             VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
             (
                 int(user_id),
@@ -427,6 +435,8 @@ def record_trade(
                 iid,
                 fsrc,
                 poid,
+                int(strategy_run_id or 0),
+                int(order_intent_id or 0),
             ),
         )
         db.commit()

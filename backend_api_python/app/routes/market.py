@@ -21,7 +21,9 @@ from app.services.market.watchlist import (
     list_watchlist,
     normalize_symbol,
     remove_watchlist_item,
+    validate_watchlist_pair,
 )
+from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 from app.utils.market_visibility import is_market_visible, filter_market_items
 
 logger = get_logger(__name__)
@@ -252,14 +254,29 @@ def get_watchlist_prices():
                 user_id,
             )
 
-        watchlist = get_user_watchlist_pairs(user_id)
-        if not watchlist:
-            return jsonify({'code': 1, 'msg': 'success', 'data': []})
+        cache_id = cache_key("watchlist_prices", user_id)
 
-        results = get_price_map(watchlist, timeout_sec=30)
-        success_count = sum(1 for r in results if r.get('price', 0) > 0)
-        logger.info("Watchlist prices: %s/%s successful", success_count, len(results))
+        def _compute():
+            watchlist = get_user_watchlist_pairs(user_id)
+            if not watchlist:
+                return []
+            results = get_price_map(watchlist, timeout_sec=6)
+            success_count = sum(1 for r in results if r.get('price', 0) > 0)
+            logger.debug("Watchlist prices: %s/%s successful", success_count, len(results))
+            return results
+
+        results = guarded_cached(
+            cache_id,
+            _compute,
+            ttl_sec=5,
+            stale_ttl_sec=120,
+            timeout_sec=7,
+            namespace="watchlist_prices",
+            max_concurrent=8,
+        )
         return jsonify({'code': 1, 'msg': 'success', 'data': results})
+    except RequestGuardError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': []}), e.status_code
     except Exception as e:
         logger.error(f"Batch watchlist price fetch failed: {str(e)}")
         logger.error(traceback.format_exc())
@@ -275,8 +292,8 @@ def get_price():
         symbol: Symbol or ticker
     """
     try:
-        market = request.args.get('market', '')
-        symbol = request.args.get('symbol', '')
+        market = (request.args.get('market', '') or '').strip()
+        symbol = normalize_symbol(request.args.get('symbol', ''))
         
         if not market or not symbol:
             return jsonify({
@@ -284,14 +301,28 @@ def get_price():
                 'msg': 'Missing market or symbol parameter(s)',
                 'data': None
             }), 400
+
+        validation_err = validate_watchlist_pair(market, symbol)
+        if validation_err:
+            return jsonify({'code': 0, 'msg': validation_err, 'data': None}), 400
         
-        result = get_single_price(market, symbol)
+        result = guarded_cached(
+            cache_key("market_price", market, symbol),
+            lambda: get_single_price(market, symbol),
+            ttl_sec=5,
+            stale_ttl_sec=120,
+            timeout_sec=6,
+            namespace="market_price",
+            max_concurrent=12,
+        )
         
         return jsonify({
             'code': 1,
             'msg': 'success',
             'data': result
         })
+    except RequestGuardError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), e.status_code
         
     except Exception as e:
         logger.error(f"Failed to fetch price: {str(e)}")

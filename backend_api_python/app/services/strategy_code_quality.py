@@ -11,7 +11,12 @@ def analyze_strategy_code_quality(code: str) -> List[Dict[str, Any]]:
     has_on_init = bool(re.search(r"^\s*def\s+on_init\s*\(", raw, re.MULTILINE))
     has_on_bar = bool(re.search(r"^\s*def\s+on_bar\s*\(", raw, re.MULTILINE))
     has_ctx_param = bool(re.search(r"\bctx\.param\s*\(", raw))
-    has_order_intent = bool(re.search(r"\bctx\.(buy|sell|close_position)\s*\(", raw))
+    has_order_intent = bool(
+        re.search(
+            r"\bctx\.(buy|sell|close_position|open_long|add_long|close_long|open_short|add_short|close_short|basket)\s*\(",
+            raw,
+        )
+    )
 
     if not has_on_init:
         hints.append({"severity": "warn", "code": "MISSING_ON_INIT", "params": {}})
@@ -110,7 +115,7 @@ def strategy_hint_to_text(hint_code: str, params: Dict[str, Any] | None = None, 
         "MISSING_ON_INIT": "Missing on_init(ctx) function.",
         "MISSING_ON_BAR": "Missing on_bar(ctx, bar) function.",
         "NO_CTX_PARAM_DEFAULTS": "No parameter defaults were declared via ctx.param(...).",
-        "NO_ORDER_INTENT": "No order intent like ctx.buy / ctx.sell / ctx.close_position was detected.",
+        "NO_ORDER_INTENT": "No order intent like ctx.buy / ctx.sell / ctx.basket / ctx.close_position was detected.",
         "EMPTY_CODE": "Strategy code is empty.",
     }
     return texts.get(hint_code, f"Strategy hint detected: {hint_code}")

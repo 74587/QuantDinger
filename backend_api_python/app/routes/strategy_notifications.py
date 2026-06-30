@@ -8,6 +8,7 @@ from app.routes.strategy_blueprint import strategy_blp
 from app.utils.auth import login_required
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 
 
 logger = get_logger(__name__)
@@ -109,20 +110,35 @@ def get_unread_notification_count():
     """Get unread notification count for the current user."""
     try:
         user_id = g.user_id
-        where, args = _user_notification_scope(user_id)
-        where.insert(0, "is_read = 0")
-        where_sql = "WHERE " + " AND ".join(where)
 
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute(
-                f"SELECT COUNT(1) AS cnt FROM qd_strategy_notifications {where_sql}",
-                tuple(args),
-            )
-            cnt = int((cur.fetchone() or {}).get("cnt") or 0)
-            cur.close()
+        def _compute_unread_count() -> int:
+            where, args = _user_notification_scope(user_id)
+            where.insert(0, "is_read = 0")
+            where_sql = "WHERE " + " AND ".join(where)
+
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    f"SELECT COUNT(1) AS cnt FROM qd_strategy_notifications {where_sql}",
+                    tuple(args),
+                )
+                cnt = int((cur.fetchone() or {}).get("cnt") or 0)
+                cur.close()
+            return cnt
+
+        cnt = guarded_cached(
+            cache_key("unread_count", user_id),
+            _compute_unread_count,
+            ttl_sec=5,
+            stale_ttl_sec=60,
+            timeout_sec=3,
+            namespace="unread_count",
+            max_concurrent=8,
+        )
 
         return jsonify({'code': 1, 'msg': 'success', 'data': {'unread': cnt}})
+    except RequestGuardError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': {'unread': 0}}), e.status_code
     except Exception as e:
         logger.error(f"get_unread_notification_count failed: {str(e)}")
         logger.error(traceback.format_exc())

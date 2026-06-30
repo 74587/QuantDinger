@@ -6,14 +6,16 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from app.services.kline import KlineService
 from app.utils.cache import CacheManager
 from app.utils.logger import get_logger
+from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 
 logger = get_logger(__name__)
 
 kline_service = KlineService()
 _market_cache = CacheManager()
 
-QUOTE_CACHE_TTL_SEC = int(os.getenv("WATCHLIST_QUOTE_CACHE_TTL_SEC", "20"))
+QUOTE_CACHE_TTL_SEC = int(os.getenv("WATCHLIST_QUOTE_CACHE_TTL_SEC", "5"))
 QUOTE_STALE_TTL_SEC = int(os.getenv("WATCHLIST_QUOTE_STALE_TTL_SEC", "600"))
+QUOTE_FETCH_TIMEOUT_SEC = float(os.getenv("WATCHLIST_QUOTE_FETCH_TIMEOUT_SEC", "5"))
 
 
 def _executor_workers() -> int:
@@ -78,11 +80,21 @@ def get_single_price(market: str, symbol: str) -> dict:
         return normalize_price_payload(market, symbol, cached, cached=True)
 
     try:
-        price_data = kline_service.get_realtime_price(market, symbol)
+        price_data = guarded_cached(
+            cache_key("single_quote_fetch", market, symbol),
+            lambda: kline_service.get_realtime_price(market, symbol),
+            ttl_sec=QUOTE_CACHE_TTL_SEC,
+            stale_ttl_sec=QUOTE_STALE_TTL_SEC,
+            timeout_sec=QUOTE_FETCH_TIMEOUT_SEC,
+            namespace="single_quote_fetch",
+            max_concurrent=_executor_workers(),
+        )
         if price_data and float(price_data.get("price") or 0) > 0:
             _market_cache.set(fresh_key, price_data, QUOTE_CACHE_TTL_SEC)
             _market_cache.set(stale_key, price_data, QUOTE_STALE_TTL_SEC)
             return normalize_price_payload(market, symbol, price_data)
+    except RequestGuardError as exc:
+        logger.info("Price fetch guarded for %s:%s - %s", market, symbol, exc)
     except Exception as exc:
         logger.error("Failed to fetch price %s:%s - %s", market, symbol, exc)
 

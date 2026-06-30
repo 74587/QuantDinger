@@ -21,6 +21,7 @@ from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.auth import login_required
+from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 
 logger = get_logger(__name__)
 
@@ -657,110 +658,113 @@ def pending_orders():
         user_id = g.user_id
         page = max(1, _safe_int(request.args.get("page"), 1))
         page_size = max(1, min(200, _safe_int(request.args.get("pageSize"), 20)))
-        offset = (page - 1) * page_size
 
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute("SELECT COUNT(1) AS cnt FROM pending_orders WHERE user_id = ?", (user_id,))
-            total = int((cur.fetchone() or {}).get("cnt") or 0)
-            cur.close()
+        def _compute_pending_orders() -> Dict[str, Any]:
+            offset = (page - 1) * page_size
 
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute(
-                """
-                SELECT o.*,
-                       s.strategy_name,
-                       s.notification_config AS strategy_notification_config,
-                       s.exchange_config AS strategy_exchange_config,
-                       s.market_type AS strategy_market_type,
-                       s.market_category AS strategy_market_category,
-                       s.execution_mode AS strategy_execution_mode
-                FROM pending_orders o
-                LEFT JOIN qd_strategies_trading s ON s.id = o.strategy_id
-                WHERE o.user_id = ?
-                ORDER BY o.id DESC
-                LIMIT ? OFFSET ?
-                """,
-                (user_id, int(page_size), int(offset)),
-            )
-            rows = cur.fetchall() or []
-            cur.close()
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("SELECT COUNT(1) AS cnt FROM pending_orders WHERE user_id = ?", (user_id,))
+                total = int((cur.fetchone() or {}).get("cnt") or 0)
+                cur.close()
 
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            status = (r.get("status") or "").strip().lower()
-            if status == "sent":
-                status = "completed"
-            if status == "deferred":
-                status = "pending"
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT o.*,
+                           s.strategy_name,
+                           s.notification_config AS strategy_notification_config,
+                           s.exchange_config AS strategy_exchange_config,
+                           s.market_type AS strategy_market_type,
+                           s.market_category AS strategy_market_category,
+                           s.execution_mode AS strategy_execution_mode
+                    FROM pending_orders o
+                    LEFT JOIN qd_strategies_trading s ON s.id = o.strategy_id
+                    WHERE o.user_id = ?
+                    ORDER BY o.id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (user_id, int(page_size), int(offset)),
+                )
+                rows = cur.fetchall() or []
+                cur.close()
 
-            # Frontend expects these keys:
-            # - filled_amount, filled_price, error_message
-            filled_amount = float(r.get("filled") or 0.0)
-            filled_price = float(r.get("avg_price") or 0.0) if float(r.get("avg_price") or 0.0) > 0 else float(r.get("price") or 0.0)
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                status = (r.get("status") or "").strip().lower()
+                if status == "sent":
+                    status = "completed"
+                if status == "deferred":
+                    status = "pending"
 
-            # Derive exchange_id + notify channels without leaking secrets to frontend.
-            ex_cfg = _safe_json_loads(r.get("strategy_exchange_config"), {}) or {}
-            notify_cfg = _safe_json_loads(r.get("strategy_notification_config"), {}) or {}
-            exchange_id = (r.get("exchange_id") or ex_cfg.get("exchange_id") or ex_cfg.get("exchangeId") or "").strip().lower()
-            notify_channels = _as_list((notify_cfg or {}).get("channels"))
-            if not notify_channels:
-                notify_channels = ["browser"]
-            market_type = (r.get("market_type") or r.get("strategy_market_type") or ex_cfg.get("market_type") or ex_cfg.get("marketType") or "").strip().lower()
-            market_category = str(r.get("strategy_market_category") or "").strip().lower()
-            execution_mode = str(r.get("strategy_execution_mode") or r.get("execution_mode") or "").strip().lower()
+                filled_amount = float(r.get("filled") or 0.0)
+                filled_price = float(r.get("avg_price") or 0.0) if float(r.get("avg_price") or 0.0) > 0 else float(r.get("price") or 0.0)
 
-            # If non-crypto markets are "signal-only", show SIGNAL instead of blank exchange.
-            exchange_display = exchange_id
-            if not exchange_display:
-                if execution_mode == "signal" or (market_category and market_category != "crypto"):
-                    exchange_display = "signal"
+                ex_cfg = _safe_json_loads(r.get("strategy_exchange_config"), {}) or {}
+                notify_cfg = _safe_json_loads(r.get("strategy_notification_config"), {}) or {}
+                exchange_id = (r.get("exchange_id") or ex_cfg.get("exchange_id") or ex_cfg.get("exchangeId") or "").strip().lower()
+                notify_channels = _as_list((notify_cfg or {}).get("channels"))
+                if not notify_channels:
+                    notify_channels = ["browser"]
+                market_type = (r.get("market_type") or r.get("strategy_market_type") or ex_cfg.get("market_type") or ex_cfg.get("marketType") or "").strip().lower()
+                market_category = str(r.get("strategy_market_category") or "").strip().lower()
+                execution_mode = str(r.get("strategy_execution_mode") or r.get("execution_mode") or "").strip().lower()
 
-            out.append(
-                {
-                    **r,
-                    "strategy_name": r.get("strategy_name") or "",
-                    "status": status,
-                    "filled_amount": filled_amount,
-                    "filled_price": filled_price,
-                    "error_message": r.get("last_error") or "",
-                    "exchange_id": exchange_id,
-                    "exchange_display": exchange_display,
-                    "notify_channels": notify_channels,
-                    "market_type": market_type or (r.get("market_type") or ""),
-                    # Format datetime fields for JSON serialization
-                    "created_at": _format_datetime(r.get("created_at")),
-                    "updated_at": _format_datetime(r.get("updated_at")),
-                    "executed_at": _format_datetime(r.get("executed_at")),
-                    "processed_at": _format_datetime(r.get("processed_at")),
-                    "sent_at": _format_datetime(r.get("sent_at")),
-                }
-            )
+                exchange_display = exchange_id
+                if not exchange_display:
+                    if execution_mode == "signal" or (market_category and market_category != "crypto"):
+                        exchange_display = "signal"
 
-        # Never expose these strategy-level config blobs.
-        for item in out:
-            try:
-                item.pop("strategy_exchange_config", None)
-                item.pop("strategy_notification_config", None)
-                item.pop("strategy_market_type", None)
-                item.pop("strategy_market_category", None)
-                item.pop("strategy_execution_mode", None)
-            except Exception:
-                pass
+                out.append(
+                    {
+                        **r,
+                        "strategy_name": r.get("strategy_name") or "",
+                        "status": status,
+                        "filled_amount": filled_amount,
+                        "filled_price": filled_price,
+                        "error_message": r.get("last_error") or "",
+                        "exchange_id": exchange_id,
+                        "exchange_display": exchange_display,
+                        "notify_channels": notify_channels,
+                        "market_type": market_type or (r.get("market_type") or ""),
+                        "created_at": _format_datetime(r.get("created_at")),
+                        "updated_at": _format_datetime(r.get("updated_at")),
+                        "executed_at": _format_datetime(r.get("executed_at")),
+                        "processed_at": _format_datetime(r.get("processed_at")),
+                        "sent_at": _format_datetime(r.get("sent_at")),
+                    }
+                )
 
-        return jsonify(
-            {
-                "code": 1,
-                "msg": "success",
-                "data": {
-                    "list": out,
-                    "page": page,
-                    "pageSize": page_size,
-                    "total": total,
-                },
+            for item in out:
+                try:
+                    item.pop("strategy_exchange_config", None)
+                    item.pop("strategy_notification_config", None)
+                    item.pop("strategy_market_type", None)
+                    item.pop("strategy_market_category", None)
+                    item.pop("strategy_execution_mode", None)
+                except Exception:
+                    pass
+
+            return {
+                "list": out,
+                "page": page,
+                "pageSize": page_size,
+                "total": total,
             }
+
+        data = guarded_cached(
+            cache_key("pending_orders", user_id, page, page_size),
+            _compute_pending_orders,
+            ttl_sec=5,
+            stale_ttl_sec=60,
+            timeout_sec=4,
+            namespace="pending_orders",
+            max_concurrent=8,
         )
+        return jsonify({"code": 1, "msg": "success", "data": data})
+    except RequestGuardError as e:
+        return jsonify({"code": 0, "msg": str(e), "data": None}), e.status_code
     except Exception as e:
         logger.error(f"dashboard pendingOrders failed: {e}", exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500

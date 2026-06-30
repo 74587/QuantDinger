@@ -154,6 +154,8 @@ def create_strategy():
         payload['strategy_type'] = payload.get('strategy_type') or 'IndicatorStrategy'
         new_id = get_strategy_service().create_strategy(payload)
         return jsonify({'code': 1, 'msg': 'success', 'data': {'id': new_id}})
+    except ValueError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
     except Exception as e:
         logger.error(f"create_strategy failed: {str(e)}")
         logger.error(traceback.format_exc())
@@ -191,6 +193,8 @@ def batch_create_strategies():
                 'msg': 'Batch creation failed',
                 'data': result
             })
+    except ValueError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
     except Exception as e:
         logger.error(f"batch_create_strategies failed: {str(e)}")
         logger.error(traceback.format_exc())
@@ -305,20 +309,31 @@ def batch_stop_strategies():
         if not strategy_ids:
             return jsonify({'code': 0, 'msg': 'Please provide strategy IDs', 'data': None}), 400
         
-        # Stop executor first
+        # Persist stop intent first so restart restore will not resume them.
+        result = get_strategy_service().batch_stop_strategies(strategy_ids, user_id=user_id)
+        stopped_ids = list(result.get('success_ids') or [])
+        executor_failed = []
         executor = get_trading_executor()
-        for sid in strategy_ids:
+        for sid in stopped_ids:
             try:
-                executor.stop_strategy(sid)
+                if not executor.stop_strategy(sid, persist_status=False):
+                    executor_failed.append({'id': sid, 'error': 'runtime stop failed'})
             except Exception as e:
                 logger.error(f"Failed to stop executor for strategy {sid}: {e}")
-        
-        # Then update database status
-        result = get_strategy_service().batch_stop_strategies(strategy_ids, user_id=user_id)
+                executor_failed.append({'id': sid, 'error': str(e)})
+        if executor_failed:
+            result.setdefault('failed_ids', []).extend(executor_failed)
+        success_count = len(result.get('success_ids', []))
+        failed_count = len(result.get('failed_ids', []))
+        ok = result['success'] and not executor_failed
         
         return jsonify({
-            'code': 1 if result['success'] else 0,
-            'msg': f"Successfully stopped {len(result.get('success_ids', []))} strategies",
+            'code': 1 if ok else 0,
+            'msg': (
+                f"Stopped {success_count} strategies"
+                if ok else
+                f"Stopped {success_count} strategies; {failed_count} failed"
+            ),
             'data': result
         })
     except Exception as e:
@@ -385,6 +400,8 @@ def update_strategy():
         if not ok:
             return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
         return jsonify({'code': 1, 'msg': 'success', 'data': None})
+    except ValueError as e:
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 400
     except Exception as e:
         logger.error(f"update_strategy failed: {str(e)}")
         logger.error(traceback.format_exc())
@@ -439,16 +456,36 @@ def stop_strategy():
         if strategy_type == 'PromptBasedStrategy':
             return jsonify({'code': 0, 'msg': 'AI strategy has been removed; local edition does not support starting/stopping AI strategies', 'data': None}), 400
 
-        # Indicator strategy
-        get_trading_executor().stop_strategy(strategy_id)
-        
-        # Update strategy status
-        get_strategy_service().update_strategy_status(strategy_id, 'stopped', user_id=user_id)
+        # Persist the user's stop intent first.  Startup restore only resumes
+        # rows still marked as running, so this write is the critical contract.
+        status_ok = get_strategy_service().update_strategy_status(strategy_id, 'stopped', user_id=user_id)
+        if not status_ok:
+            return jsonify({
+                'code': 0,
+                'msg': 'Failed to persist stopped status; strategy may resume on restart',
+                'data': None
+            }), 500
+
+        executor_ok = get_trading_executor().stop_strategy(strategy_id, persist_status=False)
+        if not executor_ok:
+            return jsonify({
+                'code': 0,
+                'msg': 'Stopped status was saved, but runtime thread stop failed; please refresh and retry',
+                'data': {'status': 'stopped'}
+            }), 500
+
+        latest = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not latest or str(latest.get('status') or '').lower() != 'stopped':
+            return jsonify({
+                'code': 0,
+                'msg': 'Stop verification failed; strategy status is not stopped',
+                'data': {'status': latest.get('status') if latest else None}
+            }), 500
         
         return jsonify({
             'code': 1,
             'msg': 'Stopped successfully',
-            'data': None
+            'data': {'status': 'stopped'}
         })
         
     except Exception as e:
@@ -837,10 +874,14 @@ def ai_generate_strategy():
             template_key = payload.get('template_key') or ''
             current_params = payload.get('params') or {}
             code_snapshot = (payload.get('code') or '')[:8000]
-            system_prompt = """You tune quantitative strategy template parameters from the user's request.
+            system_prompt = """You tune QuantDinger script-code template parameters from the user's request.
 Return ONLY a single JSON object: keys are parameter names (strings), values are JSON numbers or booleans.
 You may return a partial object (only keys that should change) or a full object.
 Do not use markdown fences, do not add explanations before or after the JSON.
+
+Hard boundary:
+- Do not return symbol, timeframe, market_type, direction, trade_direction, investment_amount, initial_capital, leverage, or base_notional.
+- Those fields are selected in the run panel, not tuned as script template parameters.
 
 Percent parameter convention (IMPORTANT):
 - Template UI stores percent-type fields on a 0-100 scale (80 = 80%, 2.5 = 2.5%).
@@ -886,33 +927,41 @@ Percent parameter convention (IMPORTANT):
                 return jsonify({'code': '', 'params': None, 'msg': _strategy_ai_text('invalid_json_params', lang)})
             return jsonify({'code': '', 'params': updates, 'msg': _strategy_ai_text('success', lang)})
 
-        system_prompt = """You are a quantitative trading strategy code generator.
-Generate Python strategy code that follows this framework:
-- def on_init(ctx): Initialize strategy parameters using ctx.param(name, default)
-- def on_bar(ctx, bar): Core logic called on each K-line bar
-  - bar supports both bar.close and bar['close'] access, and has: open, high, low, close, volume, timestamp
-  - Preferred actions: ctx.open_long/open_short(amount, price), ctx.add_long/add_short(amount, price), ctx.close_long/close_short(amount=None, price=None), ctx.close_position(); ctx.buy/sell are legacy helpers
-  - ctx.position supports both numeric checks and dict-style fields:
-    - if not ctx.position / if ctx.position > 0 / if ctx.position < 0
-    - ctx.position['side'], ctx.position['size'], ctx.position['entry_price']
-  - ctx.balance, ctx.equity
-  - ctx.bars(n) to get last N bars, ctx.log(message) to log
-Return ONLY the Python code, no explanations.
+        system_prompt = """You are a QuantDinger script-code generator.
+Return ONLY Python code. Do not use markdown fences or explanations.
 
-Quality rules:
-- Always define both on_init(ctx) and on_bar(ctx, bar)
-- Prefer reading defaults via ctx.param(...)
-- Use open_long/open_short for first entries, add_long/add_short only for intentional scale-ins, and close_long/close_short/close_position for exits
-- Entry logic must be event-based: use cross_up = prev_fast <= prev_slow and fast > slow, breakout = prev_close <= level and close > level. Do NOT enter on persistent states like `if not ctx.position and fast > slow:`.
-- Scale-ins must have layer count, price distance/cooldown, and max layers; call ctx.add_long/add_short, not ctx.buy/ctx.sell.
-- Generated code must compile cleanly
-- Avoid markdown fences or explanatory text
+Framework:
+- Always define def on_init(ctx): and def on_bar(ctx, bar):.
+- on_bar runs on the platform's fixed 1m bar stream; live execution also checks the latest price every 10 seconds.
+- bar supports bar['open'], bar['high'], bar['low'], bar['close'], bar['volume'], bar['timestamp'].
+- Use ctx.bars(n), ctx.state.get/set(...), ctx.log(...), and ctx.basket(side).
+
+Product boundary:
+- The run panel owns symbol, spot/swap, direction, investment amount, and leverage.
+- Read those values from ctx.direction, ctx.market_type, ctx.investment_amount, and ctx.leverage when needed.
+- Never define them with ctx.param(...). Do not create ctx.param for direction, trade_direction, market_type, symbol, timeframe, investment_amount, initial_capital, leverage, or base_notional.
+- Strategy code owns only strategy-specific knobs such as periods, multipliers, spacing, take-profit, stop-loss, and cooldown.
+
+Order sizing:
+- For new stateful script strategies, prefer ctx.basket(side).open_child_order(..., notional=quote_amount, price=price, action='open'/'add').
+- Derive quote_amount from ctx.investment_amount. Do not hard-code a base_notional parameter.
+- For spot, only long direction is meaningful; the run panel enforces this.
+- If you must use ctx.open_long/open_short, amount is base quantity, not quote notional. Prefer basket notional sizing for consistency.
+
+State and safety:
+- Use ctx.state for layer counters, anchors, average cost, cooldowns, and last_order_bar.
+- Prevent duplicate orders on the same bar.
+- Scale-ins must have max layer/order limits, price-distance triggers, and hard stop or explicit wait state.
+- Entry logic should be event-based where possible: EMA crosses, channel breaks, band touches, etc.
+
+Sandbox rules:
+- Do not use getattr, setattr, delattr, eval, exec, open, compile, globals, vars, dir, __builtins__, dunder attributes, file/network/database/process APIs, or unsafe imports.
+- Do not import os, sys, requests, urllib, socket, subprocess, threading, multiprocessing, sqlite3, psycopg, sqlalchemy, pathlib, tempfile, glob, io, operator, pickle, or ctypes.
+- Keep loops bounded by lookback windows. Do not create unbounded lists or infinite loops.
 
 Percent / ratio convention:
 - ctx.param defaults for *_pct fields must use 0-1 ratios (0.8 = 80%, 0.025 = 2.5%).
-- When sizing with ctx.equity * some_pct, keep some_pct as a 0-1 ratio.
-- Template UI may show 0-100; only the Python default literals should be ratios.
-- If user says "80% position", use ctx.param('position_pct', 0.8) and qty = ctx.equity * ctx.position_pct / price.
+- Template UI may show 0-100; Python default literals must remain ratios.
 """
 
         extra = ''
@@ -987,8 +1036,10 @@ Percent / ratio convention:
                 "# Repair requirements\n"
                 "- Must define both on_init(ctx) and on_bar(ctx, bar).\n"
                 "- Must compile and run in QuantDinger strategy runtime.\n"
-                "- Prefer ctx.param(...) for defaults; use explicit open/add/close actions.\n"
-                "- Entry conditions must be edge/crossing events; scale-ins must call add_long/add_short deliberately.\n"
+                "- Use ctx.param(...) only for strategy knobs, never for symbol/market/direction/investment/leverage/base_notional.\n"
+                "- Do not use getattr/setattr/delattr or any unsafe file/network/import/introspection API.\n"
+                "- Prefer ctx.basket(side).open_child_order(..., notional=quote_amount, price=price) for entries and adds.\n"
+                "- Entry conditions must be edge/crossing events; scale-ins need layer limits, distance triggers, and cooldowns.\n"
                 "- Return Python only, no markdown, no explanation."
             )
             repaired_content = llm.call_llm_api(
