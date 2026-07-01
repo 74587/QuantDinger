@@ -42,7 +42,7 @@
     <img src="https://img.shields.io/badge/Docker-Compose%20Ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
     <img src="https://img.shields.io/badge/Frontend-Prebuilt-1f8b4c?style=flat-square" alt="Frontend">
     <img src="https://img.shields.io/badge/Agent%20Gateway-MCP%20Ready-6f42c1?style=flat-square" alt="Agent Gateway">
-    <img src="https://img.shields.io/badge/PostgreSQL-16-336791?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL">
+    <img src="https://img.shields.io/badge/PostgreSQL-18-336791?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL">
     <img src="https://img.shields.io/github/stars/brokermr810/QuantDinger?style=flat-square&logo=github" alt="Stars">
     <img src="https://img.shields.io/github/forks/brokermr810/QuantDinger?style=flat-square&logo=github&label=Forks" alt="Forks">
   </p>
@@ -165,7 +165,7 @@ QuantDinger is a **self-hosted, local-first** quantitative infrastructure layer 
 | **Agent-native** | First-class **Agent Gateway** (`/api/agent/v1`) + **[`quantdinger-mcp`](https://pypi.org/project/quantdinger-mcp/)** on PyPI — Cursor, Claude Code, and Codex can read markets, run backtests, and trade (paper by default) with full audit logs. |
 | **Dual strategy runtimes** | **`IndicatorStrategy`** (four-way dataframe signals + chart overlays) and **`ScriptStrategy`** (event-driven `on_bar`, explicit orders) — research and production in the same codebase. |
 | **Multi-venue execution** | Direct adapters for Binance, OKX, Bitget, Bybit, Gate, HTX, Coinbase Exchange, Kraken, **IBKR**, and **Alpaca** — unified Broker Accounts page with isolated multi-tenant sessions. |
-| **Production-grade infra** | **PostgreSQL 16** + **Redis 7**, connection pooling, background workers (orders, portfolio monitor, reflection), idempotent schema bootstrap, GHCR multi-arch images (amd64/arm64). |
+| **Production-grade infra** | **PostgreSQL 18** + **Redis 7**, connection pooling, background workers (orders, portfolio monitor, reflection), idempotent schema bootstrap, GHCR multi-arch images (amd64/arm64). |
 | **Security by default** | Refuses default `SECRET_KEY`, agent tokens hashed at rest, **paper-only trading** unless explicitly unlocked server-side, every agent call audit-logged. |
 | **Operator-ready** | OAuth, multi-user roles, credits/membership/USDT billing toggles, an 11-language web UI, and multilingual docs — build a commercial quant product on top, not just a hobby bot. |
 
@@ -235,13 +235,13 @@ Deeper references: [AI Integration design](docs/agent/AI_INTEGRATION_DESIGN.md) 
 - **Build** — Professional KLine chart UI; `IndicatorStrategy` (four-way dataframe signals: `open_long`, `close_long`, `open_short`, `close_short`) and `ScriptStrategy` (`on_bar`, `ctx.buy()` / `ctx.sell()`); AI code generation as a starting point, Python as source of truth.
 - **Validate** — Server-side backtests with equity curves, drawdown metrics, trade logs, and strategy snapshots — no client-side-only backtest theater.
 - **Operate** — Live strategy bots, quick trade, crypto spot/swap execution through direct exchange adapters, **IBKR** / **Alpaca** workflows for traditional markets; unified **Broker Accounts** page; notifications (Telegram, email, SMS, Discord, webhooks).
-- **Platform** — Docker Compose + GHCR images, PostgreSQL 16, Redis 7, OAuth, multi-user RBAC, credits / membership / USDT billing toggles, an 11-language web UI, and multilingual documentation.
+- **Platform** — Docker Compose + GHCR images, PostgreSQL 18, Redis 7, OAuth, multi-user RBAC, credits / membership / USDT billing toggles, an 11-language web UI, and multilingual documentation.
 
 ## Architecture
 
 **Design principle:** separate **market data ingestion**, **strategy/backtest compute**, and **order execution** so research never shares a code path with live capital unless you explicitly promote a strategy.
 
-**Stack:** Nginx serves the prebuilt Vue SPA (`ghcr.io/brokermr810/quantdinger-frontend`); **Flask + Gunicorn** API hosts strategy, AI, billing, and agent services; **PostgreSQL 16** is the system of record; **Redis 7** backs cache and worker coordination. Exchanges, brokers, LLMs, and payment rails plug in through env-driven adapters — swap providers without forking core code.
+**Stack:** Nginx serves the prebuilt Vue SPA (`ghcr.io/brokermr810/quantdinger-frontend`); **Flask + Gunicorn** API hosts strategy, AI, billing, and agent services; **PostgreSQL 18** is the system of record; **Redis 7** backs cache and worker coordination. Exchanges, brokers, LLMs, and payment rails plug in through env-driven adapters — swap providers without forking core code.
 
 **Runtime flow:** market feeds → indicator/signal layer → strategy engine → backtest or live runtime → venue-specific execution adapters; pending orders dispatched by background workers with health checks and retry semantics.
 
@@ -267,7 +267,7 @@ flowchart LR
     end
 
     subgraph DATA[State Layer]
-        PG[(PostgreSQL 16)]
+        PG[(PostgreSQL 18)]
         REDIS[(Redis 7)]
         FILES[Logs and Runtime Data]
     end
@@ -331,7 +331,14 @@ cd QuantDinger
 cp backend_api_python/env.example backend_api_python/.env
 ```
 
-Almost all runtime behavior is driven by **`backend_api_python/.env`** (database URL, admin user, LLM keys, workers, billing toggles, etc.). The optional **repository root** `.env` only adjusts Compose-level concerns such as **ports** and **image mirrors** (`IMAGE_PREFIX`).
+Almost all application behavior is driven by **`backend_api_python/.env`** (admin user, LLM keys, workers, billing toggles, broker settings, etc.).
+
+The optional **repository root** `.env` is for Docker Compose orchestration: exposed ports, image mirrors (`IMAGE_PREFIX`), image tags, Postgres image/version, Postgres data mount, `PGDATA`, and the Compose-generated `DATABASE_URL`. Keep this boundary clear:
+
+| File | Owns |
+|------|------|
+| `backend_api_python/.env` or `backend.env` | Application runtime settings used by the Flask API. |
+| Repository-root `.env` | Docker Compose substitutions such as ports, image tags, Postgres/Redis wiring, and host paths. |
 
 ### 3) Set `SECRET_KEY` and admin credentials before the first boot (mandatory)
 
@@ -369,6 +376,46 @@ docker compose up -d
 - For UI development from Vue source, clone **QuantDinger-Vue** into `./QuantDinger-Vue/` and add `-f docker-compose.build.yml` to the command (see *Build the frontend from Vue source* below).
 
 Services: **`postgres`**, **`redis`**, **`backend`**, **`frontend`**, **`mobile`** (see `docker-compose.yml`).
+
+#### Existing PostgreSQL data or 1Panel migration
+
+For a fresh install, do nothing: Compose creates its own Postgres volume.
+
+For an existing production database, prefer `pg_dump` / `pg_restore` when the dataset is manageable. If the data directory is too large and must be mounted directly, all of these must match:
+
+- The Postgres **major version** of the image and the existing data directory.
+- The exact container `PGDATA`.
+- The database user/password that already exist inside that data directory.
+- Only one Postgres container may use that physical directory at a time.
+
+Check the existing data version before mounting:
+
+```bash
+cat /path/to/old/postgres/data/PG_VERSION
+# or, for a nested 1Panel layout:
+cat /opt/1panel/apps/postgresql/postgresql/data/18/docker/PG_VERSION
+```
+
+Example root `.env` for reusing a PostgreSQL 18 data directory managed by 1Panel:
+
+```ini
+POSTGRES_IMAGE=postgres:18.3-alpine
+POSTGRES_DATA_SOURCE=/opt/1panel/apps/postgresql/postgresql/data/18/docker
+POSTGRES_PGDATA=/var/lib/postgresql/18/docker
+POSTGRES_DB=quantdinger
+POSTGRES_USER=existing_db_user
+POSTGRES_PASSWORD=existing_db_password
+```
+
+Then stop the old database container, recreate the new one, and verify:
+
+```bash
+docker compose up -d postgres
+docker compose logs --tail=100 postgres
+docker compose up -d backend frontend mobile redis
+```
+
+Do **not** mount a PostgreSQL 16 data directory into a PostgreSQL 18 image, or the database will fail with `database files are incompatible with server`.
 
 #### Alternative: zero-repo install from GHCR (lightest)
 
@@ -459,6 +506,19 @@ In the normal Docker stack, you usually do **not** need to edit a frontend API U
 
 For LAN testing on a phone, do not use `localhost` inside the phone browser. Use the host machine's LAN IP, such as `http://192.168.1.10:8889`.
 
+### 5.2) Production runtime checks
+
+The Compose backend runs the API with **Gunicorn** and sets `nofile` to `65535`. That is the recommended production path. Avoid running the backend with `python run.py` on a public server; it is meant for development and commonly inherits a low file-descriptor limit such as `1024`.
+
+After deployment, quick-check the backend container:
+
+```bash
+docker exec quantdinger-backend sh -lc 'echo "ulimit -n=$(ulimit -n)"; cat /proc/1/cmdline | tr "\0" " "; echo'
+curl -fsS http://127.0.0.1:5000/api/health
+```
+
+Expected: `ulimit -n` is high enough for your user scale, and the command line contains Gunicorn. If you deploy through 1Panel or another custom runtime, set the equivalent `nofile` limit there and point the reverse proxy at the running backend port.
+
 ### 6) Optional: enable AI features
 
 AI analysis, NL→code, and related flows need at least one LLM provider configured. Open `backend_api_python/env.example`, find the **AI / LLM** block, copy the relevant keys into your `.env` (for example `LLM_PROVIDER` + `OPENROUTER_API_KEY`, or another supported provider). Restart the backend after edits.
@@ -499,6 +559,10 @@ If `py` is not on PATH, use `python` or `python3` in the one-liner that generate
 | `redis` / `python` / `node` pull fails, `content size of zero` | Docker Hub unreachable from Docker Desktop. Set root `.env` `IMAGE_PREFIX=docker.m.daocloud.io/library/` and/or configure **Docker Desktop → Proxies** (system VPN alone is often not enough). |
 | Backend exits immediately | `SECRET_KEY` still default, or invalid `.env` syntax. Read `docker compose logs backend`. |
 | Blank page or API errors from browser | `FRONTEND_URL` / origins mismatch; API not reachable from the host you opened. |
+| Browser shows `502 Bad Gateway` | The reverse proxy cannot reach the backend. Check `docker compose ps`, `docker compose logs --tail=100 backend`, and make sure Nginx/OpenResty points to `quantdinger-backend:5000` inside Compose or to the exposed host port. |
+| `database files are incompatible with server` | The Postgres image major version does not match the mounted data directory. Set `POSTGRES_IMAGE` to the existing data major version, or restore through `pg_dump` / `pg_restore`. |
+| `password authentication failed for user ...` | The root `.env` `POSTGRES_USER` / `POSTGRES_PASSWORD` or `DATABASE_URL` does not match the user stored in the existing data directory. Fix the root `.env`, then recreate the backend container. |
+| `Too many open files` or `ulimit -n` is `1024` | Use the bundled Compose backend or configure your custom runtime with `nofile` around `65535`, then recreate the container. Restarting without recreating usually keeps the old limit. |
 | Mobile or web source dev calls the wrong backend | Use `VITE_DEV_PROXY_TARGET` for `QuantDinger-Vue`, `VITE_DEV_API_TARGET` for `QuantDinger-Mobile`, and restart the dev server after changing env vars. |
 | Mobile source dev fails with `crypto.hash is not a function` | Node is too old for Vite 7. Install/switch to Node 22 LTS (or at least Node 20.19+ / 22.12+). |
 | Port already in use | Another Postgres, Redis, or local service on `5432` / `6379` / `5000` / `8888` / `8889`. Adjust variables in root `.env` per `docker-compose.yml`. |
@@ -518,13 +582,22 @@ docker compose down
 
 ### Optional root `.env` (Compose only)
 
-For **custom ports** or **mirror/prefix** for base images (slow Docker Hub pulls), create a file named `.env` in the **repository root** (same directory as `docker-compose.yml`):
+For **custom ports**, **mirror/prefix** for base images, image tags, or Postgres physical data mounts, create a file named `.env` in the **repository root** (same directory as `docker-compose.yml`):
 
 ```ini
 FRONTEND_PORT=3000
 MOBILE_PORT=3001
 BACKEND_PORT=127.0.0.1:5001
 IMAGE_PREFIX=docker.m.daocloud.io/library/
+
+# Optional: reuse an existing PostgreSQL 18 data directory.
+# Stop the old Postgres container before mounting this path.
+# POSTGRES_IMAGE=postgres:18.3-alpine
+# POSTGRES_DATA_SOURCE=/absolute/path/to/postgres/18/docker
+# POSTGRES_PGDATA=/var/lib/postgresql/18/docker
+# POSTGRES_DB=quantdinger
+# POSTGRES_USER=existing_db_user
+# POSTGRES_PASSWORD=existing_db_password
 ```
 
 When running the desktop or mobile UI containers by themselves, use `BACKEND_URL` on that container instead of the root Compose `.env` port variables:
