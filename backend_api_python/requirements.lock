@@ -132,6 +132,7 @@ vine==5.1.0
 wcwidth==0.8.2
 webargs==8.7.1
 webencodings==0.5.1
+websocket-client==1.9.0
 websockets==16.1
 Werkzeug==3.1.8
 x25519==0.0.2

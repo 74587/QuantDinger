@@ -168,6 +168,16 @@ def _geospace(start: float, end: float, count: int) -> List[float]:
     return [round(start * (ratio ** i), 8) for i in range(count)]
 
 
+def _grid_points(start: float, end: float, cell_count: int, mode: str) -> List[float]:
+    """Return cell_count + 1 price lines for an exact number of grid cells."""
+    point_count = max(1, int(cell_count or 0)) + 1
+    return (
+        _geospace(start, end, point_count)
+        if mode == "geometric"
+        else _linspace(start, end, point_count)
+    )
+
+
 def _basket_take_profit_price(
     *,
     total_quote: float,
@@ -231,20 +241,77 @@ class ExecutorPreview:
     config: Dict[str, Any]
     levels: List[ExecutorLevel] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    risk_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
+        long_levels = [level for level in self.levels if level.side == "long"]
+        short_levels = [level for level in self.levels if level.side == "short"]
         return {
             "executor_type": self.executor_type,
             "config": dict(self.config),
             "levels": [level.to_dict() for level in self.levels],
             "warnings": list(self.warnings),
+            "risk_diagnostics": [dict(item) for item in self.risk_diagnostics],
             "summary": {
                 "level_count": len(self.levels),
                 "total_amount_quote": round(sum(level.amount_quote for level in self.levels), 8),
+                "long_level_count": len(long_levels),
+                "short_level_count": len(short_levels),
+                "long_amount_quote": round(sum(level.amount_quote for level in long_levels), 8),
+                "short_amount_quote": round(sum(level.amount_quote for level in short_levels), 8),
                 "first_price": round(self.levels[0].price, 8) if self.levels else 0.0,
                 "last_price": round(self.levels[-1].price, 8) if self.levels else 0.0,
             },
-        }
+    }
+
+
+def _martingale_hard_stop_diagnostics(
+    levels: List[ExecutorLevel],
+    *,
+    hard_stop_pct: float,
+    side: str,
+) -> List[Dict[str, Any]]:
+    """Describe levels that sit beyond the basket stop before they can fill."""
+    stop = max(0.0, float(hard_stop_pct or 0.0))
+    if stop <= 0 or len(levels) < 2:
+        return []
+    cumulative_quote = 0.0
+    cumulative_quantity = 0.0
+    diagnostics: List[Dict[str, Any]] = []
+    direction = -1.0 if str(side or "").lower() == "short" else 1.0
+    for index, level in enumerate(levels[:-1]):
+        price = max(0.0, float(level.price or 0.0))
+        quote = max(0.0, float(level.amount_quote or 0.0))
+        cumulative_quote += quote
+        if price > 0:
+            cumulative_quantity += quote / price
+        if cumulative_quote <= 0 or cumulative_quantity <= 0:
+            continue
+        average = cumulative_quote / cumulative_quantity
+        next_level = levels[index + 1]
+        next_price = max(0.0, float(next_level.price or 0.0))
+        stop_price = average * (1.0 - stop if direction > 0 else 1.0 + stop)
+        conflicts = (
+            next_price <= stop_price
+            if direction > 0
+            else next_price >= stop_price
+        )
+        if not conflicts:
+            continue
+        required = abs(next_price / average - 1.0) if average > 0 else 0.0
+        diagnostics.append({
+            "code": "hard_stop_blocks_level",
+            "before_level": int(next_level.level),
+            "basket_average": round(average, 8),
+            "hard_stop_price": round(stop_price, 8),
+            "next_level_price": round(next_price, 8),
+            "configured_stop_pct": round(stop, 8),
+            "required_stop_pct": round(required, 8),
+            # A non-binding display suggestion that leaves 0.5% room for
+            # fees, price precision, and slippage around the theoretical line.
+            "suggested_stop_pct": round(min(1.0, required + 0.005), 8),
+        })
+    return diagnostics
 
 
 def normalize_executor_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -307,7 +374,7 @@ def executor_templates() -> Dict[str, Any]:
                     "grid_count": 8,
                     "total_amount_quote": 8,
                     "initial_position_pct": 0.6,
-                    "take_profit_pct": 0.004,
+                    "take_profit_pct": 0.0,
                     "max_open_orders": 4,
                     "grid_mode": "arithmetic",
                     "min_spread_between_orders": 0.0005,
@@ -323,7 +390,10 @@ def executor_templates() -> Dict[str, Any]:
                     "entry_price": 1,
                     "dca_interval_minutes": 1440,
                     "dca_max_orders": 5,
-                    "dca_total_budget_pct": 1.0,
+                    # Leave room for exchange fees and price slippage. Users
+                    # may still raise this explicitly, but the default DCA
+                    # plan must be executable without exhausting spot cash.
+                    "dca_total_budget_pct": 0.95,
                     "dca_price_filter_enabled": False,
                     "dca_max_adverse_price_pct": 0.05,
                     "take_profit_pct": 0.006,
@@ -354,6 +424,8 @@ def executor_templates() -> Dict[str, Any]:
                     "trailing_callback_pct": 0.002,
                     "hard_stop_pct": 0.12,
                     "max_entry_drift_pct": 0.03,
+                    "restart_after_stop": False,
+                    "final_level_uses_remaining_budget": True,
                 },
             },
             {
@@ -380,6 +452,8 @@ def executor_templates() -> Dict[str, Any]:
                     "trailing_callback_pct": 0.002,
                     "hard_stop_pct": 0.12,
                     "max_entry_drift_pct": 0.03,
+                    "restart_after_stop": False,
+                    "final_level_uses_remaining_budget": True,
                 },
             },
         ]
@@ -413,7 +487,7 @@ def build_executor_strategy_payload(payload: Dict[str, Any], *, user_id: int) ->
         "executor_config": executor_config,
         "executor_preview": preview,
     }
-    if kind == "grid" and trade_direction == "neutral":
+    if kind == "grid":
         grid_count = max(2, int(executor_config.get("grid_count") or 2))
         total_amount = max(0.0, float(executor_config.get("total_amount_quote") or 0.0))
         trading_config.update({
@@ -428,10 +502,16 @@ def build_executor_strategy_payload(payload: Dict[str, Any], *, user_id: int) ->
                 "upperPrice": float(executor_config.get("end_price") or 0.0),
                 "lowerPrice": float(executor_config.get("start_price") or 0.0),
                 "gridCount": grid_count,
+                "gridCountUnit": "cells",
                 "amountPerGrid": total_amount / grid_count if grid_count else 0.0,
+                "amountPerGridPct": 1.0 / grid_count if grid_count else 0.0,
                 "gridMode": str(executor_config.get("grid_mode") or "arithmetic"),
-                "gridDirection": "neutral",
-                "initialPositionPct": 0.0,
+                "gridDirection": trade_direction,
+                "initialPositionPct": (
+                    0.0
+                    if trade_direction == "neutral"
+                    else float(executor_config.get("initial_position_pct") or 0.0)
+                ),
                 "orderMode": "maker",
                 "boundaryAction": "pause",
                 "maxOpenOrders": int(executor_config.get("max_open_orders") or 4),
@@ -495,33 +575,94 @@ def _preview_grid(cfg: Dict[str, Any]) -> ExecutorPreview:
     total = max(0.0, _float(cfg.get("total_amount_quote") or cfg.get("totalAmountQuote"), float(count)))
     side = cfg["side"]
     mode = str(cfg.get("grid_mode") or cfg.get("gridMode") or "arithmetic").strip().lower()
-    take_profit = max(0.0, _ratio(cfg.get("take_profit_pct") or cfg.get("takeProfitPct"), 0.004))
+    take_profit_raw = (
+        cfg.get("take_profit_pct")
+        if "take_profit_pct" in cfg
+        else cfg.get("takeProfitPct")
+    )
+    take_profit = max(0.0, _ratio(take_profit_raw, 0.0))
     hard_stop = max(0.0, _ratio(cfg.get("hard_stop_pct") or cfg.get("hardStopPct"), 0.0))
     warnings: List[str] = []
     if start <= 0 or end <= 0 or start == end:
         warnings.append("invalid_price_bounds")
     low, high = sorted([start, end])
-    prices = _geospace(low, high, count) if mode == "geometric" else _linspace(low, high, count)
-    reference = (low + high) / 2.0
-    if side == "long":
-        prices = sorted(prices, reverse=True)
-    if bool(cfg.get("dynamic_anchor")):
-        actionable = [
-            price for price in prices
-            if (side == "long" and price < reference) or (side == "short" and price > reference)
-        ]
-        if actionable:
-            prices = actionable
+    dynamic_anchor = bool(cfg.get("dynamic_anchor"))
+    reference = 1.0 if dynamic_anchor and low < 1.0 < high else (low + high) / 2.0
+    levels: List[ExecutorLevel] = []
+
     if side == "neutral":
-        prices = [price for price in prices if abs(price - reference) > 1e-10]
-    amount = total / max(1, len(prices))
-    levels = []
-    for idx, price in enumerate(prices, start=1):
-        level_side = side
-        if side == "neutral":
-            level_side = "long" if price < reference else "short"
-        tp = price * (1.0 + take_profit) if level_side == "long" else price * (1.0 - take_profit)
-        levels.append(ExecutorLevel(idx, "open", level_side, price, amount, tp, 0.0))
+        # A neutral grid needs the same number of cells and the same quote
+        # budget on both legs.  Odd counts cannot satisfy that contract, so
+        # normalize legacy/remote payloads to the next even value.
+        if count % 2:
+            count += 1
+            warnings.append("neutral_grid_count_adjusted_even")
+        if not low < reference < high:
+            warnings.append("neutral_grid_anchor_outside_bounds")
+            reference = (low + high) / 2.0
+        leg_count = count // 2
+        long_points = _grid_points(low, reference, leg_count, mode)
+        short_points = _grid_points(reference, high, leg_count, mode)
+        long_amount = total * 0.5 / max(1, leg_count)
+        short_amount = total * 0.5 / max(1, leg_count)
+
+        # Nearest cells are shown first, matching the order in which a resting
+        # engine arms orders around the current price.
+        long_cells = list(zip(long_points[:-1], long_points[1:]))
+        for entry, exit_price in reversed(long_cells):
+            levels.append(
+                ExecutorLevel(
+                    len(levels) + 1,
+                    "open",
+                    "long",
+                    entry,
+                    long_amount,
+                    exit_price,
+                    abs(entry / reference - 1.0),
+                )
+            )
+        short_cells = list(zip(short_points[:-1], short_points[1:]))
+        for exit_price, entry in short_cells:
+            levels.append(
+                ExecutorLevel(
+                    len(levels) + 1,
+                    "open",
+                    "short",
+                    entry,
+                    short_amount,
+                    exit_price,
+                    abs(entry / reference - 1.0),
+                )
+            )
+    else:
+        points = _grid_points(low, high, count, mode)
+        cells = list(zip(points[:-1], points[1:]))
+        if side == "long":
+            rows = [
+                (lower, upper)
+                for lower, upper in cells
+                if not dynamic_anchor or lower < reference
+            ]
+            rows.reverse()
+        else:
+            rows = [
+                (upper, lower)
+                for lower, upper in cells
+                if not dynamic_anchor or upper > reference
+            ]
+        amount = total / max(1, len(rows))
+        for entry, exit_price in rows:
+            levels.append(
+                ExecutorLevel(
+                    len(levels) + 1,
+                    "open",
+                    side,
+                    entry,
+                    amount,
+                    exit_price,
+                    abs(entry / reference - 1.0) if reference > 0 else 0.0,
+                )
+            )
     initial_position_raw = (
         cfg.get("initial_position_pct")
         if "initial_position_pct" in cfg
@@ -536,10 +677,14 @@ def _preview_grid(cfg: Dict[str, Any]) -> ExecutorPreview:
         "start_price": low,
         "end_price": high,
         "limit_price": _float(cfg.get("limit_price") or cfg.get("limitPrice"), low if side == "long" else high),
+        # grid_count is the number of tradable cells.  A live engine therefore
+        # materializes grid_count + 1 boundary lines.
         "grid_count": count,
         "grid_mode": mode if mode in ("arithmetic", "geometric") else "arithmetic",
         "total_amount_quote": total,
         "initial_position_pct": initial_position_pct,
+        "grid_take_profit_mode": "adjacent_level",
+        "portfolio_take_profit_pct": take_profit,
         "take_profit_pct": take_profit,
         "hard_stop_pct": hard_stop,
         "max_open_orders": max(1, _int(cfg.get("max_open_orders") or cfg.get("maxOpenOrders"), 4)),
@@ -773,8 +918,29 @@ def _preview_layered_martingale(cfg: Dict[str, Any]) -> ExecutorPreview:
         **trailing,
         "hard_stop_pct": hard_stop,
         "max_entry_drift_pct": max_entry_drift,
+        "restart_after_stop": _bool(
+            cfg.get("restart_after_stop")
+            if "restart_after_stop" in cfg
+            else cfg.get("restartAfterStop"),
+            False,
+        ),
+        "final_level_uses_remaining_budget": True,
+        "cycle_capital_fraction": 1.0,
     }
-    return ExecutorPreview("layered_martingale", config, levels, warnings)
+    diagnostics = _martingale_hard_stop_diagnostics(
+        levels,
+        hard_stop_pct=hard_stop,
+        side=side,
+    )
+    if diagnostics:
+        warnings.append("hard_stop_blocks_level")
+    return ExecutorPreview(
+        "layered_martingale",
+        config,
+        levels,
+        warnings,
+        diagnostics,
+    )
 
 
 def _preview_layered_dca(cfg: Dict[str, Any], kind: str) -> ExecutorPreview:
@@ -843,8 +1009,23 @@ def _preview_layered_dca(cfg: Dict[str, Any], kind: str) -> ExecutorPreview:
         **trailing,
         "hard_stop_pct": max(0.0, _ratio(cfg.get("hard_stop_pct") or cfg.get("hardStopPct"), 0.0)),
         "max_entry_drift_pct": max_entry_drift,
+        "restart_after_stop": _bool(
+            cfg.get("restart_after_stop")
+            if "restart_after_stop" in cfg
+            else cfg.get("restartAfterStop"),
+            False,
+        ),
+        "final_level_uses_remaining_budget": True,
+        "cycle_capital_fraction": 1.0,
     }
-    return ExecutorPreview(kind, config, levels, warnings)
+    diagnostics = _martingale_hard_stop_diagnostics(
+        levels,
+        hard_stop_pct=float(config["hard_stop_pct"]),
+        side=side,
+    )
+    if diagnostics:
+        warnings.append("hard_stop_blocks_level")
+    return ExecutorPreview(kind, config, levels, warnings, diagnostics)
 
 
 def _executor_code(

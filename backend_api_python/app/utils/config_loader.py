@@ -39,7 +39,11 @@ def _load_env_files_once() -> None:
     root_dir = backend_dir.parent
     for env_path in (root_dir / ".env", backend_dir / ".env"):
         if env_path.exists():
-            load_dotenv(env_path, override=True)
+            # Container/orchestrator environment is authoritative. In
+            # particular, process-role variables must not be replaced by a
+            # developer .env file or the API process can silently fall back to
+            # the legacy in-process trading runtime.
+            load_dotenv(env_path, override=False)
 
 
 def load_addon_config() -> Dict[str, Any]:
@@ -312,4 +316,3 @@ def clear_config_cache():
     _config_cache = None
     _env_loaded = False
     logger.debug("Addon config cache cleared")
-

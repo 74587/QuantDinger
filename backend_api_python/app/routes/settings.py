@@ -626,8 +626,8 @@ CONFIG_SCHEMA = {
                 'key': 'SPOT_CLOSE_SAFETY_RATIO',
                 'label': 'Spot Close Safety Ratio',
                 'type': 'number',
-                'default': '0.998',
-                'description': 'When closing spot long, sell qty is capped to (exchange free base × this ratio), then floored to lot step. Lower if full close fails due to fees (valid range 0.9–1.0).'
+                'default': '1.0',
+                'description': 'When closing spot long, sell qty is capped to (exchange free base × this ratio), then floored to lot step. Base-asset fees are already deducted from strategy inventory; lower only if a venue still rejects full closes (valid range 0.9–1.0).'
             },
             {
                 'key': 'SPOT_OPEN_QUOTE_BUFFER',

@@ -349,7 +349,7 @@ not include credentials, account data, or exploitable details in public issues.
 | --- | --- |
 | Indicators | Python chart overlays, markers, bands, and signals. |
 | Strategies | Strategy API V2 intents, sizing, risk, backtests, and live runtime. |
-| Crypto | Binance, OKX, Bitget, Bybit, Gate, HTX, Coinbase Exchange, Kraken, and adapter extensions. |
+| Crypto | Binance, OKX, Bitget, Bybit, Gate, HTX, and adapter extensions. |
 | Traditional brokers | IBKR and Alpaca workflows. |
 | AI providers | OpenRouter, OpenAI-compatible APIs, Google, DeepSeek, Grok, MiniMax, and custom endpoints. |
 | Automation | Human API, Agent Gateway, MCP server, Celery jobs, schedules, and notifications. |

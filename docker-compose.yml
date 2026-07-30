@@ -251,7 +251,7 @@ services:
       # IBKR needs local TWS or IB Gateway; set false on SaaS cloud (see env.example).
       - ALLOW_LOCAL_DESKTOP_BROKERS=${ALLOW_LOCAL_DESKTOP_BROKERS:-true}
       # Spot full close / open fee buffer (Admin → Settings → Live Trading, or backend_api_python/.env)
-      - SPOT_CLOSE_SAFETY_RATIO=${SPOT_CLOSE_SAFETY_RATIO:-0.998}
+      - SPOT_CLOSE_SAFETY_RATIO=${SPOT_CLOSE_SAFETY_RATIO:-1.0}
       - SPOT_OPEN_QUOTE_BUFFER=${SPOT_OPEN_QUOTE_BUFFER:-0.995}
       # Takes precedence over mounted .env (run.py load_dotenv override=False).
       # Include :8000 when using Vite dev server alongside this stack.
@@ -460,4 +460,3 @@ volumes:
 networks:
   quantdinger-network:
     driver: bridge
-

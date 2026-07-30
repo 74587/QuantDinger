@@ -18,6 +18,7 @@ from app.services.fundamental_data import get_fundamental_data_service
 from app.services.script_source import get_script_source_service
 from app.services.strategy_runtime.health import record_runtime_heartbeat
 from app.services.strategy_runtime.identity import ensure_strategy_run, finish_strategy_run
+from app.services.strategy_runtime.order_intents import OrderIntentService
 from app.services.strategy_runtime.state import RuntimeStateStore
 from app.services.strategy_v2 import (
     OrderIntent,
@@ -34,6 +35,12 @@ from app.utils.strategy_runtime_logs import append_strategy_log
 logger = get_logger(__name__)
 
 MIN_LIVE_ORDER_NOTIONAL = 1.0
+
+
+def _runtime_position_key(symbol: object, position_side: object = "") -> str:
+    base = str(symbol or "")
+    side = str(position_side or "").strip().lower()
+    return f"{base}::{side}" if side in {"long", "short"} else base
 
 
 def live_history_days(frequency: str, warmup_bars: int) -> int:
@@ -186,6 +193,13 @@ class TradingExecutor:
     def stop_strategy(self, strategy_id: int, *, persist_status: bool = True) -> bool:
         strategy_id = int(strategy_id)
         try:
+            # A resting grid owns exchange-side limit orders independently of the
+            # strategy thread.  Cancelling only the local runtime would leave
+            # those orders live after the UI reports the strategy as stopped.
+            # The shutdown helper is idempotent and ignores non-grid strategies.
+            from app.services.grid.runner import shutdown_grid_for_strategy
+
+            shutdown_grid_for_strategy(strategy_id)
             if persist_status:
                 with get_db_connection() as db:
                     cur = db.cursor()
@@ -358,10 +372,15 @@ class TradingExecutor:
                     end,
                 )
                 if skipped:
+                    details = ", ".join(
+                        f"{item.get('symbol') or '?'}:{item.get('reason') or 'unavailable'}"
+                        for item in skipped[:5]
+                    )
+                    suffix = f" ({details})" if details else ""
                     append_strategy_log(
                         strategy_id,
                         "warning",
-                        f"Skipped {len(skipped)} instrument(s) without usable market data",
+                        f"Skipped {len(skipped)} instrument(s) without usable market data{suffix}",
                     )
                 if program.manifest.fundamental_dependencies:
                     frames = get_fundamental_data_service().enrich_panel(frames, candidates)
@@ -400,11 +419,16 @@ class TradingExecutor:
             )
             if initial_capital <= 0:
                 raise RuntimeError("strategyV2.invalidInitialCapital")
+            runtime_params = dict(trading_config.get("params") or {})
+            runtime_params.setdefault(
+                "commission",
+                self._to_ratio(trading_config.get("commission") or 0.001),
+            )
             session = StrategyV2LiveSession(
                 code=code,
                 frames=frames,
                 initial_capital=initial_capital,
-                params=dict(trading_config.get("params") or {}),
+                params=runtime_params,
                 universe_resolver=resolve_universe,
                 schedule_timezone=self._load_schedule_timezone(user_id),
             )
@@ -448,9 +472,22 @@ class TradingExecutor:
             state_store = RuntimeStateStore(
                 strategy_id=strategy_id,
                 strategy_run_id=run_id,
-                state_key="protection",
+                state_key="strategy_v2_session",
             )
-            session.restore_protection_snapshot(state_store.load())
+            restored_state = state_store.load()
+            if restored_state:
+                session.restore_session_snapshot(restored_state)
+            else:
+                legacy_protection_store = RuntimeStateStore(
+                    strategy_id=strategy_id,
+                    strategy_run_id=run_id,
+                    state_key="protection",
+                )
+                session.restore_protection_snapshot(legacy_protection_store.load())
+            order_intent_service = OrderIntentService(
+                strategy_id=strategy_id,
+                strategy_run_id=run_id,
+            )
 
             signal_poll = max(1.0, min(30.0, float(trading_config.get("data_poll_seconds") or 5)))
             risk_tick = max(0.25, min(5.0, float(trading_config.get("risk_tick_seconds") or 1)))
@@ -468,7 +505,16 @@ class TradingExecutor:
             while self._is_strategy_running(strategy_id, current):
                 cycle_started = time.monotonic()
                 try:
-                    positions = self._positions_by_symbol(strategy_id, candidates)
+                    references = session.context.order_references()
+                    if references:
+                        session.context.update_order_statuses(
+                            order_intent_service.statuses_by_client_order_ids(references)
+                        )
+                    positions = self._positions_by_symbol(
+                        strategy_id,
+                        candidates,
+                        strategy=strategy,
+                    )
                     session.synchronize_positions(positions)
                     last_prices.update(runtime_prices())
                     protection_intents = session.evaluate_protections(
@@ -493,7 +539,17 @@ class TradingExecutor:
                             current_price_override=last_prices.get(str(intent.symbol)),
                         )
                         if not submitted:
-                            session.release_protection_exit(intent.symbol)
+                            session.release_protection_exit(
+                                intent.symbol,
+                                position_side=intent.position_side,
+                            )
+                        if intent.client_order_id:
+                            session.context.update_order_statuses({
+                                intent.client_order_id: {
+                                    "client_order_id": intent.client_order_id,
+                                    "status": "submitted" if submitted else "rejected",
+                                },
+                            })
 
                     # Suppress normal strategy orders for a symbol until its
                     # asynchronous protection close has completed and the
@@ -506,12 +562,19 @@ class TradingExecutor:
                         if execution_mode == "live":
                             frames = self._align_latest_frame_prices(frames, runtime_prices())
                         intents, messages, timestamp = session.process(frames)
-                        intents = [intent for intent in intents if str(intent.symbol) not in protected]
+                        intents = [
+                            intent
+                            for intent in intents
+                            if _runtime_position_key(
+                                intent.symbol,
+                                intent.position_side,
+                            ) not in protected
+                        ]
                         pending_count += len(intents)
                         for message in messages:
                             append_strategy_log(strategy_id, "info", message)
                         for intent in intents:
-                            self._execute_strategy_v2_intent(
+                            submitted = self._execute_strategy_v2_intent(
                                 strategy_id=strategy_id,
                                 strategy_name=strategy_name,
                                 intent=intent,
@@ -526,8 +589,15 @@ class TradingExecutor:
                                 signal_ts=self._intent_signal_timestamp(intent, timestamp),
                                 strategy_run_id=run_id,
                             )
+                            if intent.client_order_id:
+                                session.context.update_order_statuses({
+                                    intent.client_order_id: {
+                                        "client_order_id": intent.client_order_id,
+                                        "status": "submitted" if submitted else "rejected",
+                                    },
+                                })
                         next_signal_poll = cycle_started + signal_poll
-                    state_store.save(session.protection_snapshot())
+                    state_store.save(session.session_snapshot())
                     self._heartbeat(
                         strategy_id,
                         run_id,
@@ -538,6 +608,28 @@ class TradingExecutor:
                     )
                     consecutive_errors = 0
                 except Exception as exc:
+                    if str(exc) == "strategyV2.noMarketData":
+                        next_signal_poll = cycle_started + signal_poll
+                        logger.warning(
+                            "Strategy %s temporarily has no usable market data",
+                            strategy_id,
+                        )
+                        append_strategy_log(
+                            strategy_id,
+                            "warning",
+                            "Runtime cycle skipped because no instrument has usable market data",
+                        )
+                        self._heartbeat(
+                            strategy_id,
+                            run_id,
+                            primary,
+                            last_prices,
+                            0,
+                            loop_latency_ms=int((time.monotonic() - cycle_started) * 1000),
+                            status="degraded",
+                            last_error=str(exc),
+                        )
+                        continue
                     consecutive_errors += 1
                     logger.exception("Strategy %s runtime cycle failed", strategy_id)
                     append_strategy_log(strategy_id, "error", f"Runtime cycle failed: {exc}")
@@ -655,6 +747,7 @@ class TradingExecutor:
                 maker_wait_sec=float(intent.maker_wait_sec or 0.0),
                 maker_offset_bps=float(intent.maker_offset_bps or 0.0),
                 protection=intent.protection.metadata() if intent.protection else {},
+                client_order_id=str(intent.client_order_id or ""),
                 signal_ts=signal_ts,
                 strategy_run_id=strategy_run_id,
                 price_exchange_id=str(member.get("exchange_id") or ""),
@@ -703,6 +796,7 @@ class TradingExecutor:
             maker_wait_sec=float(values.get("maker_wait_sec") or 0.0),
             maker_offset_bps=float(values.get("maker_offset_bps") or 0.0),
             protection=dict(values.get("protection") or {}),
+            client_order_id=str(values.get("client_order_id") or ""),
             sizing={
                 "initial_capital": initial_capital,
                 "entry_pct": entry_pct,
@@ -1284,16 +1378,29 @@ class TradingExecutor:
         self,
         strategy_id: int,
         candidates: list[dict[str, Any]],
+        *,
+        strategy: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
+        from app.services.strategy_live_guard import resolve_strategy_direction_mode
+
         output: dict[str, dict[str, Any]] = {}
+        strategy_row = strategy if isinstance(strategy, dict) else (self._load_strategy(strategy_id) or {})
+        owns_both_legs = resolve_strategy_direction_mode(strategy_row) in {"both", "neutral"}
         for member in candidates:
             key = str(member.get("key") or "")
             rows = self._get_current_positions(strategy_id, str(member.get("symbol") or ""))
-            if rows:
-                row = rows[0]
-                output[key] = {
+            if not rows:
+                continue
+            selected_rows = rows if owns_both_legs else rows[:1]
+            for row in selected_rows:
+                side = str(row.get("side") or "long").strip().lower()
+                if side not in {"long", "short"}:
+                    side = "long"
+                position_key = f"{key}::{side}" if owns_both_legs else key
+                output[position_key] = {
                     "amount": row.get("size") or 0,
-                    "side": row.get("side") or "long",
+                    "side": side,
+                    "position_side": side if owns_both_legs else "",
                     "avg_cost": row.get("entry_price") or 0,
                     "last_price": row.get("current_price") or 0,
                 }

@@ -33,6 +33,7 @@ class LiveOrderRequest:
     maker_offset_bps: float = 0.0
     protection: dict[str, Any] | None = None
     sizing: dict[str, Any] | None = None
+    client_order_id: str = ""
 
 
 class StrategyV2OrderGateway:
@@ -44,13 +45,18 @@ class StrategyV2OrderGateway:
             strategy_id=request.strategy_id,
             strategy_run_id=request.strategy_run_id,
         )
-        key = service.build_signal_idempotency_key(
-            strategy_run_id=request.strategy_run_id,
-            strategy_id=request.strategy_id,
-            symbol=request.symbol,
-            signal_type=request.action,
-            signal_ts=request.signal_timestamp,
-        )
+        client_order_id = str(request.client_order_id or "").strip()[:100]
+        key = (
+            f"run:{request.strategy_run_id}:strategy:{request.strategy_id}:client:{client_order_id}"
+            if client_order_id
+            else service.build_signal_idempotency_key(
+                strategy_run_id=request.strategy_run_id,
+                strategy_id=request.strategy_id,
+                symbol=request.symbol,
+                signal_type=request.action,
+                signal_ts=request.signal_timestamp,
+            )
+        )[:180]
         signal = StrategySignal(
             timestamp=request.signal_timestamp,
             strategy_id=request.strategy_id,
@@ -63,7 +69,17 @@ class StrategyV2OrderGateway:
             reason=request.reason,
             source="strategy_v2",
         )
-        intent = service.create_from_signal(signal, idempotency_key=key, leverage=request.leverage)
+        intent = service.create_intent(
+            idempotency_key=key,
+            client_order_id=client_order_id,
+            portfolio_id=signal.portfolio_id,
+            universe_id=signal.universe_id,
+            rebalance_group_id=signal.rebalance_group_id,
+            target_weight=signal.target_weight,
+            target_notional=signal.target_notional,
+            target_position_qty=signal.target_position_qty,
+            **signal.to_order_intent_kwargs(leverage=request.leverage),
+        )
         if intent.existing and intent.status not in {"failed", "cancelled", "rejected"}:
             pending_id = self._pending_id(key)
             if pending_id:
@@ -94,6 +110,7 @@ class StrategyV2OrderGateway:
             "maker_offset_bps": request.maker_offset_bps,
             "protection": request.protection or {},
             "sizing": request.sizing or {},
+            "client_order_id": client_order_id,
         }
         with get_db_connection() as db:
             cur = db.cursor()

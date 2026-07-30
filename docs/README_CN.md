@@ -287,7 +287,7 @@ docker compose \
 | --- | --- |
 | 指标 | Python 图表覆盖、标记、区间和信号。 |
 | 策略 | Strategy API V2 意图、仓位、风控、回测和实盘运行。 |
-| 加密货币 | Binance、OKX、Bitget、Bybit、Gate、HTX、Coinbase Exchange、Kraken 及扩展适配器。 |
+| 加密货币 | Binance、OKX、Bitget、Bybit、Gate、HTX 及扩展适配器。 |
 | 传统券商 | IBKR 和 Alpaca 工作流。 |
 | AI 提供商 | OpenRouter、OpenAI 兼容接口、Google、DeepSeek、Grok、MiniMax 和自定义端点。 |
 | 自动化 | Human API、Agent Gateway、MCP、Celery、计划任务和通知。 |

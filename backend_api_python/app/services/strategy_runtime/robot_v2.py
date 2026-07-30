@@ -7,6 +7,350 @@ import re
 from typing import Any
 
 
+def _grid_points(start: float, end: float, count: int, mode: str) -> list[float]:
+    cells = max(1, int(count or 1))
+    low, high = sorted((float(start or 0.0), float(end or 0.0)))
+    if low <= 0 or high <= low:
+        return []
+    if str(mode or "").strip().lower() == "geometric":
+        ratio = (high / low) ** (1.0 / cells)
+        return [round(low * (ratio**index), 12) for index in range(cells + 1)]
+    step = (high - low) / cells
+    return [round(low + (step * index), 12) for index in range(cells + 1)]
+
+
+def _build_grid_v2_source(
+    config: dict[str, Any],
+    *,
+    instrument: str,
+    timeframe: str,
+) -> str:
+    """Build a bar-replay grid with the same per-cell lifecycle as live resting grid."""
+    side = str(config.get("side") or "long").strip().lower()
+    if side not in {"long", "short", "neutral"}:
+        side = "long"
+    dynamic_anchor = bool(config.get("dynamic_anchor"))
+    start = float(config.get("start_price") or 0.0)
+    end = float(config.get("end_price") or 0.0)
+    count = max(2, int(config.get("grid_count") or 2))
+    mode = str(config.get("grid_mode") or "arithmetic").strip().lower()
+    points = _grid_points(start, end, count, mode)
+    reference = (min(start, end) + max(start, end)) / 2.0
+    initial_pct = 0.0 if side == "neutral" else min(
+        1.0,
+        max(0.0, float(config.get("initial_position_pct") or 0.0)),
+    )
+    max_open_orders = max(1, int(config.get("max_open_orders") or 4))
+    take_profit = max(
+        0.0,
+        float(
+            config.get("portfolio_take_profit_pct")
+            if "portfolio_take_profit_pct" in config
+            else config.get("take_profit_pct") or 0.0
+        ),
+    )
+    hard_stop = max(0.0, float(config.get("hard_stop_pct") or 0.0))
+
+    roles: list[str] = []
+    lower_prices: list[float] = []
+    upper_prices: list[float] = []
+    for lower, upper in zip(points[:-1], points[1:]):
+        midpoint = (lower + upper) / 2.0
+        if side == "neutral":
+            role = "long_entry" if midpoint < reference else "short_entry"
+        elif side == "short":
+            role = "short_entry" if midpoint >= reference else "short_seed"
+        else:
+            role = "long_entry" if midpoint < reference else "long_seed"
+        roles.append(role)
+        lower_prices.append(lower)
+        upper_prices.append(upper)
+
+    entry_indexes = [
+        index
+        for index, role in enumerate(roles)
+        if role in {"long_entry", "short_entry"}
+    ]
+    seed_indexes = [
+        index
+        for index, role in enumerate(roles)
+        if role in {"long_seed", "short_seed"}
+    ]
+    entry_budget = 1.0 if side == "neutral" else max(0.0, 1.0 - initial_pct)
+    budget_pcts = [0.0 for _ in roles]
+    for index in entry_indexes:
+        budget_pcts[index] = entry_budget / max(1, len(entry_indexes))
+    for index in seed_indexes:
+        budget_pcts[index] = initial_pct / max(1, len(seed_indexes))
+
+    # Arm orders nearest to the anchor first, matching the live max-open-order policy.
+    arm_order = sorted(
+        entry_indexes,
+        key=lambda index: abs(
+            (
+                lower_prices[index]
+                if roles[index] == "long_entry"
+                else upper_prices[index]
+            )
+            - reference
+        ),
+    )
+    if dynamic_anchor and reference > 0:
+        lower_prices = [price / reference for price in lower_prices]
+        upper_prices = [price / reference for price in upper_prices]
+
+    leverage_line = "    context.allow_leverage(max_leverage=100)\n" if instrument.endswith("@swap") else ""
+    direction_mode = (
+        "neutral"
+        if side == "neutral"
+        else ("short_only" if side == "short" else "long_only")
+    )
+    constants = (
+        f"INSTRUMENT = {instrument!r}\n"
+        f"TIMEFRAME = {timeframe!r}\n"
+        f"GRID_SIDE = {side!r}\n"
+        f"DYNAMIC_ANCHOR = {dynamic_anchor!r}\n"
+        f"CELL_LOWER = {lower_prices!r}\n"
+        f"CELL_UPPER = {upper_prices!r}\n"
+        f"CELL_ROLES = {roles!r}\n"
+        f"CELL_BUDGET_PCTS = {budget_pcts!r}\n"
+        f"ARM_ORDER = {arm_order!r}\n"
+        f"INITIAL_POSITION_PCT = {initial_pct!r}\n"
+        f"MAX_OPEN_ENTRY_ORDERS = {max_open_orders!r}\n"
+        f"PORTFOLIO_TAKE_PROFIT = {take_profit!r}\n"
+        f"HARD_STOP = {hard_stop!r}\n"
+        "GRID_TEMPLATE_VERSION = 4\n"
+    )
+    body = f'''
+
+def initialize(context):
+    context.set_universe([INSTRUMENT])
+    context.subscribe(frequency=TIMEFRAME)
+    context.set_metadata(direction_mode={direction_mode!r})
+    context.set_warmup(2)
+{leverage_line}    g.anchor_price = 0.0
+    g.initial_ref = ""
+    g.initial_allocated = False
+    g.cell_states = ["disabled" if role.endswith("_seed") else "entry_ready" for role in CELL_ROLES]
+    g.cell_refs = ["" for _ in CELL_ROLES]
+    g.cell_quantities = [0.0 for _ in CELL_ROLES]
+    g.cell_cycles = [1 for _ in CELL_ROLES]
+    g.halted = False
+
+
+def _price(raw):
+    if not DYNAMIC_ANCHOR:
+        return float(raw or 0.0)
+    return float(raw or 0.0) * float(g.anchor_price or 0.0)
+
+
+def _status(ref):
+    return get_order_status(ref) if ref else {{"status": "unknown"}}
+
+
+def _status_name(ref):
+    return str(_status(ref).get("status") or "unknown").strip().lower()
+
+
+def _cancel_working_orders():
+    if g.initial_ref and _status_name(g.initial_ref) in ("queued", "deferred", "submitted", "open", "partial"):
+        cancel_order(g.initial_ref)
+    for ref in g.cell_refs:
+        if ref and _status_name(ref) in ("queued", "deferred", "submitted", "open", "partial"):
+            cancel_order(ref)
+
+
+def _close_all(reason):
+    _cancel_working_orders()
+    if GRID_SIDE in ("long", "neutral"):
+        position = get_position(INSTRUMENT, position_side="long")
+        if abs(float(position.amount or 0.0)) > 1e-12:
+            order_target_value(
+                INSTRUMENT,
+                0.0,
+                position_side="long",
+                reason=reason,
+                client_order_id="grid-risk-long",
+            )
+    if GRID_SIDE in ("short", "neutral"):
+        position = get_position(INSTRUMENT, position_side="short")
+        if abs(float(position.amount or 0.0)) > 1e-12:
+            order_target_value(
+                INSTRUMENT,
+                0.0,
+                position_side="short",
+                reason=reason,
+                client_order_id="grid-risk-short",
+            )
+    g.halted = True
+
+
+def _risk_exit(price):
+    sides = ["long", "short"] if GRID_SIDE == "neutral" else [GRID_SIDE]
+    weighted_profit = 0.0
+    total_notional = 0.0
+    for side in sides:
+        position = get_position(INSTRUMENT, position_side=side)
+        amount = abs(float(position.amount or 0.0))
+        average = float(position.avg_cost or 0.0)
+        if amount <= 1e-12 or average <= 0:
+            continue
+        direction = 1.0 if side == "long" else -1.0
+        notional = amount * average
+        weighted_profit += (((price - average) / average) * direction) * notional
+        total_notional += notional
+    if total_notional <= 0:
+        return False
+    profit = weighted_profit / total_notional
+    if PORTFOLIO_TAKE_PROFIT > 0 and profit >= PORTFOLIO_TAKE_PROFIT:
+        _close_all("grid_equity_take_profit")
+        return True
+    if HARD_STOP > 0 and -profit >= HARD_STOP:
+        _close_all("grid_equity_stop_loss")
+        return True
+    return False
+
+
+def _reconcile_initial():
+    if not g.initial_ref or g.initial_allocated:
+        return
+    status = _status(g.initial_ref)
+    name = str(status.get("status") or "unknown").strip().lower()
+    if name == "filled":
+        filled = abs(float(status.get("filled_quantity") or 0.0))
+        seed_indexes = [index for index, role in enumerate(CELL_ROLES) if role.endswith("_seed")]
+        total_seed_pct = sum(float(CELL_BUDGET_PCTS[index] or 0.0) for index in seed_indexes)
+        for index in seed_indexes:
+            share = float(CELL_BUDGET_PCTS[index] or 0.0) / total_seed_pct if total_seed_pct > 0 else 0.0
+            g.cell_quantities[index] = filled * share
+            g.cell_states[index] = "exit_ready" if g.cell_quantities[index] > 1e-12 else "disabled"
+        g.initial_allocated = True
+    elif name in ("rejected", "cancelled"):
+        g.halted = True
+
+
+def _reconcile_cells():
+    for index in range(len(CELL_ROLES)):
+        ref = g.cell_refs[index]
+        if not ref:
+            continue
+        status = _status(ref)
+        name = str(status.get("status") or "unknown").strip().lower()
+        if name == "filled":
+            state = g.cell_states[index]
+            if state == "entry_pending":
+                g.cell_quantities[index] = abs(float(status.get("filled_quantity") or 0.0))
+                g.cell_states[index] = "exit_ready"
+            elif state == "exit_pending":
+                g.cell_states[index] = "entry_ready"
+                g.cell_cycles[index] += 1
+            g.cell_refs[index] = ""
+        elif name in ("rejected", "cancelled"):
+            state = g.cell_states[index]
+            g.cell_states[index] = "entry_ready" if state == "entry_pending" else "exit_ready"
+            g.cell_refs[index] = ""
+
+
+def _place_entry(context, index):
+    role = CELL_ROLES[index]
+    side = "long" if role.startswith("long") else "short"
+    entry_price = _price(CELL_LOWER[index] if side == "long" else CELL_UPPER[index])
+    cycle = int(g.cell_cycles[index] or 1)
+    ref = "grid-%s-%s-entry-%s" % (index, side, cycle)
+    quantity = abs(float(g.cell_quantities[index] or 0.0))
+    if quantity > 1e-12:
+        signed_quantity = quantity if side == "long" else -quantity
+        order(
+            INSTRUMENT,
+            signed_quantity,
+            position_side=side,
+            order_type="limit",
+            limit_price=entry_price,
+            reason=side + "_entry",
+            client_order_id=ref,
+        )
+    else:
+        quote_value = float(context.portfolio.starting_cash) * float(CELL_BUDGET_PCTS[index] or 0.0)
+        signed_value = quote_value if side == "long" else -quote_value
+        order_value(
+            INSTRUMENT,
+            signed_value,
+            position_side=side,
+            order_type="limit",
+            limit_price=entry_price,
+            reason=side + "_entry",
+            client_order_id=ref,
+        )
+    g.cell_refs[index] = ref
+    g.cell_states[index] = "entry_pending"
+
+
+def _place_exit(index):
+    role = CELL_ROLES[index]
+    side = "long" if role.startswith("long") else "short"
+    quantity = abs(float(g.cell_quantities[index] or 0.0))
+    if quantity <= 1e-12:
+        g.cell_states[index] = "entry_ready"
+        return
+    exit_price = _price(CELL_UPPER[index] if side == "long" else CELL_LOWER[index])
+    cycle = int(g.cell_cycles[index] or 1)
+    ref = "grid-%s-%s-exit-%s" % (index, side, cycle)
+    signed_quantity = -quantity if side == "long" else quantity
+    order(
+        INSTRUMENT,
+        signed_quantity,
+        position_side=side,
+        order_type="limit",
+        limit_price=exit_price,
+        reason=side + "_exit",
+        client_order_id=ref,
+    )
+    g.cell_refs[index] = ref
+    g.cell_states[index] = "exit_pending"
+
+
+def _arm_orders(context):
+    for index in range(len(CELL_ROLES)):
+        if g.cell_states[index] == "exit_ready":
+            _place_exit(index)
+    active_entries = sum(1 for state in g.cell_states if state == "entry_pending")
+    for index in ARM_ORDER:
+        if active_entries >= MAX_OPEN_ENTRY_ORDERS:
+            break
+        if g.cell_states[index] == "entry_ready":
+            _place_entry(context, index)
+            active_entries += 1
+
+
+def handle_data(context, data):
+    bars = get_history(2, TIMEFRAME, ["high", "low", "close"], INSTRUMENT)
+    if len(bars) < 1 or g.halted:
+        return
+    price = float(bars["close"].iloc[-1])
+    if g.anchor_price <= 0:
+        g.anchor_price = price
+    _reconcile_initial()
+    _reconcile_cells()
+    if _risk_exit(price):
+        return
+    if INITIAL_POSITION_PCT > 0 and not g.initial_ref:
+        side = "short" if GRID_SIDE == "short" else "long"
+        value = float(context.portfolio.starting_cash) * INITIAL_POSITION_PCT
+        if side == "short":
+            value = -value
+        g.initial_ref = "grid-initial-" + side
+        order_value(
+            INSTRUMENT,
+            value,
+            position_side=side,
+            reason="grid_initial_" + side,
+            client_order_id=g.initial_ref,
+        )
+    _arm_orders(context)
+'''
+    return constants + body
+
+
 def _build_neutral_grid_v2_source(
     config: dict[str, Any],
     preview: dict[str, Any],
@@ -57,11 +401,10 @@ def initialize(context):
     context.set_metadata(direction_mode="neutral")
     context.set_warmup(2)
     context.allow_leverage(max_leverage=100)
-    g.anchor_price = 0.0
+    g.long_anchor_price = 0.0
+    g.short_anchor_price = 0.0
     g.long_next_level = 0
     g.short_next_level = 0
-    g.long_target_value = 0.0
-    g.short_target_value = 0.0
 
 
 def _leg_position(side):
@@ -69,26 +412,32 @@ def _leg_position(side):
     return float(position.amount or 0.0), float(position.avg_cost or 0.0)
 
 
-def _level_price(levels, index, current_price):
+def _level_price(side, levels, index, current_price):
     if not DYNAMIC_ANCHOR:
         return float(levels[index] or 0.0)
-    if g.anchor_price <= 0:
-        g.anchor_price = float(current_price)
-    return float(levels[index] or 0.0) * g.anchor_price
+    if side == "long":
+        if g.long_anchor_price <= 0:
+            g.long_anchor_price = float(current_price)
+        anchor = g.long_anchor_price
+    else:
+        if g.short_anchor_price <= 0:
+            g.short_anchor_price = float(current_price)
+        anchor = g.short_anchor_price
+    return float(levels[index] or 0.0) * anchor
 
 
 def _reset_leg(side):
     if side == "long":
         g.long_next_level = 0
-        g.long_target_value = 0.0
+        g.long_anchor_price = 0.0
     else:
         g.short_next_level = 0
-        g.short_target_value = 0.0
+        g.short_anchor_price = 0.0
 
 
 def _risk_exit_leg(side, price):
     amount, average = _leg_position(side)
-    if amount == 0 or average <= 0:
+    if abs(amount) <= 1e-12 or average <= 0:
         return False
     direction = 1.0 if side == "long" else -1.0
     profit = ((price - average) / average) * direction
@@ -112,39 +461,39 @@ def handle_data(context, data):
     long_exited = _risk_exit_leg("long", price)
     short_exited = _risk_exit_leg("short", price)
 
-    long_changed = False
     while not long_exited and g.long_next_level < len(LONG_PRICE_LEVELS):
-        target = _level_price(LONG_PRICE_LEVELS, g.long_next_level, price)
-        if not float(current["low"]) <= target <= float(current["high"]):
+        index = g.long_next_level
+        target = _level_price("long", LONG_PRICE_LEVELS, index, price)
+        if float(current["low"]) > target:
             break
-        weight = float(LONG_AMOUNT_WEIGHTS[g.long_next_level] or 0.0)
-        g.long_target_value += float(context.portfolio.starting_cash) * weight
+        weight = float(LONG_AMOUNT_WEIGHTS[index] or 0.0)
         g.long_next_level += 1
-        long_changed = True
-    if long_changed:
-        order_target_value(
-            INSTRUMENT,
-            g.long_target_value,
-            position_side="long",
-            reason="neutral_grid_long_level",
-        )
+        if weight > 0:
+            order_value(
+                INSTRUMENT,
+                float(context.portfolio.starting_cash) * weight,
+                position_side="long",
+                order_type="limit",
+                limit_price=target,
+                reason="neutral_grid_long_level",
+            )
 
-    short_changed = False
     while not short_exited and g.short_next_level < len(SHORT_PRICE_LEVELS):
-        target = _level_price(SHORT_PRICE_LEVELS, g.short_next_level, price)
-        if not float(current["low"]) <= target <= float(current["high"]):
+        index = g.short_next_level
+        target = _level_price("short", SHORT_PRICE_LEVELS, index, price)
+        if float(current["high"]) < target:
             break
-        weight = float(SHORT_AMOUNT_WEIGHTS[g.short_next_level] or 0.0)
-        g.short_target_value += float(context.portfolio.starting_cash) * weight
+        weight = float(SHORT_AMOUNT_WEIGHTS[index] or 0.0)
         g.short_next_level += 1
-        short_changed = True
-    if short_changed:
-        order_target_value(
-            INSTRUMENT,
-            -g.short_target_value,
-            position_side="short",
-            reason="neutral_grid_short_level",
-        )
+        if weight > 0:
+            order_value(
+                INSTRUMENT,
+                -float(context.portfolio.starting_cash) * weight,
+                position_side="short",
+                order_type="limit",
+                limit_price=target,
+                reason="neutral_grid_short_level",
+            )
 '''
     return constants + body
 
@@ -244,14 +593,16 @@ def initialize(context):
     context.set_warmup(2)
     g.dca_order_count = 0
     g.dca_last_schedule_at = None
-    g.dca_target_value = 0.0
+    g.dca_spent_value = 0.0
+    g.dca_cycle_capital = 0.0
     g.dca_anchor_price = 0.0
 
 
 def _reset():
     g.dca_order_count = 0
     g.dca_last_schedule_at = None
-    g.dca_target_value = 0.0
+    g.dca_spent_value = 0.0
+    g.dca_cycle_capital = 0.0
     g.dca_anchor_price = 0.0
 
 
@@ -311,17 +662,19 @@ def handle_data(context, data):
     g.dca_last_schedule_at = now
     if not _price_filter_allows(price):
         return
-    budget_value = float(context.portfolio.starting_cash) * DCA_TOTAL_BUDGET_PCT
-    order_value = float(context.portfolio.starting_cash) * DCA_ORDER_PCT
-    remaining_value = max(0.0, budget_value - g.dca_target_value)
-    order_value = min(order_value, remaining_value)
-    if order_value <= 0:
+    if g.dca_cycle_capital <= 0:
+        g.dca_cycle_capital = max(0.0, float(context.portfolio.total_value))
+    budget_value = g.dca_cycle_capital * DCA_TOTAL_BUDGET_PCT
+    purchase_value = g.dca_cycle_capital * DCA_ORDER_PCT
+    remaining_value = max(0.0, budget_value - g.dca_spent_value)
+    purchase_value = min(purchase_value, remaining_value)
+    if purchase_value <= 0:
         return
-    g.dca_target_value += order_value
+    g.dca_spent_value += purchase_value
     g.dca_order_count += 1
-    order_target_value(
+    order_value(
         INSTRUMENT,
-        g.dca_target_value,
+        purchase_value,
         reason="dca_scheduled_order",
         stop_loss_pct=HARD_STOP,
         take_profit_pct=TAKE_PROFIT,
@@ -351,10 +704,9 @@ def build_robot_v2_source(
             instrument=instrument,
             timeframe=timeframe,
         )
-    if kind == "grid" and side == "neutral":
-        return _build_neutral_grid_v2_source(
+    if kind == "grid":
+        return _build_grid_v2_source(
             config,
-            preview,
             instrument=instrument,
             timeframe=timeframe,
         )
@@ -399,6 +751,7 @@ def build_robot_v2_source(
     hard_stop = float(config.get("hard_stop_pct") or 0.0)
     initial_position_pct = float(config.get("initial_position_pct") or 0.0)
     level_capital_fraction = max(0.0, 1.0 - initial_position_pct) if kind == "grid" else 1.0
+    restart_after_stop = bool(config.get("restart_after_stop"))
     leverage_line = "    context.allow_leverage(max_leverage=100)\n" if market_type == "swap" else ""
     constants = (
         f"INSTRUMENT = {instrument!r}\n"
@@ -414,6 +767,10 @@ def build_robot_v2_source(
         f"TRAILING_CALLBACK = {trailing_callback!r}\n"
         f"INITIAL_POSITION_PCT = {initial_position_pct!r}\n"
         f"LEVEL_CAPITAL_FRACTION = {level_capital_fraction!r}\n"
+        f"RESTART_AFTER_STOP = {restart_after_stop!r}\n"
+        f"PERSIST_RUNTIME_STATE = {kind in {'martingale', 'layered_martingale'}!r}\n"
+        "ROBOT_TEMPLATE_VERSION = 3\n"
+        "FINAL_SWEEP_MIN_QUOTE = 1.0\n"
     )
     initialize = (
         "\ndef initialize(context):\n"
@@ -426,6 +783,18 @@ def build_robot_v2_source(
         "    g.target_value = 0.0\n"
         "    g.anchor_price = 0.0\n"
         "    g.initialized = False\n"
+        "    g.level_statuses = ['ready' for _ in PRICE_LEVELS]\n"
+        "    g.level_refs = ['' for _ in PRICE_LEVELS]\n"
+        "    g.level_spend = [0.0 for _ in PRICE_LEVELS]\n"
+        "    g.level_planned = [0.0 for _ in PRICE_LEVELS]\n"
+        "    g.level_attempts = [0 for _ in PRICE_LEVELS]\n"
+        "    g.cycle_no = 1\n"
+        "    g.halted_after_stop = False\n"
+        "    g.recovery_required = False\n"
+        "    g.exit_pending_reason = ''\n"
+        "    g.cooldown_bar = ''\n"
+        "    g.final_sweep_ref = ''\n"
+        "    g.final_sweep_done = False\n"
     )
     helpers = '''
 
@@ -510,34 +879,267 @@ def handle_data(context, data):
     else:
         handler = '''
 
-def handle_data(context, data):
-    bars = get_history(2, TIMEFRAME, "close", INSTRUMENT)
-    if len(bars) < 1 or not PRICE_LEVELS:
+def _new_cycle():
+    g.next_level = 0
+    g.target_value = 0.0
+    g.anchor_price = 0.0
+    g.level_statuses = ["ready" for _ in PRICE_LEVELS]
+    g.level_refs = ["" for _ in PRICE_LEVELS]
+    g.level_spend = [0.0 for _ in PRICE_LEVELS]
+    g.level_planned = [0.0 for _ in PRICE_LEVELS]
+    g.level_attempts = [0 for _ in PRICE_LEVELS]
+    g.exit_pending_reason = ""
+    g.final_sweep_ref = ""
+    g.final_sweep_done = False
+    g.cycle_no += 1
+
+
+def _status_name(value):
+    return str((value or {}).get("status") or "unknown").strip().lower()
+
+
+def _reconcile_orders():
+    processed = []
+    for index in range(len(PRICE_LEVELS)):
+        reference = str(g.level_refs[index] or "")
+        if not reference or reference in processed:
+            continue
+        processed.append(reference)
+        indexes = [
+            item
+            for item in range(len(PRICE_LEVELS))
+            if str(g.level_refs[item] or "") == reference
+        ]
+        status = get_order_status(reference)
+        name = _status_name(status)
+        filled_spend = (
+            float(status.get("filled_notional") or 0.0)
+            + float(status.get("fee") or 0.0)
+        )
+        planned_total = sum(
+            float(g.level_planned[item] or 0.0)
+            for item in indexes
+        )
+        if filled_spend > 0 and planned_total > 0:
+            for item in indexes:
+                share = float(g.level_planned[item] or 0.0) / planned_total
+                g.level_spend[item] = max(
+                    float(g.level_spend[item] or 0.0),
+                    filled_spend * share,
+                )
+        if name == "filled":
+            for item in indexes:
+                g.level_statuses[item] = "filled"
+        elif name in ("rejected", "failed", "cancelled", "canceled", "expired"):
+            # A rejected batch leaves every included level eligible. No level
+            # in the batch is allowed to advance independently.
+            for item in indexes:
+                g.level_statuses[item] = "ready"
+                g.level_refs[item] = ""
+                g.level_spend[item] = 0.0
+                g.level_planned[item] = 0.0
+                g.level_attempts[item] += 1
+        else:
+            for item in indexes:
+                g.level_statuses[item] = "pending"
+    g.next_level = 0
+    while (
+        g.next_level < len(PRICE_LEVELS)
+        and g.level_statuses[g.next_level] == "filled"
+    ):
+        g.next_level += 1
+
+
+def _fee_rate(context):
+    return max(
+        0.0,
+        float(
+            context.params.get(
+                "commission",
+                context.params.get("fee_rate", 0.001),
+            )
+            or 0.0
+        ),
+    )
+
+
+def _planned_quote(context, index):
+    budget = float(context.portfolio.starting_cash)
+    if index < len(PRICE_LEVELS) - 1:
+        return budget * float(AMOUNT_WEIGHTS[index] or 0.0)
+    spent = sum(float(value or 0.0) for value in g.level_spend)
+    fee_rate = _fee_rate(context)
+    reserved = 0.0
+    for pending_index in range(len(PRICE_LEVELS) - 1):
+        if g.level_statuses[pending_index] == "pending":
+            planned = float(g.level_planned[pending_index] or 0.0)
+            unfilled = max(0.0, planned - float(g.level_spend[pending_index] or 0.0))
+            reserved += unfilled * (1.0 + fee_rate)
+    # The final level absorbs all unallocated cycle capital. Its fee is part
+    # of the same fixed run budget rather than an amount above that budget.
+    return max(0.0, budget - spent - reserved) / (1.0 + fee_rate)
+
+
+def _submit_levels(context, indexes):
+    batch = []
+    quote_total = 0.0
+    for index in indexes:
+        quote = _planned_quote(context, index)
+        if quote <= 0:
+            continue
+        g.level_statuses[index] = "pending"
+        g.level_planned[index] = quote
+        batch.append(index)
+        quote_total += quote
+    if not batch or quote_total <= 0:
         return
-    price = float(bars["close"].iloc[-1])
-    if _risk_exit(price):
-        return
-    amount, _ = _position_state()
-    if amount == 0 and g.next_level > 0:
-        _reset()
-    if g.next_level >= len(PRICE_LEVELS):
-        return
-    target = _level_price(g.next_level, price)
-    due = price >= target if DIRECTION < 0 else price <= target
-    if g.next_level == 0:
-        due = True
-    if not due:
-        return
-    g.target_value += float(context.portfolio.starting_cash) * LEVEL_CAPITAL_FRACTION * float(AMOUNT_WEIGHTS[g.next_level] or 0.0)
-    g.next_level += 1
-    order_target_value(
+    attempt = max(int(g.level_attempts[index] or 0) for index in batch)
+    reference = "martingale:%s:levels:%s-%s:attempt:%s" % (
+        g.cycle_no,
+        batch[0],
+        batch[-1],
+        attempt,
+    )
+    submitted_reference = order_value(
         INSTRUMENT,
-        DIRECTION * g.target_value,
+        DIRECTION * quote_total,
         reason="robot_level",
+        client_order_id=reference,
         stop_loss_pct=HARD_STOP,
         take_profit_pct=TAKE_PROFIT,
         trailing_stop_pct=TRAILING_CALLBACK if TRAILING_TAKE_PROFIT_ENABLED else 0.0,
         trailing_activation_pct=TRAILING_ACTIVATION if TRAILING_TAKE_PROFIT_ENABLED else 0.0,
+        trailing_rebase_on_scale_in=False,
     )
+    for index in batch:
+        g.level_refs[index] = submitted_reference
+
+
+def _submit_final_sweep(context):
+    if g.final_sweep_done or g.final_sweep_ref:
+        return
+    if not PRICE_LEVELS or any(value != "filled" for value in g.level_statuses):
+        return
+    spent = sum(float(value or 0.0) for value in g.level_spend)
+    remaining = max(0.0, float(context.portfolio.starting_cash) - spent)
+    if remaining < FINAL_SWEEP_MIN_QUOTE:
+        g.final_sweep_done = True
+        return
+    quote = remaining / (1.0 + _fee_rate(context))
+    reference = "martingale:%s:final_sweep" % g.cycle_no
+    g.final_sweep_ref = order_value(
+        INSTRUMENT,
+        DIRECTION * quote,
+        reason="robot_final_sweep",
+        client_order_id=reference,
+        stop_loss_pct=HARD_STOP,
+        take_profit_pct=TAKE_PROFIT,
+        trailing_stop_pct=TRAILING_CALLBACK if TRAILING_TAKE_PROFIT_ENABLED else 0.0,
+        trailing_activation_pct=TRAILING_ACTIVATION if TRAILING_TAKE_PROFIT_ENABLED else 0.0,
+        trailing_rebase_on_scale_in=False,
+    )
+
+
+def _reconcile_final_sweep():
+    if not g.final_sweep_ref:
+        return
+    status = get_order_status(g.final_sweep_ref)
+    name = _status_name(status)
+    if name == "filled":
+        g.final_sweep_done = True
+    elif name in ("rejected", "failed", "cancelled", "canceled", "expired"):
+        # Do not retry an untradeable dust remainder forever.
+        g.final_sweep_done = True
+    if g.final_sweep_done:
+        g.final_sweep_ref = ""
+
+
+def _request_exit(reason):
+    order_target_value(INSTRUMENT, 0.0, reason=reason)
+    g.exit_pending_reason = reason
+
+
+def _risk_exit(price):
+    amount, average = _position_state()
+    if abs(amount) <= 1e-12 or average <= 0 or g.exit_pending_reason:
+        return False
+    profit = ((price - average) / average) * DIRECTION
+    loss = -profit
+    if TAKE_PROFIT > 0 and profit >= TAKE_PROFIT:
+        _request_exit("robot_take_profit")
+        return True
+    if HARD_STOP > 0 and loss >= HARD_STOP:
+        _request_exit("robot_hard_stop")
+        return True
+    return False
+
+
+def _handle_flat_transition(context):
+    amount, _ = _position_state()
+    had_cycle = any(
+        value in ("pending", "filled")
+        for value in g.level_statuses
+    )
+    if abs(amount) > 1e-12 or not had_cycle:
+        return False
+    reason = consume_last_exit_reason(INSTRUMENT) or g.exit_pending_reason
+    stopped = reason in ("stop_loss", "robot_hard_stop")
+    current_bar = str(context.current_dt or "")
+    _new_cycle()
+    g.cooldown_bar = current_bar
+    if stopped and not RESTART_AFTER_STOP:
+        g.halted_after_stop = True
+    return True
+
+
+def handle_data(context, data):
+    bars = get_history(2, TIMEFRAME, ["high", "low", "close"], INSTRUMENT)
+    if len(bars) < 1 or not PRICE_LEVELS:
+        return
+    current = bars.iloc[-1]
+    price = float(current["close"])
+    current_low = float(current["low"])
+    current_high = float(current["high"])
+    amount, _ = _position_state()
+    if not g.initialized:
+        g.initialized = True
+        if abs(amount) > 1e-12 and not any(
+            value in ("pending", "filled")
+            for value in g.level_statuses
+        ):
+            g.recovery_required = True
+            log.warning("martingale_recovery_required: live position exists without cycle state")
+            return
+    if g.recovery_required or g.halted_after_stop:
+        return
+    _reconcile_orders()
+    _reconcile_final_sweep()
+    if _handle_flat_transition(context):
+        return
+    if g.cooldown_bar:
+        if str(context.current_dt or "") == g.cooldown_bar:
+            return
+        g.cooldown_bar = ""
+    if _risk_exit(price):
+        return
+    due_indexes = []
+    for index in range(len(PRICE_LEVELS)):
+        if g.level_statuses[index] != "ready":
+            continue
+        target = _level_price(index, price)
+        due = (
+            current_high >= target
+            if DIRECTION < 0
+            else current_low <= target
+        )
+        if index == 0:
+            due = True
+        if not due:
+            # Levels are ordered away from the anchor, so deeper levels cannot
+            # be due once the first untouched level has not been crossed.
+            break
+        due_indexes.append(index)
+    _submit_levels(context, due_indexes)
+    _submit_final_sweep(context)
 '''
     return constants + initialize + helpers + handler

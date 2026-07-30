@@ -12,14 +12,27 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_PROCESS_OWNED_ENV_KEYS = (
+    "QD_PROCESS_ROLE",
+    "STRATEGY_COMMANDS_ENABLED",
+)
+
 
 def reload_runtime_env() -> None:
     """Reload .env files into the current process."""
     root_dir = os.path.dirname(BACKEND_DIR)
+    process_owned = {
+        key: os.environ[key]
+        for key in _PROCESS_OWNED_ENV_KEYS
+        if key in os.environ
+    }
 
     # Load root first, then backend .env to keep backend file higher priority.
     load_dotenv(os.path.join(root_dir, ".env"), override=True)
     load_dotenv(os.path.join(BACKEND_DIR, ".env"), override=True)
+    # Runtime topology belongs to the process supervisor (Docker/systemd), not
+    # to the mutable settings file.
+    os.environ.update(process_owned)
     try:
         registry = importlib.import_module("app.markets.registry")
         if hasattr(registry, "clear_runtime_env_cache"):
