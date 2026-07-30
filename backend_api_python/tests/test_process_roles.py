@@ -46,6 +46,11 @@ def test_config_loader_does_not_override_supervisor_environment(monkeypatch):
 
     calls = []
     monkeypatch.setattr(
+        config_loader.Path,
+        "exists",
+        lambda path: path.name == ".env",
+    )
+    monkeypatch.setattr(
         dotenv,
         "load_dotenv",
         lambda path, override=False: calls.append((path, override)) or True,
