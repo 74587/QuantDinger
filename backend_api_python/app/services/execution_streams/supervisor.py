@@ -17,6 +17,7 @@ from app.services.live_trading.capabilities import supported_crypto_exchange_ids
 from app.utils.credential_crypto import decrypt_credential_blob
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.thread_capacity import format_thread_capacity
 
 logger = get_logger(__name__)
 
@@ -48,6 +49,10 @@ class ExecutionStreamSupervisor:
         self._processor_thread: Optional[threading.Thread] = None
         self._last_catchup: Dict[str, float] = {}
         self._refresh_sec = max(10.0, float(os.getenv("EXECUTION_STREAM_REFRESH_SEC", "30")))
+        self._max_adapters = max(
+            1,
+            int(os.getenv("EXECUTION_STREAM_MAX_ADAPTERS", "64")),
+        )
         self._enabled = str(os.getenv("ENABLE_PRIVATE_EXECUTION_STREAMS", "true")).lower() in {
             "1",
             "true",
@@ -69,22 +74,41 @@ class ExecutionStreamSupervisor:
                 name="ExecutionEventProcessor",
                 daemon=True,
             )
-            self._thread.start()
-            self._processor_thread.start()
+            try:
+                self._thread.start()
+                self._processor_thread.start()
+            except RuntimeError as exc:
+                self._stop.set()
+                for thread in (self._thread, self._processor_thread):
+                    if thread and thread.is_alive():
+                        thread.join(timeout=1.0)
+                logger.error(
+                    "Private execution stream supervisor failed to start: %s; %s",
+                    exc,
+                    format_thread_capacity(),
+                )
+                return False
         logger.info("Private execution stream supervisor started")
         return True
 
     def stop(self, timeout: float = 8.0) -> None:
         self._stop.set()
         with self._lock:
-            adapters = list(self._adapters.values())
-            self._adapters.clear()
-            self._specs.clear()
-        for adapter in adapters:
+            adapters = list(self._adapters.items())
+        for key, adapter in adapters:
             try:
-                adapter.stop(timeout=2.0)
+                stopped = adapter.stop(timeout=2.0)
             except Exception:
-                pass
+                stopped = False
+            if stopped:
+                with self._lock:
+                    self._adapters.pop(key, None)
+                    self._specs.pop(key, None)
+            else:
+                logger.warning(
+                    "Execution stream remained alive during supervisor stop stream=%s",
+                    key,
+                )
         for thread in (self._thread, self._processor_thread):
             if thread and thread.is_alive():
                 thread.join(timeout=timeout)
@@ -123,10 +147,17 @@ class ExecutionStreamSupervisor:
             current_keys = set(self._adapters)
         for key in current_keys - set(desired):
             with self._lock:
-                adapter = self._adapters.pop(key, None)
-                self._specs.pop(key, None)
+                adapter = self._adapters.get(key)
             if adapter:
-                adapter.stop()
+                if not adapter.stop():
+                    logger.warning(
+                        "Execution stream did not stop; retaining handle stream=%s",
+                        key,
+                    )
+                    continue
+                with self._lock:
+                    self._adapters.pop(key, None)
+                    self._specs.pop(key, None)
                 self.repository.update_health(
                     stream_key=key,
                     credential_id=int(getattr(adapter, "credential_id", 0)),
@@ -143,7 +174,16 @@ class ExecutionStreamSupervisor:
                     self._run_rest_catchup_limited(spec)
                 continue
             if existing:
-                existing.stop()
+                if not existing.stop():
+                    logger.warning(
+                        "Execution stream replacement deferred because old thread is alive stream=%s",
+                        key,
+                    )
+                    self._run_rest_catchup_limited(spec)
+                    continue
+                with self._lock:
+                    self._adapters.pop(key, None)
+                    self._specs.pop(key, None)
             adapter_cls = ADAPTERS.get(spec.exchange_id)
             if adapter_cls is None:
                 continue
@@ -162,7 +202,28 @@ class ExecutionStreamSupervisor:
             with self._lock:
                 self._adapters[key] = adapter
                 self._specs[key] = spec
-            adapter.start()
+            try:
+                adapter.start()
+            except RuntimeError as exc:
+                with self._lock:
+                    self._adapters.pop(key, None)
+                    self._specs.pop(key, None)
+                self.repository.update_health(
+                    stream_key=key,
+                    credential_id=spec.credential_id,
+                    exchange_id=spec.exchange_id,
+                    market_type=spec.market_type,
+                    state="error",
+                    error=f"{exc}; {format_thread_capacity()}",
+                    rest_fallback=True,
+                )
+                logger.error(
+                    "Execution stream thread failed to start stream=%s: %s; %s",
+                    key,
+                    exc,
+                    format_thread_capacity(),
+                )
+                self._run_rest_catchup_limited(spec, force=True)
 
     def _on_event(self, event: ExecutionEvent) -> None:
         event_id = self.repository.ingest(event)
@@ -226,8 +287,8 @@ class ExecutionStreamSupervisor:
             logger.debug("REST catch-up scheduling failed for %s", spec.key, exc_info=True)
 
     def _discover_specs(self) -> List[StreamSpec]:
-        credentials = self._credential_rows()
         symbols = self._symbols_by_credential()
+        credentials = self._credential_rows(symbols)
         specs: List[StreamSpec] = []
         crypto = supported_crypto_exchange_ids()
         for row in credentials:
@@ -276,20 +337,35 @@ class ExecutionStreamSupervisor:
                         symbols=credential_symbols,
                     )
                 )
+        if len(specs) > self._max_adapters:
+            logger.error(
+                "Private execution stream adapter cap reached desired=%s cap=%s; "
+                "overflow accounts will use REST fallback",
+                len(specs),
+                self._max_adapters,
+            )
+            specs = specs[:self._max_adapters]
         return specs
 
     @staticmethod
-    def _credential_rows() -> List[Dict[str, Any]]:
+    def _credential_rows(credential_ids: Iterable[int]) -> List[Dict[str, Any]]:
+        active_ids = sorted({int(value) for value in credential_ids if int(value) > 0})
+        if not active_ids:
+            return []
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
                 """
                 SELECT id, user_id, exchange_id, encrypted_config
                 FROM qd_exchange_credentials
-                WHERE LOWER(exchange_id) = ANY(%s)
+                WHERE id = ANY(%s)
+                  AND LOWER(exchange_id) = ANY(%s)
                 ORDER BY id
                 """,
-                (sorted(supported_crypto_exchange_ids() | {"alpaca", "ibkr"}),),
+                (
+                    active_ids,
+                    sorted(supported_crypto_exchange_ids() | {"alpaca", "ibkr"}),
+                ),
             )
             rows = [dict(row) for row in (cur.fetchall() or [])]
             cur.close()
@@ -307,6 +383,8 @@ class ExecutionStreamSupervisor:
                        symbol
                 FROM qd_strategies_trading
                 WHERE COALESCE(symbol, '') <> ''
+                  AND LOWER(COALESCE(status, '')) = 'running'
+                  AND LOWER(COALESCE(execution_mode, 'signal')) = 'live'
                 UNION
                 SELECT credential_id, symbol
                 FROM pending_orders

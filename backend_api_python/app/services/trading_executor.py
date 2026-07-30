@@ -30,6 +30,7 @@ from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.strategy_runtime_logs import append_strategy_log
+from app.utils.thread_capacity import format_thread_capacity
 
 
 logger = get_logger(__name__)
@@ -94,7 +95,9 @@ class TradingExecutor:
                 thread.start()
             except Exception as exc:
                 self.running_strategies.pop(strategy_id, None)
-                self._last_start_failure = f"Failed to start strategy thread: {exc}"
+                self._last_start_failure = (
+                    f"Failed to start strategy thread: {exc}; {format_thread_capacity()}"
+                )
                 logger.exception("Failed to start strategy %s", strategy_id)
                 return False
         append_strategy_log(strategy_id, "info", "Strategy execution thread started")

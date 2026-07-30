@@ -96,8 +96,12 @@ class PrivateWebSocketAdapter:
     def connected(self) -> bool:
         return self._connected
 
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.is_alive:
             return
         self._stop.clear()
         self._thread = threading.Thread(
@@ -107,7 +111,7 @@ class PrivateWebSocketAdapter:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 5.0) -> bool:
         self._stop.set()
         ws = self._ws
         if ws is not None:
@@ -115,9 +119,10 @@ class PrivateWebSocketAdapter:
                 ws.close()
             except Exception:
                 pass
-        if self._thread and self._thread.is_alive():
+        if self.is_alive:
             self._thread.join(timeout=timeout)
         self._connected = False
+        return not self.is_alive
 
     def url(self) -> str:
         raise NotImplementedError
@@ -228,6 +233,13 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
         self._listen_key_base = ""
         self._listen_key_path = ""
         self._keepalive_thread: Optional[threading.Thread] = None
+
+    def stop(self, timeout: float = 5.0) -> bool:
+        main_stopped = super().stop(timeout=timeout)
+        keepalive = self._keepalive_thread
+        if keepalive and keepalive.is_alive():
+            keepalive.join(timeout=timeout)
+        return main_stopped and not bool(keepalive and keepalive.is_alive())
 
     def prepare(self) -> None:
         api_key = str(self.config.get("api_key") or self.config.get("apiKey") or "")
@@ -631,22 +643,27 @@ class IBKRExecutionAdapter:
     def connected(self) -> bool:
         return bool(self._client and self._client.connected)
 
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.is_alive:
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name=f"ExecStream-{self.stream_key}", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
+    def stop(self, timeout: float = 5.0) -> bool:
         self._stop.set()
         if self._client:
             try:
                 self._client.disconnect()
             except Exception:
                 pass
-        if self._thread and self._thread.is_alive():
+        if self.is_alive:
             self._thread.join(timeout=timeout)
+        return not self.is_alive
 
     def _run(self) -> None:
         try:
