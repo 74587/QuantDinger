@@ -39,6 +39,60 @@ class LiveOrderRequest:
 class StrategyV2OrderGateway:
     """Persist idempotent orders for the existing asynchronous dispatcher."""
 
+    _ACTIVE_PENDING_STATUSES = ("pending", "processing", "sent", "syncing")
+
+    @staticmethod
+    def _position_lane(action: str) -> str:
+        signal = str(action or "").strip().lower()
+        if signal.endswith("_long"):
+            return "long"
+        if signal.endswith("_short"):
+            return "short"
+        return ""
+
+    def has_inflight(self, request: LiveOrderRequest) -> bool:
+        """Return whether the same strategy position leg already has live work.
+
+        Timestamp-based idempotency only deduplicates the same signal event. A
+        target-position strategy can emit an equivalent order on the next poll
+        while the first order is still waiting for the exchange. Serializing
+        each symbol/position leg prevents those semantic duplicates without
+        blocking the opposite leg of a true hedge strategy.
+        """
+        lane = self._position_lane(request.action)
+        if not lane:
+            return False
+        lane_actions = (
+            ("open_long", "add_long", "reduce_long", "close_long")
+            if lane == "long"
+            else ("open_short", "add_short", "reduce_short", "close_short")
+        )
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id
+                FROM pending_orders
+                WHERE strategy_id = %s
+                  AND strategy_run_id = %s
+                  AND symbol = %s
+                  AND signal_type IN (%s, %s, %s, %s)
+                  AND status IN (%s, %s, %s, %s)
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    int(request.strategy_id),
+                    int(request.strategy_run_id),
+                    str(request.symbol or ""),
+                    *lane_actions,
+                    *self._ACTIVE_PENDING_STATUSES,
+                ),
+            )
+            row = cur.fetchone() or {}
+            cur.close()
+        return int(row.get("id") or 0) > 0
+
     def submit(self, request: LiveOrderRequest) -> int | None:
         request = self._validate(request)
         service = OrderIntentService(

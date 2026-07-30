@@ -2135,6 +2135,8 @@ CREATE TABLE IF NOT EXISTS qd_agent_tokens (
     instruments TEXT NOT NULL DEFAULT '*',       -- comma-separated allowlist or '*'
     paper_only BOOLEAN NOT NULL DEFAULT TRUE,    -- T-class always starts paper-only
     rate_limit_per_min INTEGER NOT NULL DEFAULT 60,
+    max_order_notional DECIMAL(24,8) NOT NULL DEFAULT 1000,
+    max_daily_notional DECIMAL(24,8) NOT NULL DEFAULT 5000,
     status VARCHAR(20) NOT NULL DEFAULT 'active',-- active/revoked/expired
     expires_at TIMESTAMP,
     last_used_at TIMESTAMP,
@@ -2143,6 +2145,10 @@ CREATE TABLE IF NOT EXISTS qd_agent_tokens (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_tokens_hash ON qd_agent_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_agent_tokens_user ON qd_agent_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_agent_tokens_status ON qd_agent_tokens(status);
+ALTER TABLE qd_agent_tokens
+  ADD COLUMN IF NOT EXISTS max_order_notional DECIMAL(24,8) NOT NULL DEFAULT 1000;
+ALTER TABLE qd_agent_tokens
+  ADD COLUMN IF NOT EXISTS max_daily_notional DECIMAL(24,8) NOT NULL DEFAULT 5000;
 
 CREATE TABLE IF NOT EXISTS qd_agent_jobs (
     id BIGSERIAL PRIMARY KEY,
@@ -2185,6 +2191,37 @@ CREATE TABLE IF NOT EXISTS qd_agent_audit (
 CREATE INDEX IF NOT EXISTS idx_agent_audit_user ON qd_agent_audit(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_token ON qd_agent_audit(agent_token_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_audit_class ON qd_agent_audit(scope_class);
+
+CREATE TABLE IF NOT EXISTS qd_agent_idempotency (
+    id BIGSERIAL PRIMARY KEY,
+    agent_token_id INTEGER NOT NULL REFERENCES qd_agent_tokens(id) ON DELETE CASCADE,
+    method VARCHAR(8) NOT NULL,
+    route VARCHAR(200) NOT NULL,
+    idempotency_key VARCHAR(120) NOT NULL,
+    request_hash VARCHAR(64) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'started',
+    response_body JSONB,
+    response_status INTEGER,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(agent_token_id, method, route, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_idempotency_created
+  ON qd_agent_idempotency(created_at);
+
+CREATE TABLE IF NOT EXISTS qd_agent_notional_reservations (
+    id BIGSERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    agent_token_id INTEGER NOT NULL REFERENCES qd_agent_tokens(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(120) NOT NULL,
+    notional DECIMAL(24,8) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'reserved',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(agent_token_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_notional_daily
+  ON qd_agent_notional_reservations(agent_token_id, created_at);
 
 -- Paper-only ledger so trading-class tokens can simulate without ever touching
 -- live exchange credentials.  Real-money execution stays gated by paper_only=false

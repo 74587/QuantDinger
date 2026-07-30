@@ -212,7 +212,10 @@ def _load_pending_orders(snapshots, placeholders, ids):
     rows = _query(
         f"""
         SELECT strategy_id, strategy_run_id,
-               SUM(CASE WHEN status IN ('pending', 'processing') THEN 1 ELSE 0 END) AS pending_orders,
+               SUM(CASE
+                       WHEN status IN ('pending', 'processing', 'sent', 'syncing')
+                       THEN 1 ELSE 0
+                   END) AS pending_orders,
                SUM(CASE
                        WHEN status IN ('failed', 'error', 'rejected')
                         AND updated_at >= NOW() - (%s * INTERVAL '1 second')
