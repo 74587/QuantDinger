@@ -7,6 +7,19 @@ from typing import Any, Dict, List
 
 
 EXECUTOR_TYPES = ("grid", "dca", "martingale", "layered_martingale")
+MAX_GRID_CELLS = 200
+MIN_INITIAL_CAPITAL = 10.0
+MAX_INITIAL_CAPITAL = 1_000_000.0
+
+_BLOCKING_PREVIEW_WARNINGS = {
+    "invalid_price_bounds",
+    "neutral_grid_anchor_outside_bounds",
+    "missing_dca_budget",
+    "missing_entry_price",
+    "missing_base_order_size",
+    "invalid_trailing_take_profit",
+    "invalid_equity_trailing_take_profit",
+}
 
 
 def executor_engine_compatibility() -> Dict[str, Any]:
@@ -101,6 +114,72 @@ def _trailing_take_profit_config(
         "trailing_take_profit_enabled": enabled,
         "trailing_activation_pct": activation,
         "trailing_callback_pct": callback,
+    }
+
+
+def _equity_risk_config(
+    cfg: Dict[str, Any],
+    *,
+    legacy_grid_fields: bool = False,
+) -> Dict[str, Any]:
+    """Normalize strategy-wide risk limits expressed against starting equity.
+
+    Position protection remains a separate concern for DCA and martingale
+    cycles.  These values include realized PnL, unrealized PnL and fees via
+    ``portfolio.total_value`` and therefore protect the complete robot budget.
+    """
+    take_profit_raw = (
+        cfg.get("equity_take_profit_pct")
+        if "equity_take_profit_pct" in cfg
+        else cfg.get("equityTakeProfitPct")
+    )
+    stop_loss_raw = (
+        cfg.get("equity_stop_loss_pct")
+        if "equity_stop_loss_pct" in cfg
+        else cfg.get("equityStopLossPct")
+    )
+    if legacy_grid_fields and take_profit_raw is None:
+        take_profit_raw = (
+            cfg.get("take_profit_pct")
+            if "take_profit_pct" in cfg
+            else cfg.get("takeProfitPct")
+        )
+    if legacy_grid_fields and stop_loss_raw is None:
+        stop_loss_raw = (
+            cfg.get("hard_stop_pct")
+            if "hard_stop_pct" in cfg
+            else cfg.get("hardStopPct")
+        )
+    enabled = _bool(
+        cfg.get("equity_trailing_enabled")
+        if "equity_trailing_enabled" in cfg
+        else cfg.get("equityTrailingEnabled"),
+        True,
+    )
+    activation = max(
+        0.0,
+        _ratio(
+            cfg.get("equity_trailing_activation_pct")
+            if "equity_trailing_activation_pct" in cfg
+            else cfg.get("equityTrailingActivationPct"),
+            0.05,
+        ),
+    )
+    callback = max(
+        0.0,
+        _ratio(
+            cfg.get("equity_trailing_callback_pct")
+            if "equity_trailing_callback_pct" in cfg
+            else cfg.get("equityTrailingCallbackPct"),
+            0.03,
+        ),
+    )
+    return {
+        "equity_take_profit_pct": max(0.0, _ratio(take_profit_raw, 0.10)),
+        "equity_stop_loss_pct": max(0.0, _ratio(stop_loss_raw, 0.06)),
+        "equity_trailing_enabled": enabled,
+        "equity_trailing_activation_pct": activation,
+        "equity_trailing_callback_pct": callback,
     }
 
 
@@ -374,7 +453,11 @@ def executor_templates() -> Dict[str, Any]:
                     "grid_count": 8,
                     "total_amount_quote": 8,
                     "initial_position_pct": 0.6,
-                    "take_profit_pct": 0.0,
+                    "equity_take_profit_pct": 0.10,
+                    "equity_stop_loss_pct": 0.06,
+                    "equity_trailing_enabled": True,
+                    "equity_trailing_activation_pct": 0.05,
+                    "equity_trailing_callback_pct": 0.03,
                     "max_open_orders": 4,
                     "grid_mode": "arithmetic",
                     "min_spread_between_orders": 0.0005,
@@ -401,6 +484,11 @@ def executor_templates() -> Dict[str, Any]:
                     "trailing_activation_pct": 0.006,
                     "trailing_callback_pct": 0.002,
                     "hard_stop_pct": 0.12,
+                    "equity_take_profit_pct": 0.10,
+                    "equity_stop_loss_pct": 0.06,
+                    "equity_trailing_enabled": True,
+                    "equity_trailing_activation_pct": 0.05,
+                    "equity_trailing_callback_pct": 0.03,
                     "max_entry_drift_pct": 0.03,
                 },
             },
@@ -423,6 +511,11 @@ def executor_templates() -> Dict[str, Any]:
                     "trailing_activation_pct": 0.005,
                     "trailing_callback_pct": 0.002,
                     "hard_stop_pct": 0.12,
+                    "equity_take_profit_pct": 0.10,
+                    "equity_stop_loss_pct": 0.06,
+                    "equity_trailing_enabled": True,
+                    "equity_trailing_activation_pct": 0.05,
+                    "equity_trailing_callback_pct": 0.03,
                     "max_entry_drift_pct": 0.03,
                     "restart_after_stop": False,
                     "final_level_uses_remaining_budget": True,
@@ -451,6 +544,11 @@ def executor_templates() -> Dict[str, Any]:
                     "trailing_activation_pct": 0.006,
                     "trailing_callback_pct": 0.002,
                     "hard_stop_pct": 0.12,
+                    "equity_take_profit_pct": 0.10,
+                    "equity_stop_loss_pct": 0.06,
+                    "equity_trailing_enabled": True,
+                    "equity_trailing_activation_pct": 0.05,
+                    "equity_trailing_callback_pct": 0.03,
                     "max_entry_drift_pct": 0.03,
                     "restart_after_stop": False,
                     "final_level_uses_remaining_budget": True,
@@ -469,13 +567,59 @@ def build_executor_strategy_payload(payload: Dict[str, Any], *, user_id: int) ->
         exchange_config = {}
     if cfg["execution_mode"] == "live" and not exchange_config.get("credential_id"):
         raise ValueError("LIVE_EXECUTOR_CREDENTIAL_REQUIRED")
+    for field in (
+        "equity_take_profit_pct",
+        "equity_stop_loss_pct",
+        "equity_trailing_activation_pct",
+        "equity_trailing_callback_pct",
+        "take_profit_pct",
+        "hard_stop_pct",
+        "trailing_activation_pct",
+        "trailing_callback_pct",
+    ):
+        if field in cfg:
+            raw_percentage = _float(cfg.get(field), -1.0)
+            if raw_percentage < 0 or raw_percentage > 100:
+                raise ValueError("RISK_PERCENTAGE_OUT_OF_RANGE")
     preview = preview_executor(cfg)
+    blocking_warning = next(
+        (
+            str(item)
+            for item in preview.get("warnings", [])
+            if str(item) in _BLOCKING_PREVIEW_WARNINGS
+        ),
+        "",
+    )
+    if blocking_warning:
+        raise ValueError(f"INVALID_EXECUTOR_CONFIG:{blocking_warning}")
     kind = cfg["executor_type"]
     strategy_name = str(cfg.get("strategy_name") or cfg.get("name") or f"{kind.upper()} {cfg['symbol']}").strip()
     timeframe = str(cfg.get("timeframe") or "1m").strip() or "1m"
-    initial_capital = max(10.0, _float(cfg.get("initial_capital") or cfg.get("investment_amount"), 1000.0))
+    raw_initial_capital = (
+        cfg.get("initial_capital")
+        if cfg.get("initial_capital") is not None
+        else cfg.get("investment_amount")
+    )
+    initial_capital = _float(raw_initial_capital, 1000.0)
+    if not MIN_INITIAL_CAPITAL <= initial_capital <= MAX_INITIAL_CAPITAL:
+        raise ValueError("INITIAL_CAPITAL_OUT_OF_RANGE")
     trade_direction = "long" if cfg["market_type"] == "spot" else cfg["side"]
     executor_config = preview["config"]
+    ratio_fields = (
+        "equity_take_profit_pct",
+        "equity_stop_loss_pct",
+        "equity_trailing_activation_pct",
+        "equity_trailing_callback_pct",
+        "take_profit_pct",
+        "hard_stop_pct",
+        "trailing_activation_pct",
+        "trailing_callback_pct",
+    )
+    if any(
+        float(executor_config.get(field) or 0.0) > 1.0
+        for field in ratio_fields
+    ):
+        raise ValueError("RISK_PERCENTAGE_OUT_OF_RANGE")
     executor_config["dynamic_anchor"] = bool(cfg.get("dynamic_anchor"))
     if cfg["market_type"] == "spot":
         executor_config["side"] = "long"
@@ -486,7 +630,34 @@ def build_executor_strategy_payload(payload: Dict[str, Any], *, user_id: int) ->
         "executor_type": kind,
         "executor_config": executor_config,
         "executor_preview": preview,
+        "entry_trigger_mode": (
+            "exchange_resting_orders"
+            if kind == "grid"
+            else "realtime_price"
+            if kind in {"martingale", "layered_martingale"}
+            else "schedule"
+        ),
+        "risk_tick_seconds": max(
+            0.25,
+            min(5.0, _float(cfg.get("risk_tick_seconds"), 1.0)),
+        ),
+        "price_stale_after_seconds": max(
+            3.0,
+            min(30.0, _float(cfg.get("price_stale_after_seconds"), 10.0)),
+        ),
     }
+    # Keep portfolio-wide risk settings at the deployment root as well as in
+    # executor_config.  The generated Strategy V2 runtime reads the nested
+    # contract, while the dedicated live resting-grid engine consumes the root
+    # values on every price tick.
+    for field in (
+        "equity_take_profit_pct",
+        "equity_stop_loss_pct",
+        "equity_trailing_enabled",
+        "equity_trailing_activation_pct",
+        "equity_trailing_callback_pct",
+    ):
+        trading_config[field] = executor_config.get(field)
     if kind == "grid":
         grid_count = max(2, int(executor_config.get("grid_count") or 2))
         total_amount = max(0.0, float(executor_config.get("total_amount_quote") or 0.0))
@@ -562,6 +733,43 @@ def build_executor_strategy_payload(payload: Dict[str, Any], *, user_id: int) ->
             "source": "robot_builder",
             "executor_type": kind,
             "executor_config": executor_config,
+            "trigger_contract": {
+                "entry": (
+                    "exchange_resting_orders"
+                    if kind == "grid"
+                    else "realtime_price"
+                    if kind in {"martingale", "layered_martingale"}
+                    else "schedule"
+                ),
+                "signal_confirmation": (
+                    "exchange_match"
+                    if kind == "grid"
+                    else "price_tick"
+                    if kind in {"martingale", "layered_martingale"}
+                    else "scheduler"
+                ),
+                "risk": "realtime_price_with_rest_fallback",
+                "fills": "private_stream_with_rest_reconciliation",
+                "bar_close_policy": "closed_bars_only",
+            },
+            "equity_risk": {
+                "basis": "starting_equity",
+                "take_profit_pct": float(
+                    executor_config.get("equity_take_profit_pct") or 0.0
+                ),
+                "stop_loss_pct": float(
+                    executor_config.get("equity_stop_loss_pct") or 0.0
+                ),
+                "trailing_enabled": bool(
+                    executor_config.get("equity_trailing_enabled")
+                ),
+                "trailing_activation_pct": float(
+                    executor_config.get("equity_trailing_activation_pct") or 0.0
+                ),
+                "trailing_callback_pct": float(
+                    executor_config.get("equity_trailing_callback_pct") or 0.0
+                ),
+            },
             "strategy_manifest": program.manifest.metadata(),
         },
         "compatibility": executor_engine_compatibility(),
@@ -572,16 +780,12 @@ def _preview_grid(cfg: Dict[str, Any]) -> ExecutorPreview:
     start = _float(cfg.get("start_price") or cfg.get("startPrice"), 0.0)
     end = _float(cfg.get("end_price") or cfg.get("endPrice"), 0.0)
     count = max(2, _int(cfg.get("grid_count") or cfg.get("gridCount"), 2))
+    if count > MAX_GRID_CELLS:
+        raise ValueError("GRID_COUNT_EXCEEDS_SAFE_LIMIT")
     total = max(0.0, _float(cfg.get("total_amount_quote") or cfg.get("totalAmountQuote"), float(count)))
     side = cfg["side"]
     mode = str(cfg.get("grid_mode") or cfg.get("gridMode") or "arithmetic").strip().lower()
-    take_profit_raw = (
-        cfg.get("take_profit_pct")
-        if "take_profit_pct" in cfg
-        else cfg.get("takeProfitPct")
-    )
-    take_profit = max(0.0, _ratio(take_profit_raw, 0.0))
-    hard_stop = max(0.0, _ratio(cfg.get("hard_stop_pct") or cfg.get("hardStopPct"), 0.0))
+    equity_risk = _equity_risk_config(cfg, legacy_grid_fields=True)
     warnings: List[str] = []
     if start <= 0 or end <= 0 or start == end:
         warnings.append("invalid_price_bounds")
@@ -671,6 +875,22 @@ def _preview_grid(cfg: Dict[str, Any]) -> ExecutorPreview:
     initial_position_pct = min(1.0, max(0.0, _ratio(initial_position_raw, 0.6)))
     if side == "neutral":
         initial_position_pct = 0.0
+    requested_max_open_orders = max(
+        1,
+        _int(cfg.get("max_open_orders") or cfg.get("maxOpenOrders"), 4),
+    )
+    max_open_orders = min(count, requested_max_open_orders)
+    if requested_max_open_orders > count:
+        warnings.append("max_open_orders_adjusted_to_grid_count")
+    if count >= 60 or max_open_orders >= 40:
+        warnings.append("high_frequency_grid_backtest_workload")
+    if equity_risk["equity_trailing_enabled"] and (
+        equity_risk["equity_trailing_activation_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"]
+        >= equity_risk["equity_trailing_activation_pct"]
+    ):
+        warnings.append("invalid_equity_trailing_take_profit")
     config = {
         "side": side,
         "market_type": cfg["market_type"],
@@ -684,10 +904,13 @@ def _preview_grid(cfg: Dict[str, Any]) -> ExecutorPreview:
         "total_amount_quote": total,
         "initial_position_pct": initial_position_pct,
         "grid_take_profit_mode": "adjacent_level",
-        "portfolio_take_profit_pct": take_profit,
-        "take_profit_pct": take_profit,
-        "hard_stop_pct": hard_stop,
-        "max_open_orders": max(1, _int(cfg.get("max_open_orders") or cfg.get("maxOpenOrders"), 4)),
+        **equity_risk,
+        # Compatibility aliases for existing grid deployments.  Grid cell
+        # exits remain adjacent-level exits; these aliases are portfolio risk.
+        "portfolio_take_profit_pct": equity_risk["equity_take_profit_pct"],
+        "take_profit_pct": equity_risk["equity_take_profit_pct"],
+        "hard_stop_pct": equity_risk["equity_stop_loss_pct"],
+        "max_open_orders": max_open_orders,
         "min_spread_between_orders": max(0.0, _ratio(cfg.get("min_spread_between_orders") or cfg.get("minSpreadBetweenOrders"), 0.0005)),
         "order_frequency": max(0, _int(cfg.get("order_frequency") or cfg.get("orderFrequency"), 0)),
     }
@@ -758,6 +981,7 @@ def _preview_dca(cfg: Dict[str, Any]) -> ExecutorPreview:
         _ratio(cfg.get("take_profit_pct") or cfg.get("takeProfitPct"), 0.006),
     )
     trailing = _trailing_take_profit_config(cfg, default_activation=take_profit)
+    equity_risk = _equity_risk_config(cfg)
     hard_stop = max(
         0.0,
         _ratio(cfg.get("hard_stop_pct") or cfg.get("hardStopPct"), 0.0),
@@ -774,6 +998,13 @@ def _preview_dca(cfg: Dict[str, Any]) -> ExecutorPreview:
         or trailing["trailing_callback_pct"] >= trailing["trailing_activation_pct"]
     ):
         warnings.append("invalid_trailing_take_profit")
+    if equity_risk["equity_trailing_enabled"] and (
+        equity_risk["equity_trailing_activation_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"]
+        >= equity_risk["equity_trailing_activation_pct"]
+    ):
+        warnings.append("invalid_equity_trailing_take_profit")
 
     levels = []
     cumulative = 0.0
@@ -807,6 +1038,7 @@ def _preview_dca(cfg: Dict[str, Any]) -> ExecutorPreview:
         "take_profit_pct": take_profit,
         **trailing,
         "hard_stop_pct": hard_stop,
+        **equity_risk,
     }
     return ExecutorPreview("dca", config, levels, warnings)
 
@@ -823,6 +1055,7 @@ def _preview_layered_martingale(cfg: Dict[str, Any]) -> ExecutorPreview:
     volume_mult = max(1.0, _float(cfg.get("volume_multiplier") or cfg.get("volumeMultiplier"), 1.8))
     take_profit = max(0.0, _ratio(cfg.get("take_profit_pct") or cfg.get("takeProfitPct"), 0.006))
     trailing = _trailing_take_profit_config(cfg, default_activation=take_profit)
+    equity_risk = _equity_risk_config(cfg)
     hard_stop = max(0.0, _ratio(cfg.get("hard_stop_pct") or cfg.get("hardStopPct"), 0.0))
     max_entry_drift = max(0.0, _ratio(cfg.get("max_entry_drift_pct") or cfg.get("maxEntryDriftPct"), 0.03))
     side = cfg["side"]
@@ -857,6 +1090,13 @@ def _preview_layered_martingale(cfg: Dict[str, Any]) -> ExecutorPreview:
         or trailing["trailing_callback_pct"] >= trailing["trailing_activation_pct"]
     ):
         warnings.append("invalid_trailing_take_profit")
+    if equity_risk["equity_trailing_enabled"] and (
+        equity_risk["equity_trailing_activation_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"]
+        >= equity_risk["equity_trailing_activation_pct"]
+    ):
+        warnings.append("invalid_equity_trailing_take_profit")
     levels: List[ExecutorLevel] = []
     price = entry
     seq = 1
@@ -917,6 +1157,7 @@ def _preview_layered_martingale(cfg: Dict[str, Any]) -> ExecutorPreview:
         "take_profit_pct": take_profit,
         **trailing,
         "hard_stop_pct": hard_stop,
+        **equity_risk,
         "max_entry_drift_pct": max_entry_drift,
         "restart_after_stop": _bool(
             cfg.get("restart_after_stop")
@@ -953,6 +1194,7 @@ def _preview_layered_dca(cfg: Dict[str, Any], kind: str) -> ExecutorPreview:
     volume_mult = max(1.0, _float(cfg.get("volume_multiplier") or cfg.get("volumeMultiplier"), 1.0))
     take_profit = max(0.0, _ratio(cfg.get("take_profit_pct") or cfg.get("takeProfitPct"), 0.005))
     trailing = _trailing_take_profit_config(cfg, default_activation=take_profit)
+    equity_risk = _equity_risk_config(cfg)
     max_entry_drift = max(0.0, _ratio(cfg.get("max_entry_drift_pct") or cfg.get("maxEntryDriftPct"), 0.03))
     side = cfg["side"]
     warnings: List[str] = []
@@ -966,6 +1208,13 @@ def _preview_layered_dca(cfg: Dict[str, Any], kind: str) -> ExecutorPreview:
         or trailing["trailing_callback_pct"] >= trailing["trailing_activation_pct"]
     ):
         warnings.append("invalid_trailing_take_profit")
+    if equity_risk["equity_trailing_enabled"] and (
+        equity_risk["equity_trailing_activation_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"] <= 0
+        or equity_risk["equity_trailing_callback_pct"]
+        >= equity_risk["equity_trailing_activation_pct"]
+    ):
+        warnings.append("invalid_equity_trailing_take_profit")
     levels = []
     cumulative_deviation = 0.0
     cumulative_quote = 0.0
@@ -1008,6 +1257,7 @@ def _preview_layered_dca(cfg: Dict[str, Any], kind: str) -> ExecutorPreview:
         "take_profit_pct": take_profit,
         **trailing,
         "hard_stop_pct": max(0.0, _ratio(cfg.get("hard_stop_pct") or cfg.get("hardStopPct"), 0.0)),
+        **equity_risk,
         "max_entry_drift_pct": max_entry_drift,
         "restart_after_stop": _bool(
             cfg.get("restart_after_stop")

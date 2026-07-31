@@ -7,6 +7,54 @@ import re
 from typing import Any
 
 
+MAX_GRID_CELLS = 200
+
+
+def _equity_risk_constants(config: dict[str, Any]) -> str:
+    """Emit the common, strategy-wide equity risk configuration."""
+    take_profit = max(0.0, float(config.get("equity_take_profit_pct") or 0.0))
+    stop_loss = max(0.0, float(config.get("equity_stop_loss_pct") or 0.0))
+    trailing_enabled = bool(config.get("equity_trailing_enabled"))
+    trailing_activation = max(
+        0.0,
+        float(config.get("equity_trailing_activation_pct") or 0.0),
+    )
+    trailing_callback = max(
+        0.0,
+        float(config.get("equity_trailing_callback_pct") or 0.0),
+    )
+    return (
+        f"EQUITY_TAKE_PROFIT = {take_profit!r}\n"
+        f"EQUITY_STOP_LOSS = {stop_loss!r}\n"
+        f"EQUITY_TRAILING_ENABLED = {trailing_enabled!r}\n"
+        f"EQUITY_TRAILING_ACTIVATION = {trailing_activation!r}\n"
+        f"EQUITY_TRAILING_CALLBACK = {trailing_callback!r}\n"
+    )
+
+
+EQUITY_RISK_HELPERS = '''
+
+def _equity_risk_reason(context):
+    starting_equity = float(context.portfolio.starting_cash or 0.0)
+    if starting_equity <= 0:
+        return ""
+    current_equity = float(context.portfolio.total_value or 0.0)
+    total_return = (current_equity / starting_equity) - 1.0
+    g.equity_peak_return = max(float(g.equity_peak_return or 0.0), total_return)
+    if EQUITY_TAKE_PROFIT > 0 and total_return >= EQUITY_TAKE_PROFIT:
+        return "equity_take_profit"
+    if EQUITY_STOP_LOSS > 0 and total_return <= -EQUITY_STOP_LOSS:
+        return "equity_stop_loss"
+    if EQUITY_TRAILING_ENABLED:
+        if total_return >= EQUITY_TRAILING_ACTIVATION:
+            g.equity_trailing_armed = True
+        drawdown_from_peak = float(g.equity_peak_return or 0.0) - total_return
+        if g.equity_trailing_armed and drawdown_from_peak >= EQUITY_TRAILING_CALLBACK:
+            return "equity_trailing_stop"
+    return ""
+'''
+
+
 def _grid_points(start: float, end: float, count: int, mode: str) -> list[float]:
     cells = max(1, int(count or 1))
     low, high = sorted((float(start or 0.0), float(end or 0.0)))
@@ -33,6 +81,8 @@ def _build_grid_v2_source(
     start = float(config.get("start_price") or 0.0)
     end = float(config.get("end_price") or 0.0)
     count = max(2, int(config.get("grid_count") or 2))
+    if count > MAX_GRID_CELLS:
+        raise ValueError("GRID_COUNT_EXCEEDS_SAFE_LIMIT")
     mode = str(config.get("grid_mode") or "arithmetic").strip().lower()
     points = _grid_points(start, end, count, mode)
     reference = (min(start, end) + max(start, end)) / 2.0
@@ -41,15 +91,6 @@ def _build_grid_v2_source(
         max(0.0, float(config.get("initial_position_pct") or 0.0)),
     )
     max_open_orders = max(1, int(config.get("max_open_orders") or 4))
-    take_profit = max(
-        0.0,
-        float(
-            config.get("portfolio_take_profit_pct")
-            if "portfolio_take_profit_pct" in config
-            else config.get("take_profit_pct") or 0.0
-        ),
-    )
-    hard_stop = max(0.0, float(config.get("hard_stop_pct") or 0.0))
 
     roles: list[str] = []
     lower_prices: list[float] = []
@@ -76,6 +117,9 @@ def _build_grid_v2_source(
         for index, role in enumerate(roles)
         if role in {"long_seed", "short_seed"}
     ]
+    # More entry slots than entry cells cannot change trading behavior, but it
+    # increases generated state and makes workload estimates misleading.
+    max_open_orders = min(max_open_orders, max(1, len(entry_indexes)))
     entry_budget = 1.0 if side == "neutral" else max(0.0, 1.0 - initial_pct)
     budget_pcts = [0.0 for _ in roles]
     for index in entry_indexes:
@@ -117,9 +161,9 @@ def _build_grid_v2_source(
         f"ARM_ORDER = {arm_order!r}\n"
         f"INITIAL_POSITION_PCT = {initial_pct!r}\n"
         f"MAX_OPEN_ENTRY_ORDERS = {max_open_orders!r}\n"
-        f"PORTFOLIO_TAKE_PROFIT = {take_profit!r}\n"
-        f"HARD_STOP = {hard_stop!r}\n"
-        "GRID_TEMPLATE_VERSION = 4\n"
+        f"{_equity_risk_constants(config)}"
+        "PERSIST_RUNTIME_STATE = True\n"
+        "GRID_TEMPLATE_VERSION = 5\n"
     )
     body = f'''
 
@@ -136,6 +180,10 @@ def initialize(context):
     g.cell_quantities = [0.0 for _ in CELL_ROLES]
     g.cell_cycles = [1 for _ in CELL_ROLES]
     g.halted = False
+    g.equity_peak_return = 0.0
+    g.equity_trailing_armed = False
+    g.equity_exit_pending = False
+    g.equity_stop_reason = ""
 
 
 def _price(raw):
@@ -185,30 +233,30 @@ def _close_all(reason):
     g.halted = True
 
 
-def _risk_exit(price):
-    sides = ["long", "short"] if GRID_SIDE == "neutral" else [GRID_SIDE]
-    weighted_profit = 0.0
-    total_notional = 0.0
-    for side in sides:
-        position = get_position(INSTRUMENT, position_side=side)
-        amount = abs(float(position.amount or 0.0))
-        average = float(position.avg_cost or 0.0)
-        if amount <= 1e-12 or average <= 0:
-            continue
-        direction = 1.0 if side == "long" else -1.0
-        notional = amount * average
-        weighted_profit += (((price - average) / average) * direction) * notional
-        total_notional += notional
-    if total_notional <= 0:
+{EQUITY_RISK_HELPERS}
+
+
+def _risk_exit(context):
+    if g.equity_exit_pending:
         return False
-    profit = weighted_profit / total_notional
-    if PORTFOLIO_TAKE_PROFIT > 0 and profit >= PORTFOLIO_TAKE_PROFIT:
-        _close_all("grid_equity_take_profit")
-        return True
-    if HARD_STOP > 0 and -profit >= HARD_STOP:
-        _close_all("grid_equity_stop_loss")
-        return True
-    return False
+    reason = _equity_risk_reason(context)
+    if not reason:
+        return False
+    full_reason = "grid_" + reason
+    g.equity_exit_pending = True
+    g.equity_stop_reason = full_reason
+    _close_all(full_reason)
+    return True
+
+
+def _equity_risk_exit(context):
+    return _risk_exit(context)
+
+
+def _release_equity_risk_exit():
+    g.equity_exit_pending = False
+    g.equity_stop_reason = ""
+    g.halted = False
 
 
 def _reconcile_initial():
@@ -331,7 +379,7 @@ def handle_data(context, data):
         g.anchor_price = price
     _reconcile_initial()
     _reconcile_cells()
-    if _risk_exit(price):
+    if _risk_exit(context):
         return
     if INITIAL_POSITION_PCT > 0 and not g.initial_ref:
         side = "short" if GRID_SIDE == "short" else "long"
@@ -583,6 +631,8 @@ def _build_dca_v2_source(
         f"TRAILING_TAKE_PROFIT_ENABLED = {trailing_enabled!r}\n"
         f"TRAILING_ACTIVATION = {trailing_activation!r}\n"
         f"TRAILING_CALLBACK = {trailing_callback!r}\n"
+        f"{_equity_risk_constants(config)}"
+        "PERSIST_RUNTIME_STATE = True\n"
     )
     body = f'''
 
@@ -596,6 +646,11 @@ def initialize(context):
     g.dca_spent_value = 0.0
     g.dca_cycle_capital = 0.0
     g.dca_anchor_price = 0.0
+    g.equity_peak_return = 0.0
+    g.equity_trailing_armed = False
+    g.equity_halted = False
+    g.equity_exit_pending = False
+    g.equity_stop_reason = ""
 
 
 def _reset():
@@ -611,6 +666,29 @@ def _position_state():
     amount = float(position.amount or 0.0)
     average = float(position.avg_cost or 0.0)
     return amount, average
+
+
+{EQUITY_RISK_HELPERS}
+
+
+def _equity_risk_exit(context):
+    if g.equity_exit_pending:
+        return False
+    reason = _equity_risk_reason(context)
+    if not reason:
+        return False
+    full_reason = "dca_" + reason
+    order_target_value(INSTRUMENT, 0.0, reason=full_reason)
+    g.equity_halted = True
+    g.equity_exit_pending = True
+    g.equity_stop_reason = full_reason
+    return True
+
+
+def _release_equity_risk_exit():
+    g.equity_halted = False
+    g.equity_exit_pending = False
+    g.equity_stop_reason = ""
 
 
 def _risk_exit(price):
@@ -642,9 +720,11 @@ def _price_filter_allows(price):
 
 def handle_data(context, data):
     bars = get_history(2, TIMEFRAME, "close", INSTRUMENT)
-    if len(bars) < 1:
+    if len(bars) < 1 or g.equity_halted:
         return
     price = float(bars["close"].iloc[-1])
+    if _equity_risk_exit(context):
+        return
     if _risk_exit(price):
         return
     amount, _ = _position_state()
@@ -765,11 +845,13 @@ def build_robot_v2_source(
         f"TRAILING_TAKE_PROFIT_ENABLED = {trailing_enabled!r}\n"
         f"TRAILING_ACTIVATION = {trailing_activation!r}\n"
         f"TRAILING_CALLBACK = {trailing_callback!r}\n"
+        f"{_equity_risk_constants(config)}"
         f"INITIAL_POSITION_PCT = {initial_position_pct!r}\n"
         f"LEVEL_CAPITAL_FRACTION = {level_capital_fraction!r}\n"
         f"RESTART_AFTER_STOP = {restart_after_stop!r}\n"
-        f"PERSIST_RUNTIME_STATE = {kind in {'martingale', 'layered_martingale'}!r}\n"
-        "ROBOT_TEMPLATE_VERSION = 3\n"
+        "ENTRY_TRIGGER_MODE = 'realtime_price'\n"
+        "PERSIST_RUNTIME_STATE = True\n"
+        "ROBOT_TEMPLATE_VERSION = 5\n"
         "FINAL_SWEEP_MIN_QUOTE = 1.0\n"
     )
     initialize = (
@@ -795,8 +877,14 @@ def build_robot_v2_source(
         "    g.cooldown_bar = ''\n"
         "    g.final_sweep_ref = ''\n"
         "    g.final_sweep_done = False\n"
+        "    g.equity_peak_return = 0.0\n"
+        "    g.equity_trailing_armed = False\n"
+        "    g.equity_halted = False\n"
+        "    g.equity_exit_pending = False\n"
+        "    g.equity_stop_reason = ''\n"
+        "    g.price_tick_seen = False\n"
     )
-    helpers = '''
+    helpers = f'''
 
 def _reset():
     g.next_level = 0
@@ -818,6 +906,31 @@ def _position_state():
     amount = float(position.amount or 0.0)
     average = float(position.avg_cost or 0.0)
     return amount, average
+
+
+{EQUITY_RISK_HELPERS}
+
+
+def _equity_risk_exit(context):
+    if g.exit_pending_reason or g.equity_exit_pending:
+        return False
+    reason = _equity_risk_reason(context)
+    if not reason:
+        return False
+    full_reason = "robot_" + reason
+    _request_exit(full_reason)
+    g.equity_halted = True
+    g.equity_exit_pending = True
+    g.equity_stop_reason = full_reason
+    return True
+
+
+def _release_equity_risk_exit():
+    if g.equity_exit_pending:
+        g.exit_pending_reason = ""
+    g.equity_halted = False
+    g.equity_exit_pending = False
+    g.equity_stop_reason = ""
 
 
 def _risk_exit(price):
@@ -1083,6 +1196,11 @@ def _handle_flat_transition(context):
     if abs(amount) > 1e-12 or not had_cycle:
         return False
     reason = consume_last_exit_reason(INSTRUMENT) or g.exit_pending_reason
+    # Fill/order status can become visible before the separately synchronized
+    # position snapshot.  Without a confirmed exit reason that short window is
+    # not a completed cycle and must never start a duplicate initial order.
+    if not reason:
+        return False
     stopped = reason in ("stop_loss", "robot_hard_stop")
     current_bar = str(context.current_dt or "")
     _new_cycle()
@@ -1090,6 +1208,63 @@ def _handle_flat_transition(context):
     if stopped and not RESTART_AFTER_STOP:
         g.halted_after_stop = True
     return True
+
+
+def _prepare_cycle(context, price):
+    amount, average = _position_state()
+    if not g.initialized:
+        g.initialized = True
+        if abs(amount) > 1e-12 and not any(
+            value in ("pending", "filled")
+            for value in g.level_statuses
+        ):
+            g.recovery_required = True
+            log.warning("martingale_recovery_required: live position exists without cycle state")
+            return False
+    if g.recovery_required or g.halted_after_stop:
+        return False
+    _reconcile_orders()
+    _reconcile_final_sweep()
+    if abs(amount) > 1e-12 and average > 0 and g.anchor_price <= 0:
+        g.anchor_price = average
+    if _handle_flat_transition(context):
+        return False
+    if g.equity_halted:
+        return False
+    if g.cooldown_bar:
+        if str(context.current_dt or "") == g.cooldown_bar:
+            return False
+        g.cooldown_bar = ""
+    return True
+
+
+def _due_levels_at_price(price):
+    due_indexes = []
+    for index in range(len(PRICE_LEVELS)):
+        if g.level_statuses[index] != "ready":
+            continue
+        target = _level_price(index, price)
+        due = price >= target if DIRECTION < 0 else price <= target
+        if index == 0:
+            due = True
+        if not due:
+            break
+        due_indexes.append(index)
+    return due_indexes
+
+
+def on_price_tick(context, prices):
+    price = float((prices or {{}}).get(INSTRUMENT) or 0.0)
+    if price <= 0 or not PRICE_LEVELS:
+        return
+    g.price_tick_seen = True
+    if not _prepare_cycle(context, price):
+        return
+    # Position and portfolio exits are evaluated by the supervisor before this
+    # entry hook.  This callback only scales the active martingale cycle.
+    due_indexes = _due_levels_at_price(price)
+    _submit_levels(context, due_indexes)
+    _submit_final_sweep(context)
 
 
 def handle_data(context, data):
@@ -1100,26 +1275,14 @@ def handle_data(context, data):
     price = float(current["close"])
     current_low = float(current["low"])
     current_high = float(current["high"])
-    amount, _ = _position_state()
-    if not g.initialized:
-        g.initialized = True
-        if abs(amount) > 1e-12 and not any(
-            value in ("pending", "filled")
-            for value in g.level_statuses
-        ):
-            g.recovery_required = True
-            log.warning("martingale_recovery_required: live position exists without cycle state")
-            return
-    if g.recovery_required or g.halted_after_stop:
+    if not _prepare_cycle(context, price):
         return
-    _reconcile_orders()
-    _reconcile_final_sweep()
-    if _handle_flat_transition(context):
+    # Live deployments receive price ticks independently of bar events.  Once
+    # that hook is active, the closed-bar handler must never emit duplicates.
+    if g.price_tick_seen:
         return
-    if g.cooldown_bar:
-        if str(context.current_dt or "") == g.cooldown_bar:
-            return
-        g.cooldown_bar = ""
+    if _equity_risk_exit(context):
+        return
     if _risk_exit(price):
         return
     due_indexes = []

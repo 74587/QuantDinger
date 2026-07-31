@@ -195,6 +195,66 @@ def handle_data(context, data):
     )
 
 
+def test_resting_limit_compacts_poll_events_without_changing_fill_or_status():
+    code = """
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+    g.sent = False
+
+def handle_data(context, data):
+    if not g.sent:
+        order_value(
+            "AAPL",
+            95.0,
+            order_type="limit",
+            limit_price=95.0,
+            client_order_id="resting-buy",
+        )
+        g.sent = True
+"""
+    periods = 20
+    index = pd.date_range("2026-01-01", periods=periods, freq="D")
+    frame = pd.DataFrame({
+        "open": [100.0] * (periods - 1) + [94.0],
+        "high": [101.0] * (periods - 1) + [96.0],
+        "low": [99.0] * (periods - 1) + [93.0],
+        "close": [100.0] * (periods - 1) + [95.0],
+        "volume": [100000.0] * periods,
+    }, index=index)
+    runner = StrategyV2BacktestRunner(
+        code=code,
+        frames={"USStock:AAPL": frame},
+        initial_capital=1000,
+        commission=0,
+        slippage=0,
+    )
+
+    result = runner.run()
+
+    resting = [
+        item
+        for item in result["orderLedger"]
+        if item.get("statusReason") == "limit_not_reached"
+    ]
+    assert len(resting) == 1
+    assert resting[0]["occurrenceCount"] == periods - 2
+    assert resting[0]["firstEventTime"] < resting[0]["lastEventTime"]
+    assert result["orderLedgerStats"] == {
+        "storedEvents": 2,
+        "eventOccurrences": periods - 1,
+        "compactedOccurrences": periods - 3,
+    }
+    assert result["totalExecutions"] == 1
+    assert result["executions"][0]["price"] == pytest.approx(94.0)
+    status = runner.context.get_order_status("resting-buy")
+    assert status["status"] == "filled"
+    # Limit-order sizing is fixed at the submitted limit price; a favorable
+    # gap improves cash usage without changing the requested base quantity.
+    assert status["filled_quantity"] == pytest.approx(1.0)
+    assert runner._order_status_cursor == len(runner.broker.order_ledger)
+
+
 def test_buy_limit_fills_at_limit_when_touched_inside_bar():
     code = """
 def initialize(context):

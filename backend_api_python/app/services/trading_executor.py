@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
@@ -326,6 +326,7 @@ class TradingExecutor:
         current = threading.current_thread()
         run_id = 0
         exit_reason = "strategy stopped"
+        market_price_feed = None
         try:
             strategy = self._load_strategy(strategy_id)
             if not strategy:
@@ -423,6 +424,7 @@ class TradingExecutor:
             if initial_capital <= 0:
                 raise RuntimeError("strategyV2.invalidInitialCapital")
             runtime_params = dict(trading_config.get("params") or {})
+            runtime_params.setdefault("execution_mode", execution_mode)
             runtime_params.setdefault(
                 "commission",
                 self._to_ratio(trading_config.get("commission") or 0.001),
@@ -452,12 +454,13 @@ class TradingExecutor:
             )
             run_id = int(runtime_run.strategy_run_id or 0)
             last_prices: dict[str, float] = {}
+            last_price_seen_at: dict[str, float] = {}
             self._heartbeat(strategy_id, run_id, primary, last_prices, 0)
             bot_type = str(
                 strategy.get("bot_type") or trading_config.get("bot_type") or ""
             ).strip().lower()
             if execution_mode == "live" and bot_type == "grid":
-                self._run_grid_resting_loop(
+                exit_reason = self._run_grid_resting_loop(
                     strategy_id=strategy_id,
                     strategy_run_id=run_id,
                     current_thread=current,
@@ -470,8 +473,36 @@ class TradingExecutor:
                     initial_capital=initial_capital,
                     notification_config=_json_object(strategy.get("notification_config")),
                 )
-                exit_reason = "grid strategy stopped"
                 return
+            price_feed_meta = {
+                "source": "exchange_rest",
+                "age_ms": 0,
+                "connected": False,
+            }
+            if execution_mode == "live" and account_exchange:
+                from app.services.market_price_stream import PublicMarketPriceFeed
+
+                market_price_feed = PublicMarketPriceFeed(
+                    exchange_id=account_exchange,
+                    market_type=str(primary.get("market_type") or "spot"),
+                    instruments=candidates,
+                    rest_fallback=runtime_prices,
+                )
+                market_price_feed.start()
+                rest_runtime_prices = runtime_prices
+
+                def runtime_prices() -> dict[str, float]:
+                    snapshot = market_price_feed.snapshot(
+                        max_age_seconds=float(
+                            trading_config.get("price_stale_after_seconds") or 10.0
+                        )
+                    )
+                    price_feed_meta.update({
+                        "source": snapshot.source,
+                        "age_ms": snapshot.age_ms,
+                        "connected": snapshot.connected,
+                    })
+                    return snapshot.prices or rest_runtime_prices()
             state_store = RuntimeStateStore(
                 strategy_id=strategy_id,
                 strategy_run_id=run_id,
@@ -494,7 +525,12 @@ class TradingExecutor:
 
             signal_poll = max(1.0, min(30.0, float(trading_config.get("data_poll_seconds") or 5)))
             risk_tick = max(0.25, min(5.0, float(trading_config.get("risk_tick_seconds") or 1)))
+            price_stale_after = max(
+                risk_tick * 3.0,
+                min(30.0, float(trading_config.get("price_stale_after_seconds") or 10.0)),
+            )
             next_signal_poll = 0.0
+            stale_price_logged = False
             consecutive_errors = 0
             strategy_name = str(strategy.get("strategy_name") or f"strategy_{strategy_id}")
             notification_config = _json_object(strategy.get("notification_config"))
@@ -521,11 +557,120 @@ class TradingExecutor:
                         candidates,
                         strategy=strategy,
                     )
-                    session.synchronize_positions(positions)
-                    last_prices.update(runtime_prices())
-                    protection_intents = session.evaluate_protections(
-                        last_prices,
-                        timestamp=pd.Timestamp.now(tz="UTC"),
+                    fresh_prices = runtime_prices()
+                    price_clock = time.monotonic()
+                    for symbol_key, value in fresh_prices.items():
+                        if float(value or 0.0) > 0:
+                            last_prices[symbol_key] = float(value)
+                            last_price_seen_at[symbol_key] = price_clock
+                    active_prices = {
+                        symbol_key: value
+                        for symbol_key, value in last_prices.items()
+                        if price_clock - last_price_seen_at.get(symbol_key, 0.0)
+                        <= price_stale_after
+                    }
+                    if not active_prices:
+                        if not stale_price_logged:
+                            append_strategy_log(
+                                strategy_id,
+                                "warning",
+                                "Live price is stale; new entries and runtime exits are paused until recovery",
+                            )
+                            stale_price_logged = True
+                    elif stale_price_logged:
+                        append_strategy_log(strategy_id, "info", "Live price feed recovered")
+                        stale_price_logged = False
+                    equity_positions: list[dict[str, Any]] = []
+                    positions_prices_fresh = True
+                    for position_key, position in positions.items():
+                        symbol_key, separator, suffix = str(position_key).rpartition("::")
+                        runtime_symbol = symbol_key if separator and suffix in {"long", "short"} else str(position_key)
+                        position_mark = active_prices.get(runtime_symbol)
+                        if abs(float(position.get("amount") or 0.0)) > 1e-12 and not position_mark:
+                            positions_prices_fresh = False
+                        equity_positions.append({
+                            "symbol": runtime_symbol,
+                            "side": position.get("side") or "long",
+                            "size": abs(float(position.get("amount") or 0.0)),
+                            "entry_price": position.get("avg_cost") or 0.0,
+                            "current_price": position_mark or 0.0,
+                        })
+                    current_equity = self._calculate_current_equity(
+                        strategy_id,
+                        initial_capital,
+                        current_positions=equity_positions,
+                        current_prices=active_prices,
+                    )
+                    session.synchronize_positions(
+                        positions,
+                        total_value=current_equity,
+                    )
+                    risk_timestamp = pd.Timestamp.now(tz="UTC")
+                    equity_intents, equity_messages, equity_stop_reason = (
+                        session.evaluate_equity_risk(timestamp=risk_timestamp)
+                        if active_prices and positions_prices_fresh
+                        else ([], [], "")
+                    )
+                    for message in equity_messages:
+                        append_strategy_log(strategy_id, "info", message)
+                    equity_submission_failed = False
+                    for intent in equity_intents:
+                        submitted = self._execute_strategy_v2_intent(
+                            strategy_id=strategy_id,
+                            strategy_name=strategy_name,
+                            intent=intent,
+                            frames=frames,
+                            candidates=candidates,
+                            initial_capital=initial_capital,
+                            leverage=leverage,
+                            execution_mode=execution_mode,
+                            notification_config=notification_config,
+                            trading_config=trading_config,
+                            exchange_config=exchange_config,
+                            signal_ts=self._intent_signal_timestamp(intent, risk_timestamp),
+                            strategy_run_id=run_id,
+                            current_price_override=active_prices.get(str(intent.symbol)),
+                            direction_mode=direction_mode,
+                        )
+                        if not submitted and intent.kind in {
+                            "target_quantity",
+                            "target_value",
+                            "target_percent",
+                        } and abs(float(intent.value or 0.0)) <= 1e-12:
+                            position_key = _runtime_position_key(
+                                intent.symbol,
+                                intent.position_side,
+                            )
+                            live_position = (
+                                positions.get(position_key)
+                                or positions.get(str(intent.symbol))
+                                or {}
+                            )
+                            # A portfolio limit may be crossed after a prior
+                            # cycle has already closed.  A zero-target order is
+                            # then a successful no-op, and the robot must still
+                            # enter the risk-stopped state instead of retrying
+                            # forever.
+                            submitted = abs(float(live_position.get("amount") or 0.0)) <= 1e-12
+                        equity_submission_failed = equity_submission_failed or not submitted
+                        if intent.client_order_id:
+                            session.context.update_order_statuses({
+                                intent.client_order_id: {
+                                    "client_order_id": intent.client_order_id,
+                                    "status": "submitted" if submitted else "rejected",
+                                },
+                            })
+                    if equity_stop_reason and equity_submission_failed:
+                        session.release_equity_risk_exit()
+                        append_strategy_log(
+                            strategy_id,
+                            "warning",
+                            f"Equity risk exit submission failed and will retry: {equity_stop_reason}",
+                        )
+
+                    protection_intents = [] if equity_stop_reason else session.evaluate_protections(
+                        active_prices,
+                        timestamp=risk_timestamp,
                     )
                     for intent in protection_intents:
                         submitted = self._execute_strategy_v2_intent(
@@ -542,7 +687,7 @@ class TradingExecutor:
                             exchange_config=exchange_config,
                             signal_ts=int(time.time()),
                             strategy_run_id=run_id,
-                            current_price_override=last_prices.get(str(intent.symbol)),
+                            current_price_override=active_prices.get(str(intent.symbol)),
                             direction_mode=direction_mode,
                         )
                         if not submitted:
@@ -563,11 +708,52 @@ class TradingExecutor:
                     # strategy position snapshot becomes flat.
                     protected = session.pending_protection_exit_symbols()
 
-                    pending_count = len(protection_intents)
-                    if cycle_started >= next_signal_poll:
+                    pending_count = len(equity_intents) + len(protection_intents)
+                    if execution_mode == "live" and not equity_stop_reason and active_prices:
+                        tick_intents, tick_messages = session.evaluate_price_tick(
+                            active_prices,
+                            timestamp=risk_timestamp,
+                        )
+                        tick_intents = [
+                            intent
+                            for intent in tick_intents
+                            if _runtime_position_key(
+                                intent.symbol,
+                                intent.position_side,
+                            ) not in protected
+                        ]
+                        pending_count += len(tick_intents)
+                        for message in tick_messages:
+                            append_strategy_log(strategy_id, "info", message)
+                        for intent in tick_intents:
+                            submitted = self._execute_strategy_v2_intent(
+                                strategy_id=strategy_id,
+                                strategy_name=strategy_name,
+                                intent=intent,
+                                frames=frames,
+                                candidates=candidates,
+                                initial_capital=initial_capital,
+                                leverage=leverage,
+                                execution_mode=execution_mode,
+                                notification_config=notification_config,
+                                trading_config=trading_config,
+                                exchange_config=exchange_config,
+                                signal_ts=self._intent_signal_timestamp(intent, risk_timestamp),
+                                strategy_run_id=run_id,
+                                current_price_override=active_prices.get(str(intent.symbol)),
+                                direction_mode=direction_mode,
+                            )
+                            if intent.client_order_id:
+                                session.context.update_order_statuses({
+                                    intent.client_order_id: {
+                                        "client_order_id": intent.client_order_id,
+                                        "status": "submitted" if submitted else "rejected",
+                                    },
+                                })
+                    if not equity_stop_reason and cycle_started >= next_signal_poll:
                         frames = fetch_frames()
                         if execution_mode == "live":
-                            frames = self._align_latest_frame_prices(frames, runtime_prices())
+                            frames = self._align_latest_frame_prices(frames, active_prices)
                         intents, messages, timestamp = session.process(frames)
                         intents = [
                             intent
@@ -613,7 +799,23 @@ class TradingExecutor:
                         last_prices,
                         pending_count,
                         loop_latency_ms=int((time.monotonic() - cycle_started) * 1000),
+                        status="healthy" if active_prices else "degraded",
+                        last_error="" if active_prices else "live_price_stale",
+                        price_source=str(price_feed_meta.get("source") or "exchange_rest"),
+                        price_age_ms=int(price_feed_meta.get("age_ms") or 0),
+                        trigger_mode=(
+                            "realtime_price"
+                            if bot_type in {"martingale", "layered_martingale"}
+                            else "closed_bar"
+                        ),
+                        fill_transport="private_stream_with_rest_reconciliation",
                     )
+                    if equity_stop_reason and not equity_submission_failed:
+                        exit_reason = f"equity risk stopped: {equity_stop_reason}"
+                        self._last_exit_reason[strategy_id] = exit_reason
+                        append_strategy_log(strategy_id, "warning", exit_reason)
+                        self._mark_stopped(strategy_id)
+                        break
                     consecutive_errors = 0
                 except Exception as exc:
                     if str(exc) == "strategyV2.noMarketData":
@@ -663,6 +865,8 @@ class TradingExecutor:
             append_strategy_log(strategy_id, "error", exit_reason)
             self._mark_stopped(strategy_id)
         finally:
+            if market_price_feed is not None:
+                market_price_feed.stop()
             if run_id > 0:
                 finish_strategy_run(run_id, reason=exit_reason)
             with self.lock:
@@ -857,7 +1061,7 @@ class TradingExecutor:
         exchange_config: Dict[str, Any],
         initial_capital: float,
         notification_config: Dict[str, Any],
-    ) -> None:
+    ) -> str:
         from app.services.grid.runner import GridRestingRunner
         from app.services.live_trading.account_configuration import configure_derivatives_account
         from app.services.live_trading.factory import create_client
@@ -916,6 +1120,29 @@ class TradingExecutor:
         if initial_price <= 0 and frame is not None and not frame.empty:
             initial_price = float(frame["close"].iloc[-1])
         runtime_grid_config = self._materialize_grid_anchor(trading_config, initial_price)
+        grid_risk_store = RuntimeStateStore(
+            strategy_id=strategy_id,
+            strategy_run_id=strategy_run_id,
+            state_key="grid_equity_risk",
+        )
+        grid_risk_state = {
+            "peak_return": 0.0,
+            "trailing_armed": False,
+            **grid_risk_store.load(),
+        }
+
+        def evaluate_grid_risk(price: float) -> List[Dict[str, Any]]:
+            exits = self._grid_bot_risk_exits(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                current_price=float(price),
+                trading_config=runtime_grid_config,
+                timeframe_seconds=60,
+                initial_capital=initial_capital,
+                risk_state=grid_risk_state,
+            )
+            grid_risk_store.save(grid_risk_state)
+            return exits
 
         runner = GridRestingRunner(
             strategy_id,
@@ -926,28 +1153,51 @@ class TradingExecutor:
             initial_capital=initial_capital,
             enqueue_market_fn=enqueue_market,
             create_client_fn=create_grid_client,
-            risk_exit_fn=lambda price: self._grid_bot_risk_exits(
-                strategy_id=strategy_id,
-                symbol=symbol,
-                current_price=float(price),
-                trading_config=runtime_grid_config,
-                timeframe_seconds=60,
-                initial_capital=initial_capital,
-            ),
+            risk_exit_fn=evaluate_grid_risk,
         )
         ok, message = runner.startup(initial_price, bars_df=frame)
         if not ok:
             raise RuntimeError(f"grid.startupFailed:{message}")
         tick_seconds = max(0.25, min(5.0, float(trading_config.get("risk_tick_seconds") or 1)))
         last_prices: dict[str, float] = {}
+        stale_logged = False
+        grid_exit_reason = "grid strategy stopped"
+        from app.services.market_price_stream import PublicMarketPriceFeed
+
+        grid_price_feed = PublicMarketPriceFeed(
+            exchange_id=exchange_id,
+            market_type=market_type,
+            instruments=candidates,
+            rest_fallback=lambda: self._execution_account_prices(
+                candidates,
+                exchange_config,
+                client_holder,
+            ),
+        )
+        grid_price_feed.start()
         try:
             while self._is_strategy_running(strategy_id, current_thread):
                 cycle_started = time.monotonic()
-                prices = self._live_prices(candidates)
+                price_snapshot = grid_price_feed.snapshot(
+                    max_age_seconds=float(
+                        trading_config.get("price_stale_after_seconds") or 10.0
+                    )
+                )
+                prices = price_snapshot.prices
                 current_price = float(prices.get(key) or 0)
                 if current_price > 0:
                     last_prices[key] = current_price
                     runner.tick(current_price, high=current_price, low=current_price, bars_df=frame)
+                    if stale_logged:
+                        append_strategy_log(strategy_id, "info", "Live grid price feed recovered")
+                        stale_logged = False
+                elif not stale_logged:
+                    append_strategy_log(
+                        strategy_id,
+                        "warning",
+                        "Live grid price unavailable; risk checks are paused while exchange resting orders remain active",
+                    )
+                    stale_logged = True
                 self._heartbeat(
                     strategy_id,
                     strategy_run_id,
@@ -955,12 +1205,25 @@ class TradingExecutor:
                     last_prices,
                     0,
                     loop_latency_ms=int((time.monotonic() - cycle_started) * 1000),
+                    status="healthy" if current_price > 0 else "degraded",
+                    last_error="" if current_price > 0 else "live_price_unavailable",
+                    price_source=price_snapshot.source,
+                    price_age_ms=price_snapshot.age_ms,
+                    trigger_mode="exchange_resting_orders",
+                    fill_transport="private_stream_with_rest_reconciliation",
                 )
                 if runner.should_stop:
+                    reason = runner.stop_reason or "grid strategy stopped"
+                    grid_exit_reason = reason
+                    self._last_exit_reason[strategy_id] = reason
+                    append_strategy_log(strategy_id, "warning", reason)
+                    self._mark_stopped(strategy_id)
                     break
                 time.sleep(tick_seconds)
         finally:
+            grid_price_feed.stop()
             runner.shutdown()
+        return grid_exit_reason
 
     @staticmethod
     def _materialize_grid_anchor(
@@ -1174,6 +1437,7 @@ class TradingExecutor:
         trading_config: Dict[str, Any],
         timeframe_seconds: int,
         initial_capital: Optional[float] = None,
+        risk_state: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         config = trading_config if isinstance(trading_config, dict) else {}
         if str(config.get("bot_type") or "").strip().lower() not in {"grid", "dca"}:
@@ -1211,9 +1475,40 @@ class TradingExecutor:
             if current_price <= lower * (1 - buffer_ratio):
                 return close_all("grid_out_of_bounds_down", oob_threshold=lower * (1 - buffer_ratio))
         capital = float(initial_capital or config.get("initial_capital") or 0)
-        stop_ratio = self._ratio(config.get("stop_loss_pct"), 0)
-        take_ratio = self._ratio(config.get("take_profit_pct"), 0)
-        if capital > 0 and (stop_ratio > 0 or take_ratio > 0):
+        executor_config = (
+            config.get("executor_config")
+            if isinstance(config.get("executor_config"), dict)
+            else {}
+        )
+        stop_ratio = self._ratio(
+            config.get("equity_stop_loss_pct", executor_config.get("equity_stop_loss_pct", config.get("stop_loss_pct"))),
+            0,
+        )
+        take_ratio = self._ratio(
+            config.get("equity_take_profit_pct", executor_config.get("equity_take_profit_pct", config.get("take_profit_pct"))),
+            0,
+        )
+        trailing_enabled = bool(
+            config.get(
+                "equity_trailing_enabled",
+                executor_config.get("equity_trailing_enabled", False),
+            )
+        )
+        trailing_activation = self._ratio(
+            config.get(
+                "equity_trailing_activation_pct",
+                executor_config.get("equity_trailing_activation_pct"),
+            ),
+            0,
+        )
+        trailing_callback = self._ratio(
+            config.get(
+                "equity_trailing_callback_pct",
+                executor_config.get("equity_trailing_callback_pct"),
+            ),
+            0,
+        )
+        if capital > 0 and (stop_ratio > 0 or take_ratio > 0 or trailing_enabled):
             equity = self._calculate_current_equity(
                 strategy_id,
                 capital,
@@ -1222,10 +1517,27 @@ class TradingExecutor:
                 symbol=symbol,
             )
             change = (equity - capital) / capital
+            state = risk_state if isinstance(risk_state, dict) else {}
+            peak_return = max(float(state.get("peak_return") or 0.0), change)
+            state["peak_return"] = peak_return
+            if trailing_enabled and change >= trailing_activation:
+                state["trailing_armed"] = True
             if stop_ratio > 0 and change <= -stop_ratio:
                 return close_all("grid_equity_stop_loss", equity=equity, equity_pct=change)
             if take_ratio > 0 and change >= take_ratio:
                 return close_all("grid_equity_take_profit", equity=equity, equity_pct=change)
+            if (
+                trailing_enabled
+                and bool(state.get("trailing_armed"))
+                and trailing_callback > 0
+                and peak_return - change >= trailing_callback
+            ):
+                return close_all(
+                    "grid_equity_trailing_stop",
+                    equity=equity,
+                    equity_pct=change,
+                    equity_peak_pct=peak_return,
+                )
         return []
 
     def _calculate_current_equity(
@@ -1235,6 +1547,7 @@ class TradingExecutor:
         current_positions: Optional[List[Dict[str, Any]]] = None,
         current_price: Optional[float] = None,
         symbol: str = "",
+        current_prices: Optional[Mapping[str, float]] = None,
     ) -> float:
         realized = 0.0
         try:
@@ -1252,13 +1565,27 @@ class TradingExecutor:
         except Exception as exc:
             logger.warning("Failed to calculate realized PnL for strategy %s: %s", strategy_id, exc)
         unrealized = 0.0
-        base_symbol = str(symbol or "").split(":", 1)[0]
+        def normalized_symbol(value: Any) -> str:
+            text = str(value or "").strip()
+            text = text.rpartition("::")[0] if "::" in text else text
+            text = text.split(":", 1)[-1] if ":" in text else text
+            return text.split("@", 1)[0].upper()
+
+        base_symbol = normalized_symbol(symbol)
+        marks = {
+            normalized_symbol(key): float(value or 0.0)
+            for key, value in (current_prices or {}).items()
+            if float(value or 0.0) > 0
+        }
         for row in current_positions or []:
             side = str(row.get("side") or "").lower()
             size = float(row.get("size") or 0)
             entry = float(row.get("entry_price") or 0)
             mark = float(row.get("current_price") or 0)
-            if current_price and str(row.get("symbol") or "").split(":", 1)[0] == base_symbol:
+            row_symbol = normalized_symbol(row.get("symbol"))
+            if marks.get(row_symbol, 0.0) > 0:
+                mark = marks[row_symbol]
+            elif current_price and row_symbol == base_symbol:
                 mark = float(current_price)
             if size <= 0 or entry <= 0 or mark <= 0:
                 continue
@@ -1545,6 +1872,10 @@ class TradingExecutor:
         loop_latency_ms: int = 0,
         status: str = "healthy",
         last_error: str = "",
+        price_source: str = "",
+        price_age_ms: int = 0,
+        trigger_mode: str = "",
+        fill_transport: str = "",
     ) -> None:
         record_runtime_heartbeat(
             strategy_id=strategy_id,
@@ -1555,6 +1886,10 @@ class TradingExecutor:
             loop_latency_ms=loop_latency_ms,
             status=status,
             last_error=last_error,
+            price_source=price_source,
+            price_age_ms=price_age_ms,
+            trigger_mode=trigger_mode,
+            fill_transport=fill_transport,
         )
 
 

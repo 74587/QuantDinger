@@ -600,6 +600,7 @@ class MultiAssetSimulationBroker:
         self._protections: dict[str, ProtectionState] = {}
         self.protection_events: list[dict[str, Any]] = []
         self.order_ledger: list[dict[str, Any]] = []
+        self._resting_deferred_events: dict[str, int] = {}
         self.rebalance_records: list[dict[str, Any]] = []
         self.holding_snapshots: list[dict[str, Any]] = []
         self.protection_engine = ProtectionEngine()
@@ -636,8 +637,7 @@ class MultiAssetSimulationBroker:
             if blocked_reason:
                 status = "rejected" if order.attempts >= 4 else "deferred"
                 event = self._order_event(order_id, order, timestamp, status, blocked_reason)
-                self.order_ledger.append(event)
-                batch_event_indexes.append(len(self.order_ledger) - 1)
+                batch_event_indexes.append(self._append_order_event(event))
                 if status == "deferred":
                     deferred.append(replace(order, attempts=order.attempts + 1))
                 continue
@@ -658,11 +658,10 @@ class MultiAssetSimulationBroker:
             delta = target_qty - current.amount
             direction = 1 if delta > 0 else -1 if delta < 0 else 0
             if order.pending_direction and direction != order.pending_direction:
-                self.order_ledger.append(self._order_event(
+                batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "target_already_met",
                     requested_quantity=0.0,
-                ))
-                batch_event_indexes.append(len(self.order_ledger) - 1)
+                )))
                 continue
             closes_position = (
                 order.kind in {"target_quantity", "target_value", "target_percent"}
@@ -670,11 +669,10 @@ class MultiAssetSimulationBroker:
                 and abs(current.amount) > 1e-12
             )
             if abs(delta) <= 1e-12 or (abs(delta * sizing_price) < 0.01 and not closes_position):
-                self.order_ledger.append(self._order_event(
+                batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "target_already_met",
                     requested_quantity=0.0,
-                ))
-                batch_event_indexes.append(len(self.order_ledger) - 1)
+                )))
                 continue
             fill_reference = "bar_open"
             if is_limit_order:
@@ -682,15 +680,14 @@ class MultiAssetSimulationBroker:
                 high_price = float((bar or {}).get("high") or open_price)
                 low_price = float((bar or {}).get("low") or open_price)
                 if limit_price <= 0:
-                    self.order_ledger.append(self._order_event(
+                    batch_event_indexes.append(self._append_order_event(self._order_event(
                         order_id,
                         order,
                         timestamp,
                         "rejected",
                         "limit_price_required",
                         requested_quantity=abs(delta),
-                    ))
-                    batch_event_indexes.append(len(self.order_ledger) - 1)
+                    )))
                     continue
                 if delta > 0 and open_price <= limit_price:
                     fill_price = open_price
@@ -705,7 +702,7 @@ class MultiAssetSimulationBroker:
                     fill_price = limit_price
                     fill_reference = "limit"
                 else:
-                    self.order_ledger.append(self._order_event(
+                    batch_event_indexes.append(self._append_order_event(self._order_event(
                         order_id,
                         order,
                         timestamp,
@@ -713,8 +710,7 @@ class MultiAssetSimulationBroker:
                         "limit_not_reached",
                         requested_quantity=abs(delta),
                         price=limit_price,
-                    ))
-                    batch_event_indexes.append(len(self.order_ledger) - 1)
+                    ), coalesce_resting=True))
                     # Resting limits remain active until filled; unlike missing
                     # market data they must not expire after four bars.
                     deferred.append(order)
@@ -727,11 +723,10 @@ class MultiAssetSimulationBroker:
             lot_size = self._lot_size(order.symbol, bar)
             delta = self._round_to_lot(delta, lot_size)
             if abs(delta) < lot_size - 1e-12:
-                self.order_ledger.append(self._order_event(
+                batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "minimum_trade_unit",
                     requested_quantity=abs(requested_delta),
-                ))
-                batch_event_indexes.append(len(self.order_ledger) - 1)
+                )))
                 continue
             liquidity_cap = None if forced_liquidation else self._liquidity_cap(bar, lot_size)
             if liquidity_cap is not None and abs(delta) > liquidity_cap:
@@ -748,15 +743,14 @@ class MultiAssetSimulationBroker:
                     position_key=position_key,
                 )
             if abs(feasible_delta) < lot_size - 1e-12:
-                self.order_ledger.append(self._order_event(
+                batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id,
                     order,
                     timestamp,
                     "rejected",
                     constraint_reason or "position_limit",
                     requested_quantity=abs(requested_delta),
-                ))
-                batch_event_indexes.append(len(self.order_ledger) - 1)
+                )))
                 continue
             delta = feasible_delta
             target_qty = current.amount + delta
@@ -836,7 +830,7 @@ class MultiAssetSimulationBroker:
                     if liquidity_cap is not None and abs(requested_delta) > liquidity_cap
                     else "partial_fill"
                 )
-            self.order_ledger.append(self._order_event(
+            batch_event_indexes.append(self._append_order_event(self._order_event(
                 order_id,
                 order,
                 timestamp,
@@ -846,8 +840,7 @@ class MultiAssetSimulationBroker:
                 filled_quantity=abs(delta),
                 price=fill_price,
                 commission=fee,
-            ))
-            batch_event_indexes.append(len(self.order_ledger) - 1)
+            )))
             self._record_closed_trade(
                 execution=execution,
                 old_amount=old_amount,
@@ -1056,6 +1049,64 @@ class MultiAssetSimulationBroker:
             "price": price,
             "commission": commission,
         }
+
+    def _append_order_event(
+        self,
+        event: dict[str, Any],
+        *,
+        coalesce_resting: bool = False,
+    ) -> int:
+        """Append an economic order event, compacting repeated resting polls.
+
+        A limit order that remains outside the bar range has not changed
+        economically.  Persist one audit row for that continuous resting
+        period and retain its first/last timestamps plus exact poll count.
+        Filled, partial, rejected, and other deferred transitions always get
+        their own rows and terminate the previous resting period.
+        """
+        reference = str(event.get("clientOrderId") or "").strip()
+        if coalesce_resting and reference:
+            existing_index = self._resting_deferred_events.get(reference)
+            if existing_index is not None and 0 <= existing_index < len(self.order_ledger):
+                existing = self.order_ledger[existing_index]
+                if (
+                    existing.get("status") == "deferred"
+                    and existing.get("statusReason") == "limit_not_reached"
+                ):
+                    requested = float(event.get("requestedQuantity") or 0.0)
+                    existing["lastEventTime"] = event.get("eventTime")
+                    existing["lastOrderId"] = event.get("orderId")
+                    existing["occurrenceCount"] = int(existing.get("occurrenceCount") or 1) + 1
+                    existing["requestedQuantity"] = requested
+                    existing["minRequestedQuantity"] = min(
+                        float(existing.get("minRequestedQuantity") or requested),
+                        requested,
+                    )
+                    existing["maxRequestedQuantity"] = max(
+                        float(existing.get("maxRequestedQuantity") or requested),
+                        requested,
+                    )
+                    return existing_index
+
+            requested = float(event.get("requestedQuantity") or 0.0)
+            event["firstEventTime"] = event.get("eventTime")
+            event["lastEventTime"] = event.get("eventTime")
+            event["occurrenceCount"] = 1
+            event["minRequestedQuantity"] = requested
+            event["maxRequestedQuantity"] = requested
+        elif reference:
+            self._resting_deferred_events.pop(reference, None)
+
+        self.order_ledger.append(event)
+        index = len(self.order_ledger) - 1
+        if coalesce_resting and reference:
+            self._resting_deferred_events[reference] = index
+        return index
+
+    def release_resting_order_references(self, references: Iterable[str]) -> None:
+        """End deferred-ledger compaction windows for strategy cancellations."""
+        for reference in references:
+            self._resting_deferred_events.pop(str(reference or "").strip(), None)
 
     def _record_rebalance(
         self,
@@ -1315,6 +1366,8 @@ class StrategyV2BacktestRunner:
             params=runtime_params,
         )
         self.logs: list[str] = []
+        self._order_status_cursor = 0
+        self._order_status_summaries: dict[str, dict[str, Any]] = {}
         self._bind_runtime_api()
 
     def run(self, *, start_date: Any = None, end_date: Any = None) -> dict[str, Any]:
@@ -1392,6 +1445,7 @@ class StrategyV2BacktestRunner:
         cancelled = self.context.flush_cancelled_order_ids()
         if not cancelled:
             return orders
+        self.broker.release_resting_order_references(cancelled)
         return [
             order
             for order in orders
@@ -1399,12 +1453,12 @@ class StrategyV2BacktestRunner:
         ]
 
     def _sync_order_statuses(self) -> None:
-        statuses: dict[str, dict[str, Any]] = {}
-        for event in self.broker.order_ledger:
+        changed: dict[str, dict[str, Any]] = {}
+        for event in self.broker.order_ledger[self._order_status_cursor:]:
             reference = str(event.get("clientOrderId") or "").strip()
             if not reference:
                 continue
-            current = statuses.setdefault(reference, {
+            current = self._order_status_summaries.setdefault(reference, {
                 "client_order_id": reference,
                 "status": "unknown",
                 "filled_quantity": 0.0,
@@ -1419,7 +1473,9 @@ class StrategyV2BacktestRunner:
             current["fee"] += max(0.0, float(event.get("commission") or 0.0))
             current["status"] = str(event.get("status") or "unknown")
             current["reason"] = str(event.get("statusReason") or "")
-        self.context.update_order_statuses(statuses)
+            changed[reference] = current
+        self._order_status_cursor = len(self.broker.order_ledger)
+        self.context.update_order_statuses(changed)
 
     def _bind_runtime_api(self) -> None:
         ctx = self.context
@@ -1575,6 +1631,10 @@ class StrategyV2BacktestRunner:
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
         average_profit = sum(profits) / len(profits) if profits else 0.0
         attribution = self._attribution(initial)
+        ledger_occurrences = sum(
+            max(1, int(item.get("occurrenceCount") or 1))
+            for item in self.broker.order_ledger
+        )
         return {
             "initialCapital": initial,
             "totalReturn": total_return,
@@ -1592,6 +1652,14 @@ class StrategyV2BacktestRunner:
             "holdingSnapshots": list(self.broker.holding_snapshots),
             "rebalanceRecords": list(self.broker.rebalance_records),
             "orderLedger": list(self.broker.order_ledger),
+            "orderLedgerStats": {
+                "storedEvents": len(self.broker.order_ledger),
+                "eventOccurrences": ledger_occurrences,
+                "compactedOccurrences": max(
+                    0,
+                    ledger_occurrences - len(self.broker.order_ledger),
+                ),
+            },
             "trades": closed_trades,
             "closedTrades": closed_trades,
             "rawTrades": executions,
@@ -1662,7 +1730,14 @@ class StrategyV2BacktestRunner:
                 "commission": fee,
                 "netContribution": (realized + unrealized) / initial if initial else 0.0,
             })
-        statuses = {name: sum(1 for item in self.broker.order_ledger if item.get("status") == name) for name in ("filled", "partial", "deferred", "rejected")}
+        statuses = {
+            name: sum(
+                max(1, int(item.get("occurrenceCount") or 1))
+                for item in self.broker.order_ledger
+                if item.get("status") == name
+            )
+            for name in ("filled", "partial", "deferred", "rejected")
+        }
         total_commission = sum(commission_by_symbol.values())
         return {
             "symbols": rows,
@@ -1944,6 +2019,75 @@ class StrategyV2LiveSession:
             self.context.set_last_exit_reason(position.symbol, decision.reason)
             self._protection_exit_pending.add(position_key)
         return exits
+
+    def evaluate_equity_risk(
+        self,
+        *,
+        timestamp: object = None,
+    ) -> tuple[list[OrderIntent], list[str], str]:
+        """Evaluate a generated robot's portfolio-wide risk on every live tick.
+
+        Generated system templates expose ``_equity_risk_exit``.  Keeping this
+        hook outside ``handle_data`` means a 1H robot can still stop immediately
+        when its live account equity crosses a limit instead of waiting for the
+        next hourly candle.  User-authored and previously purchased sources that
+        do not expose the hook retain their existing behaviour.
+        """
+        callback = self.program.namespace.get("_equity_risk_exit")
+        if not callable(callback):
+            return [], [], ""
+        self.context.current_dt = pd.Timestamp(timestamp or pd.Timestamp.utcnow())
+        callback(self.context)
+        orders = self.context.flush_orders()
+        self._capture_protection_intents(orders)
+        logs = self.context.flush_logs()
+        reason = str(
+            getattr(self.program.state, "equity_stop_reason", "") or ""
+        ).strip()
+        if not reason and orders:
+            reason = str(orders[0].reason or "").strip()
+        return orders, logs, reason
+
+    def evaluate_price_tick(
+        self,
+        prices: Mapping[str, float],
+        *,
+        timestamp: object = None,
+    ) -> tuple[list[OrderIntent], list[str]]:
+        """Run the optional live-price hook without advancing the K-line clock.
+
+        System robot templates use this hook for price-level strategies such as
+        martingale.  Indicator strategies deliberately omit it and therefore
+        remain closed-bar driven.  The caller is responsible for freshness
+        checks before invoking the hook so stale REST/stream cache values can
+        never open or scale a position.
+        """
+        callback = self.program.namespace.get("on_price_tick")
+        if not callable(callback):
+            return [], []
+        normalized: dict[str, float] = {}
+        for raw_symbol, raw_price in (prices or {}).items():
+            try:
+                symbol = self.portal.resolve_key(raw_symbol)
+                price = float(raw_price or 0.0)
+            except Exception:
+                continue
+            if price > 0 and math.isfinite(price):
+                normalized[symbol] = price
+        if not normalized:
+            return [], []
+        tick_time = pd.Timestamp(timestamp or pd.Timestamp.utcnow())
+        self.context.current_dt = tick_time
+        callback(self.context, normalized)
+        orders = self.context.flush_orders()
+        self._capture_protection_intents(orders)
+        return orders, self.context.flush_logs()
+
+    def release_equity_risk_exit(self) -> None:
+        """Re-arm a generated equity exit after its async submission failed."""
+        callback = self.program.namespace.get("_release_equity_risk_exit")
+        if callable(callback):
+            callback()
 
     def pending_protection_exit_symbols(self) -> set[str]:
         """Return symbols whose protection close has already been dispatched."""
