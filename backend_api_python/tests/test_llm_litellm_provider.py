@@ -26,6 +26,16 @@ def test_litellm_env_mapping(monkeypatch):
     assert cfg["litellm"]["base_url"] == "https://litellm.example/v1"
 
 
+def test_uniform_llm_max_tokens_env_mapping(monkeypatch):
+    monkeypatch.setenv("LLM_MAX_TOKENS", "16384")
+    _reset_config_cache()
+
+    cfg = load_addon_config()
+
+    assert cfg["llm"]["max_tokens"] == 16384
+    assert LLMService().get_max_tokens() == 16384
+
+
 def test_atlascloud_env_mapping(monkeypatch):
     monkeypatch.setenv("ATLASCLOUD_API_KEY", "atlas-key")
     monkeypatch.setenv("ATLASCLOUD_MODEL", "openai/gpt-5.4")
@@ -90,7 +100,80 @@ def test_atlascloud_openai_compatible_call_skips_response_format(monkeypatch):
     assert captured["url"] == "https://api.atlascloud.ai/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer atlas-key"
     assert captured["json"]["model"] == "deepseek-v3"
+    assert captured["json"]["max_tokens"] == 16384
     assert "response_format" not in captured["json"]
+
+
+def test_google_gemini_uses_uniform_max_tokens(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "candidates": [
+                    {"content": {"parts": [{"text": "{\"ok\": true}"}]}}
+                ]
+            }
+
+    service = LLMService(provider="google")
+    monkeypatch.setattr(service, "get_max_tokens", lambda: 16384)
+
+    def fake_post(url, **kwargs):
+        captured.update({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setattr(service, "_llm_post", fake_post)
+
+    out = service._call_google_gemini(
+        [{"role": "user", "content": "hello"}],
+        "gemini-1.5-flash",
+        0.7,
+        "google-key",
+        "https://generativelanguage.googleapis.com/v1beta",
+        30,
+    )
+
+    assert out == "{\"ok\": true}"
+    assert captured["json_payload"]["generationConfig"]["maxOutputTokens"] == 16384
+
+
+def test_openai_compatible_stream_uses_uniform_max_tokens(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def iter_lines(self, decode_unicode=False):
+            return [b"data: [DONE]"]
+
+        def close(self):
+            return None
+
+    service = LLMService(provider="openrouter")
+    monkeypatch.setattr(service, "get_max_tokens", lambda: 16384)
+
+    def fake_post(url, **kwargs):
+        captured.update({"url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setattr(service, "_llm_post", fake_post)
+
+    chunks = list(
+        service._stream_openai_compatible(
+            [{"role": "user", "content": "hello"}],
+            "openai/gpt-5.4",
+            0.7,
+            "openrouter-key",
+            "https://openrouter.ai/api/v1",
+            30,
+        )
+    )
+
+    assert chunks == []
+    assert captured["json_payload"]["max_tokens"] == 16384
 
 
 @pytest.mark.parametrize(
@@ -400,9 +483,12 @@ def test_litellm_sdk_error_is_wrapped(monkeypatch):
 
 
 def test_litellm_response_content(monkeypatch):
+    captured = {}
+
     class FakeLiteLLM:
         @staticmethod
         def completion(**kwargs):
+            captured.update(kwargs)
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))]
             )
@@ -421,3 +507,4 @@ def test_litellm_response_content(monkeypatch):
     )
 
     assert out == "hello"
+    assert captured["max_tokens"] == 16384

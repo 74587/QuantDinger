@@ -16,6 +16,8 @@ from app.utils.config_loader import load_addon_config
 
 logger = get_logger(__name__)
 
+DEFAULT_MAX_TOKENS = 16_384
+
 
 class LLMAPIError(ValueError):
     """Provider HTTP error with status and request metadata preserved."""
@@ -198,6 +200,20 @@ class LLMService:
             return model
         return self.get_default_model(provider)
 
+    def get_max_tokens(self) -> int:
+        """Get the shared maximum output-token budget for every LLM provider."""
+        config = load_addon_config()
+        configured = config.get('llm', {}).get('max_tokens', DEFAULT_MAX_TOKENS)
+        try:
+            return max(1, int(configured))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid LLM_MAX_TOKENS=%r; using %s",
+                configured,
+                DEFAULT_MAX_TOKENS,
+            )
+            return DEFAULT_MAX_TOKENS
+
     def is_configured(self, provider: LLMProvider = None) -> bool:
         """Return whether the provider has enough configuration to make a request."""
         p = provider or self.provider
@@ -301,6 +317,7 @@ class LLMService:
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": self.get_max_tokens(),
         }
         
         # AtlasCloud documents the OpenAI-compatible ChatCompletion shape, but
@@ -458,6 +475,7 @@ class LLMService:
             "contents": contents,
             "generationConfig": {
                 "temperature": temperature,
+                "maxOutputTokens": self.get_max_tokens(),
                 "responseMimeType": "application/json",
             }
         }
@@ -496,6 +514,7 @@ class LLMService:
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": self.get_max_tokens(),
             "timeout": timeout,
             "drop_params": True,
         }
@@ -535,6 +554,7 @@ class LLMService:
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": self.get_max_tokens(),
             "stream": True,
         }
         response = self._llm_post(url, headers=headers, json_payload=data, timeout=timeout, stream=True)

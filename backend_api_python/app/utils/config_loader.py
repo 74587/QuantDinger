@@ -92,7 +92,7 @@ def load_addon_config() -> Dict[str, Any]:
         ('OPENROUTER_API_URL', 'openrouter.api_url', 'string'),
         ('OPENROUTER_MODEL', 'openrouter.model', 'string'),
         ('OPENROUTER_TEMPERATURE', 'openrouter.temperature', 'float'),
-        ('OPENROUTER_MAX_TOKENS', 'openrouter.max_tokens', 'int'),
+        ('LLM_MAX_TOKENS', 'llm.max_tokens', 'int'),
         ('OPENROUTER_TIMEOUT', 'openrouter.timeout', 'int'),
         ('OPENROUTER_CONNECT_TIMEOUT', 'openrouter.connect_timeout', 'int'),
         
