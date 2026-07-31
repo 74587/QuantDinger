@@ -56,8 +56,8 @@
     &nbsp;&nbsp;&nbsp;&nbsp;
     <a href="https://aws.amazon.com/" title="Amazon Web Services — cloud infrastructure sponsor">
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="https://d0.awsstatic.com/logos/powered-by-aws-white.png">
-        <img src="https://d0.awsstatic.com/logos/powered-by-aws.png" alt="Powered by Amazon Web Services" height="38">
+        <source media="(prefers-color-scheme: dark)" srcset="https://a0.awsstatic.com/libra-css/images/logos/aws_smile-header-desktop-en-white_59x35.png">
+        <img src="https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg" alt="Amazon Web Services" width="86">
       </picture>
     </a>
   </p>
@@ -639,8 +639,8 @@ QuantDinger's continued development and open-source community are supported by:
     <td align="center" width="50%">
       <a href="https://aws.amazon.com/">
         <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="https://d0.awsstatic.com/logos/powered-by-aws-white.png">
-          <img src="https://d0.awsstatic.com/logos/powered-by-aws.png" alt="Powered by Amazon Web Services" height="52">
+          <source media="(prefers-color-scheme: dark)" srcset="https://a0.awsstatic.com/libra-css/images/logos/aws_smile-header-desktop-en-white_59x35.png">
+          <img src="https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg" alt="Amazon Web Services" width="120">
         </picture>
       </a>
       <br><br>
