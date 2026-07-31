@@ -44,6 +44,23 @@
     <img src="badges/docker-compose.svg" alt="Docker Compose">
     <a href="https://github.com/OpenByteInc/QuantDinger/releases/latest"><img src="badges/latest-release.svg" alt="最新版本"></a>
   </p>
+
+  <p><sub>赞助支持</sub></p>
+  <p>
+    <a href="https://www.atlascloud.ai/" title="Atlas Cloud — AI 推理赞助商">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
+        <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" height="30">
+      </picture>
+    </a>
+    &nbsp;&nbsp;&nbsp;&nbsp;
+    <a href="https://aws.amazon.com/cn/" title="Amazon Web Services — 云基础设施赞助商">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://d0.awsstatic.com/logos/powered-by-aws-white.png">
+        <img src="https://d0.awsstatic.com/logos/powered-by-aws.png" alt="由 Amazon Web Services 提供支持" height="38">
+      </picture>
+    </a>
+  </p>
 </div>
 
 > QuantDinger 在明确启用实盘交易后可以提交真实订单。请先使用模拟盘，
@@ -519,9 +536,39 @@ QuantDinger 仅用于**合法的研究、教育和合规交易场景**，不得�
 
 ## 赞助商
 
-衷心感谢以下赞助商对 QuantDinger 持续开发和开源社区的支持：
+QuantDinger 的持续开发和开源社区由以下赞助商共同支持：
 
-- [AtlasCloud](https://www.atlascloud.ai/)
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://www.atlascloud.ai/">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
+          <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" height="42">
+        </picture>
+      </a>
+      <br><br>
+      <strong>Atlas Cloud</strong>
+      <br>
+      <sub>AI 推理赞助商</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://aws.amazon.com/cn/">
+        <picture>
+          <source media="(prefers-color-scheme: dark)" srcset="https://d0.awsstatic.com/logos/powered-by-aws-white.png">
+          <img src="https://d0.awsstatic.com/logos/powered-by-aws.png" alt="由 Amazon Web Services 提供支持" height="52">
+        </picture>
+      </a>
+      <br><br>
+      <strong>Amazon Web Services</strong>
+      <br>
+      <sub>云基础设施赞助商</sub>
+    </td>
+  </tr>
+</table>
+
+衷心感谢 [Atlas Cloud](https://www.atlascloud.ai/) 为 AI 模型推理提供赞助支持，
+以及 [Amazon Web Services](https://aws.amazon.com/cn/) 为 QuantDinger 社区服务所需的云基础设施提供赞助支持。
 
 ## 支持项目
 
