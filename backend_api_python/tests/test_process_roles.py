@@ -79,3 +79,33 @@ def test_runtime_settings_reload_preserves_process_topology(monkeypatch):
 
     assert os.environ["QD_PROCESS_ROLE"] == "api"
     assert os.environ["STRATEGY_COMMANDS_ENABLED"] == "true"
+
+
+def test_runtime_settings_reload_preserves_process_security_roots(monkeypatch):
+    from app.services.settings import runtime
+
+    monkeypatch.setenv("SECRET_KEY", "live-jwt-secret-shared-by-all-workers")
+    monkeypatch.setenv(
+        "CREDENTIAL_ENCRYPTION_KEY",
+        "live-credential-key-shared-by-all-workers",
+    )
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+
+    def fake_load(_path, override=True):
+        assert override is True
+        monkeypatch.setenv("SECRET_KEY", "different-file-jwt-secret")
+        monkeypatch.setenv(
+            "CREDENTIAL_ENCRYPTION_KEY",
+            "different-file-credential-key",
+        )
+        monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+
+    monkeypatch.setattr(runtime, "load_dotenv", fake_load)
+    runtime.reload_runtime_env()
+
+    assert os.environ["SECRET_KEY"] == "live-jwt-secret-shared-by-all-workers"
+    assert (
+        os.environ["CREDENTIAL_ENCRYPTION_KEY"]
+        == "live-credential-key-shared-by-all-workers"
+    )
+    assert os.environ["LLM_PROVIDER"] == "deepseek"

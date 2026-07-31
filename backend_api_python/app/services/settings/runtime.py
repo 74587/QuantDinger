@@ -13,6 +13,12 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _PROCESS_OWNED_ENV_KEYS = (
+    # Security roots must remain identical for every worker until the process
+    # group is restarted. Rotating either key in just the worker that handled a
+    # settings request makes JWTs or encrypted credentials unreadable by the
+    # other workers.
+    "SECRET_KEY",
+    "CREDENTIAL_ENCRYPTION_KEY",
     "QD_PROCESS_ROLE",
     "STRATEGY_COMMANDS_ENABLED",
 )
