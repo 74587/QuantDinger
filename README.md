@@ -50,14 +50,14 @@
     <a href="https://www.atlascloud.ai/" title="Atlas Cloud — AI inference sponsor">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
-        <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" height="30">
+        <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="142">
       </picture>
     </a>
     &nbsp;&nbsp;&nbsp;&nbsp;
     <a href="https://aws.amazon.com/" title="Amazon Web Services — cloud infrastructure sponsor">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="https://a0.awsstatic.com/libra-css/images/logos/aws_smile-header-desktop-en-white_59x35.png">
-        <img src="https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg" alt="Amazon Web Services" width="86">
+        <img src="https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg" alt="Amazon Web Services" width="70">
       </picture>
     </a>
   </p>
@@ -628,7 +628,7 @@ QuantDinger's continued development and open-source community are supported by:
       <a href="https://www.atlascloud.ai/">
         <picture>
           <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
-          <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" height="42">
+          <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="190">
         </picture>
       </a>
       <br><br>
@@ -640,7 +640,7 @@ QuantDinger's continued development and open-source community are supported by:
       <a href="https://aws.amazon.com/">
         <picture>
           <source media="(prefers-color-scheme: dark)" srcset="https://a0.awsstatic.com/libra-css/images/logos/aws_smile-header-desktop-en-white_59x35.png">
-          <img src="https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg" alt="Amazon Web Services" width="120">
+          <img src="https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg" alt="Amazon Web Services" width="100">
         </picture>
       </a>
       <br><br>
