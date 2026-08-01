@@ -1798,15 +1798,33 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 symbol=str(symbol),
                 side=str(pos_side),
             )
-            tolerance = max(1e-8, expected_qty * 0.001)
-            if abs(pre_position_qty - expected_qty) > tolerance:
+            from app.services.live_trading.position_ownership import (
+                evaluate_and_record_ownership,
+                ownership_log_message,
+            )
+
+            ownership = evaluate_and_record_ownership(
+                user_id=int(cfg.get("user_id") or order_row.get("user_id") or 1),
+                credential_id=int(credential_id or 0),
+                exchange_id=str(exchange_id or ""),
+                market_type=str(market_type),
+                symbol=str(symbol),
+                side=str(pos_side),
+                account_qty=float(pre_position_qty),
+                strategy_qty=float(expected_qty),
+            )
+            phases_ownership = ownership.metadata()
+            if not ownership.allowed:
                 error = (
                     "position_drift_detected:"
-                    f"side={pos_side},exchange={pre_position_qty},allocated={expected_qty}"
+                    f"side={pos_side},account={ownership.account_qty},"
+                    f"strategy={ownership.strategy_qty},protected={ownership.protected_qty},"
+                    f"unknown={ownership.unknown_qty},mode={ownership.coexistence_mode}"
                 )
                 self._mark_failed(order_id=order_id, error=error)
                 _notify_live_best_effort(status="failed", error=error)
-                append_strategy_log(strategy_id, "error", f"Order rejected because account and strategy positions differ: {symbol} {pos_side}")
+                if ownership.should_log:
+                    append_strategy_log(strategy_id, "error", ownership_log_message(ownership))
                 return
 
             if not _strategy_allows_simultaneous_legs(cfg):
@@ -1846,6 +1864,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
 
         # Collect raw exchange interactions / intermediate states for debugging & persistence.
         phases: Dict[str, Any] = {"pre_position_qty": pre_position_qty}
+        if not reduce_only and market_type == "swap":
+            phases["position_ownership"] = phases_ownership
 
         if not reduce_only and market_type == "swap":
             try:
@@ -1899,6 +1919,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                     market_type=str(market_type or "swap"),
                     exchange_config=exchange_config,
                     allow_exchange_fallback=False,
+                    user_id=int(cfg.get("user_id") or order_row.get("user_id") or 1),
+                    credential_id=int(credential_id_from_exchange_config(exchange_config) or 0),
                 )
                 if close_meta:
                     phases["close_size_resolve"] = close_meta
@@ -1914,7 +1936,14 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             except Exception:
                 pass
 
-        if market_type == "swap":
+        from app.services.live_trading.account_configuration import (
+            requires_derivatives_account_configuration,
+        )
+
+        if requires_derivatives_account_configuration(
+            market_type=market_type,
+            reduce_only=reduce_only,
+        ):
             try:
                 from app.services.live_trading.account_configuration import configure_derivatives_account
 
@@ -2028,6 +2057,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                     market_type=str(market_type or "swap"),
                     exchange_config=exchange_config,
                     allow_exchange_fallback=False,
+                    user_id=int(cfg.get("user_id") or order_row.get("user_id") or 1),
+                    credential_id=int(credential_id_from_exchange_config(exchange_config) or 0),
                 )
                 if retry_meta:
                     phases["close_size_retry"].update(retry_meta)

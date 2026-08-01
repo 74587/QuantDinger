@@ -244,6 +244,8 @@ def resolve_reduce_only_quantity(
     market_type: str,
     exchange_config: Optional[Dict[str, Any]] = None,
     allow_exchange_fallback: bool = False,
+    user_id: int = 0,
+    credential_id: int = 0,
 ) -> Tuple[float, Dict[str, Any]]:
     """
     Choose a safe close/reduce base quantity.
@@ -311,6 +313,28 @@ def resolve_reduce_only_quantity(
             pos_side,
         )
         meta["filled_from"] = "none"
+
+    # In advanced coexistence mode the manual baseline is a hard floor.  Even
+    # a reduce-only strategy exit may use only quantity above that floor.
+    if int(user_id or 0) > 0 and int(credential_id or 0) > 0:
+        try:
+            from app.services.live_trading.position_ownership import protected_quantity
+
+            protected = protected_quantity(
+                user_id=int(user_id),
+                credential_id=int(credential_id),
+                market_type=market_type,
+                symbol=symbol,
+                side=pos_side,
+            )
+            available = max(0.0, float(exch_size or 0.0) - float(protected or 0.0))
+            meta["protected_manual_qty"] = protected
+            meta["exchange_strategy_available"] = available
+            if amount > available:
+                amount = available
+                meta["capped_by"] = "protected_manual_position"
+        except Exception as exc:
+            meta["protected_position_check_error"] = str(exc)
 
     meta["resolved"] = amount
     return amount, meta

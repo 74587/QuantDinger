@@ -997,6 +997,33 @@ class TradingExecutor:
                 logger.warning("Strategy %s %s", strategy_id, message)
                 append_strategy_log(strategy_id, "warning", message)
                 return False
+            action = str(values.get("signal_type") or "").strip().lower()
+            market_type = str(values.get("market_type") or "swap").strip().lower()
+            if action in {"open_long", "add_long", "open_short", "add_short"} and market_type in {
+                "swap", "future", "futures", "perp", "perpetual",
+            }:
+                try:
+                    from app.services.exchange_execution import resolve_exchange_config
+                    from app.services.live_trading.leg_context import credential_id_from_exchange_config
+                    from app.services.live_trading.position_ownership import is_position_leg_blocked
+
+                    resolved_exchange = resolve_exchange_config(
+                        _json_object(strategy.get("exchange_config")),
+                        user_id=int(strategy.get("user_id") or 0),
+                    )
+                    if is_position_leg_blocked(
+                        user_id=int(strategy.get("user_id") or 0),
+                        credential_id=int(credential_id_from_exchange_config(resolved_exchange) or 0),
+                        market_type=market_type,
+                        symbol=str(values.get("symbol") or ""),
+                        side="long" if action.endswith("_long") else "short",
+                    ):
+                        # The worker logged the state transition with full
+                        # quantities.  Suppress repeated queue/log churn until
+                        # a repair or successful reconciliation clears it.
+                        return False
+                except Exception as exc:
+                    logger.debug("Position drift queue check skipped for strategy %s: %s", strategy_id, exc)
         quantity = float(values.get("script_base_qty") or 0)
         reference_price = float(values.get("current_price") or 0)
         initial_capital = float(values.get("initial_capital") or 0)

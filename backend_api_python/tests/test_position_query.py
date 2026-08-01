@@ -109,6 +109,35 @@ def test_resolve_caps_to_db_when_smaller(monkeypatch):
     assert meta.get("capped_by") == "db"
 
 
+def test_resolve_preserves_advanced_manual_position_floor(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.live_trading.position_query.fetch_position_size_for_side",
+        lambda *_a, **_k: 0.015,
+    )
+    monkeypatch.setattr(
+        "app.services.live_trading.position_query.query_exchange_position_size",
+        lambda **_k: 0.02,
+    )
+    monkeypatch.setattr(
+        "app.services.live_trading.position_ownership.protected_quantity",
+        lambda **_k: 0.01,
+    )
+    amount, meta = resolve_reduce_only_quantity(
+        strategy_id=1,
+        symbol="BTC/USDT",
+        pos_side="long",
+        requested_amount=0.015,
+        client=MagicMock(),
+        market_type="swap",
+        exchange_config={},
+        user_id=1,
+        credential_id=2,
+    )
+    assert amount == pytest.approx(0.01)
+    assert meta["protected_manual_qty"] == pytest.approx(0.01)
+    assert meta["capped_by"] == "protected_manual_position"
+
+
 def test_okx_net_mode_long_position(monkeypatch):
     from app.services.live_trading.okx import OkxClient
     from app.services.live_trading.position_query import query_exchange_position_size
