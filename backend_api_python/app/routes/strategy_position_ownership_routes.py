@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import traceback
 from typing import Any, Dict, Tuple
 
 from flask import g, jsonify, request
@@ -106,7 +105,7 @@ def _load_ownership_rows(strategy_id: int, user_id: int, *, fresh: bool = False)
 def get_position_ownership():
     strategy_id = request.args.get("id", type=int)
     if not strategy_id:
-        return jsonify({"code": 0, "msg": "Missing strategy id", "data": {"items": []}}), 400
+        return jsonify({"code": 0, "msg": "positionOwnership.missingStrategyId", "data": {"items": []}}), 400
     try:
         rows, context = _load_ownership_rows(int(strategy_id), int(g.user_id))
         status = "drift_blocked" if any(row.get("status") == "drift_blocked" for row in rows) else "ok"
@@ -121,19 +120,21 @@ def get_position_ownership():
                 "advanced_coexistence_available": context["market_type"] in {"swap", "spot"},
             },
         })
-    except LookupError as exc:
-        return jsonify({"code": 0, "msg": str(exc), "data": {"items": []}}), 404
-    except Exception as exc:
-        logger.error("get_position_ownership failed: %s", exc)
-        logger.debug(traceback.format_exc())
-        return jsonify({"code": 0, "msg": str(exc), "data": {"items": []}}), 500
+    except LookupError:
+        return jsonify({"code": 0, "msg": "strategyV2.strategyNotFound", "data": {"items": []}}), 404
+    except Exception:
+        logger.exception("get_position_ownership failed")
+        return jsonify({"code": 0, "msg": "positionOwnership.loadFailed", "data": {"items": []}}), 500
 
 
 @strategy_blp.route('/strategies/position-ownership/repair', methods=['POST'])
 @login_required
 def repair_position_ownership_route():
     payload = dict(request.get_json(silent=True) or {})
-    strategy_id = int(payload.get("id") or payload.get("strategy_id") or 0)
+    try:
+        strategy_id = int(payload.get("id") or payload.get("strategy_id") or 0)
+    except (TypeError, ValueError):
+        strategy_id = 0
     symbol = str(payload.get("symbol") or "").strip()
     side = str(payload.get("side") or "").strip().lower()
     action = str(payload.get("action") or "recheck").strip().lower()
@@ -163,11 +164,10 @@ def repair_position_ownership_route():
             inst_id=str(current.get("inst_id") or ""),
         )
         return jsonify({"code": 1, "msg": "success", "data": result.metadata()})
-    except LookupError as exc:
-        return jsonify({"code": 0, "msg": str(exc), "data": None}), 404
-    except ValueError as exc:
-        return jsonify({"code": 0, "msg": str(exc), "data": None}), 409
-    except Exception as exc:
-        logger.error("repair_position_ownership failed: %s", exc)
-        logger.debug(traceback.format_exc())
-        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+    except LookupError:
+        return jsonify({"code": 0, "msg": "strategyV2.strategyNotFound", "data": None}), 404
+    except ValueError:
+        return jsonify({"code": 0, "msg": "positionOwnership.invalidRepairRequest", "data": None}), 409
+    except Exception:
+        logger.exception("repair_position_ownership failed")
+        return jsonify({"code": 0, "msg": "positionOwnership.repairFailed", "data": None}), 500

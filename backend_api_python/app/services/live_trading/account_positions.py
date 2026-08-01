@@ -216,6 +216,7 @@ def reconcile_strategy_vs_account(
     allocations: Dict[tuple, float] = aggregate(
         allocated_rows if allocated_rows is not None else (local_rows or [])
     )
+    include_ownership = protected_rows is not None
     protected: Dict[tuple, float] = {}
     for row in protected_rows or []:
         if str(row.get("coexistence_mode") or "strict") != "advanced":
@@ -245,22 +246,30 @@ def reconcile_strategy_vs_account(
         if expected_size <= eps and account_size <= eps:
             continue
         if expected_size > eps and account_size <= eps:
-            notes.append(
-                f"strategy_only:{sym}:{side}:strategy={allocated_size}:protected={protected_size}:account=0"
-            )
+            note = f"strategy_only:{sym}:{side}:allocated={allocated_size}"
+            if include_ownership:
+                note = (
+                    f"strategy_only:{sym}:{side}:strategy={allocated_size}:"
+                    f"protected={protected_size}:account=0"
+                )
+            notes.append(note)
             status = "strategy_only" if status == "ok" else "mismatch"
         elif expected_size <= eps and account_size > eps:
-            notes.append(
-                f"account_only:{sym}:{side}:account={account_size}:strategy=0:protected=0"
-            )
+            note = f"account_only:{sym}:{side}:account={account_size}"
+            if include_ownership:
+                note += ":strategy=0:protected=0"
+            notes.append(note)
             status = "account_only" if status == "ok" else "mismatch"
         else:
             tol = max(eps, expected_size * size_tolerance_ratio)
             if abs(expected_size - account_size) > tol:
-                notes.append(
-                    f"size_mismatch:{sym}:{side}:account={account_size}:strategy={allocated_size}:"
-                    f"protected={protected_size}:unknown={account_size - expected_size}"
-                )
+                note = f"size_mismatch:{sym}:{side}:allocated={allocated_size}:account={account_size}"
+                if include_ownership:
+                    note = (
+                        f"size_mismatch:{sym}:{side}:account={account_size}:strategy={allocated_size}:"
+                        f"protected={protected_size}:unknown={account_size - expected_size}"
+                    )
+                notes.append(note)
                 status = "mismatch"
 
     shares: List[Dict[str, Any]] = []
@@ -269,15 +278,17 @@ def reconcile_strategy_vs_account(
         allocated_size = float(allocations.get(key, 0.0))
         protected_size = float(protected.get(key, 0.0))
         account_size = float(acct.get(key, 0.0))
-        shares.append({
+        share = {
             "symbol": sym,
             "side": side,
             "strategy_size": local_size,
             "allocated_size": allocated_size,
-            "protected_size": protected_size,
             "account_size": account_size,
             "allocation_share": local_size / allocated_size if allocated_size > eps else 0.0,
-        })
+        }
+        if include_ownership:
+            share["protected_size"] = protected_size
+        shares.append(share)
     return {
         "status": status,
         "notes": notes,

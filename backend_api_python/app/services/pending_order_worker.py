@@ -21,10 +21,11 @@ from app.services.live_trading.execution import place_order_from_signal
 from app.services.live_trading.factory import create_client
 from app.services.live_trading.records import (
     ensure_position_ledger_schema,
-    fetch_allocated_position_size,
-    fetch_position_size_for_side,
     normalize_strategy_symbol,
     strategy_allowed_symbols,
+)
+from app.services.live_trading.account_configuration import (
+    requires_derivatives_account_configuration,
 )
 from app.services.live_trading.strategy_position_sync import (
     strategy_uses_fill_ledger,
@@ -74,6 +75,10 @@ from app.services.pending_orders.live_order_phases import (
     maker_limit_price,
     wait_live_order_fill,
 )
+from app.services.pending_orders.entry_position_guard import (
+    evaluate_entry_position_guard,
+    strategy_allows_simultaneous_legs as _strategy_allows_simultaneous_legs,
+)
 from app.services.grid.exchange_orders import query_grid_order_fill
 from app.services.pending_orders.position_sync_cache import (
     exchange_sync_backoff_sec,
@@ -106,7 +111,6 @@ from app.services.strategy_lifecycle import (
     is_fatal_exchange_error,
     should_skip_position_sync,
 )
-from app.services.strategy_live_guard import resolve_strategy_direction_mode
 
 # Lazy import IBKR to avoid ImportError if ib_insync not installed
 IBKRClient = None
@@ -118,11 +122,6 @@ AlpacaClient = None
 logger = get_logger(__name__)
 
 ALPACA_FILL_DELTA_EPSILON = 1e-8
-
-
-def _strategy_allows_simultaneous_legs(strategy: Dict[str, Any]) -> bool:
-    """Return whether one strategy intentionally owns both derivative legs."""
-    return resolve_strategy_direction_mode(strategy) in {"both", "neutral"}
 
 
 def _broker_order_type(payload: Dict[str, Any], ref_price: float) -> Tuple[str, float]:
@@ -1791,76 +1790,26 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
 
         if not reduce_only and market_type == "swap":
             credential_id = credential_id_from_exchange_config(exchange_config)
-            expected_qty = fetch_allocated_position_size(
+            guard = evaluate_entry_position_guard(
+                client=client,
                 strategy_id=int(strategy_id),
-                credential_id=int(credential_id or 0),
-                market_type=str(market_type),
-                symbol=str(symbol),
-                side=str(pos_side),
-            )
-            from app.services.live_trading.position_ownership import (
-                evaluate_and_record_ownership,
-                ownership_log_message,
-            )
-
-            ownership = evaluate_and_record_ownership(
                 user_id=int(cfg.get("user_id") or order_row.get("user_id") or 1),
                 credential_id=int(credential_id or 0),
                 exchange_id=str(exchange_id or ""),
                 market_type=str(market_type),
                 symbol=str(symbol),
                 side=str(pos_side),
+                strategy_config=cfg,
+                exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
                 account_qty=float(pre_position_qty),
-                strategy_qty=float(expected_qty),
             )
-            phases_ownership = ownership.metadata()
-            if not ownership.allowed:
-                error = (
-                    "position_drift_detected:"
-                    f"side={pos_side},account={ownership.account_qty},"
-                    f"strategy={ownership.strategy_qty},protected={ownership.protected_qty},"
-                    f"unknown={ownership.unknown_qty},mode={ownership.coexistence_mode}"
-                )
-                self._mark_failed(order_id=order_id, error=error)
-                _notify_live_best_effort(status="failed", error=error)
-                if ownership.should_log:
-                    append_strategy_log(strategy_id, "error", ownership_log_message(ownership))
+            phases_ownership = guard.ownership
+            if guard.error:
+                self._mark_failed(order_id=order_id, error=guard.error)
+                _notify_live_best_effort(status="failed", error=guard.error)
+                if guard.log_message:
+                    append_strategy_log(strategy_id, guard.log_level, guard.log_message)
                 return
-
-            if not _strategy_allows_simultaneous_legs(cfg):
-                opposite_side = "short" if str(pos_side) == "long" else "long"
-                local_opposite = fetch_position_size_for_side(int(strategy_id), str(symbol), opposite_side)
-                if local_opposite > 1e-8:
-                    try:
-                        live_opposite = float(
-                            query_exchange_position_size(
-                                client=client,
-                                symbol=str(symbol),
-                                pos_side=opposite_side,
-                                market_type=str(market_type),
-                                exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
-                                strict=True,
-                            )
-                            or 0.0
-                        )
-                    except Exception as e:
-                        error = f"opposite_position_snapshot_failed:{e}"
-                        self._mark_failed(order_id=order_id, error=error)
-                        _notify_live_best_effort(status="failed", error=error)
-                        return
-                    if live_opposite > 1e-8:
-                        error = (
-                            "opposite_position_still_open:"
-                            f"side={opposite_side},exchange={live_opposite},local={local_opposite}"
-                        )
-                        self._mark_failed(order_id=order_id, error=error)
-                        _notify_live_best_effort(status="failed", error=error)
-                        append_strategy_log(
-                            strategy_id,
-                            "warning",
-                            f"Reverse entry rejected until the opposite position is fully closed: {symbol}",
-                        )
-                        return
 
         # Collect raw exchange interactions / intermediate states for debugging & persistence.
         phases: Dict[str, Any] = {"pre_position_qty": pre_position_qty}
@@ -1935,10 +1884,6 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                     ref_price = float(client.get_mark_price(symbol=str(symbol)) or 0.0)
             except Exception:
                 pass
-
-        from app.services.live_trading.account_configuration import (
-            requires_derivatives_account_configuration,
-        )
 
         if requires_derivatives_account_configuration(
             market_type=market_type,

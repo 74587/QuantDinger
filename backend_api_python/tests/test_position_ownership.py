@@ -2,6 +2,7 @@
 
 import pytest
 
+from app.services.pending_orders import entry_position_guard
 from app.services.live_trading.account_positions import reconcile_strategy_vs_account
 from app.services.live_trading.position_ownership import (
     ADVANCED_MODE,
@@ -73,3 +74,39 @@ def test_account_reconciliation_counts_protected_manual_inventory():
     )
     assert result["status"] == "ok"
     assert result["strategy_allocations"][0]["protected_size"] == pytest.approx(0.01)
+
+
+def test_entry_guard_returns_structured_drift_without_checking_opposite_leg(monkeypatch):
+    snapshot = calculate_position_ownership(
+        symbol="BTC/USDT",
+        side="long",
+        account_qty=0.025,
+        strategy_qty=0.015,
+    )
+    monkeypatch.setattr(entry_position_guard, "fetch_allocated_position_size", lambda **_kwargs: 0.015)
+    monkeypatch.setattr(entry_position_guard, "evaluate_and_record_ownership", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(
+        entry_position_guard,
+        "fetch_position_size_for_side",
+        lambda *_args, **_kwargs: pytest.fail("blocked ownership must stop before opposite-leg checks"),
+    )
+
+    result = entry_position_guard.evaluate_entry_position_guard(
+        client=object(),
+        strategy_id=1,
+        user_id=2,
+        credential_id=3,
+        exchange_id="binance",
+        market_type="swap",
+        symbol="BTC/USDT",
+        side="long",
+        strategy_config={},
+        exchange_config={},
+        account_qty=0.025,
+    )
+
+    assert result.error.startswith("position_drift_detected:")
+    assert "account=0.025" in result.error
+    assert "strategy=0.015" in result.error
+    assert result.log_level == "error"
+    assert result.ownership["status"] == STATUS_BLOCKED
