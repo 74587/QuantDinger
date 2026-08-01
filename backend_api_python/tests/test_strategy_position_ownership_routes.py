@@ -2,6 +2,7 @@
 
 import inspect
 
+import pytest
 from flask import g
 
 from app.routes import strategy_position_ownership_routes as routes
@@ -54,3 +55,31 @@ def test_ownership_repair_rejects_non_numeric_strategy_id(app):
 
     assert status == 400
     assert response.get_json()["msg"] == "positionOwnership.invalidRepairRequest"
+
+
+@pytest.mark.parametrize(
+    ("market_type", "exchange_id", "available"),
+    [
+        ("spot", "binance", True),
+        ("swap", "okx", True),
+        ("spot", "alpaca", False),
+        ("USStock", "alpaca", False),
+    ],
+)
+def test_ownership_read_reports_supported_coexistence_markets(
+    app, monkeypatch, market_type, exchange_id, available
+):
+    monkeypatch.setattr(
+        routes,
+        "_load_ownership_rows",
+        lambda *_args, **_kwargs: ([], {
+            "market_type": market_type,
+            "credential_id": 3,
+            "exchange": {"exchange_id": exchange_id},
+        }),
+    )
+    with app.test_request_context("/api/strategies/position-ownership?id=1"):
+        g.user_id = 1
+        response = inspect.unwrap(routes.get_position_ownership)()
+
+    assert response.get_json()["data"]["advanced_coexistence_available"] is available

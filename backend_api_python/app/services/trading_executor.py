@@ -999,19 +999,22 @@ class TradingExecutor:
                 return False
             action = str(values.get("signal_type") or "").strip().lower()
             market_type = str(values.get("market_type") or "swap").strip().lower()
-            if action in {"open_long", "add_long", "open_short", "add_short"} and market_type in {
-                "swap", "future", "futures", "perp", "perpetual",
-            }:
+            if action in {"open_long", "add_long", "open_short", "add_short"}:
                 try:
                     from app.services.exchange_execution import resolve_exchange_config
                     from app.services.live_trading.leg_context import credential_id_from_exchange_config
-                    from app.services.live_trading.position_ownership import is_position_leg_blocked
+                    from app.services.live_trading.position_ownership import (
+                        is_position_leg_blocked,
+                        supports_position_coexistence,
+                    )
 
                     resolved_exchange = resolve_exchange_config(
                         _json_object(strategy.get("exchange_config")),
                         user_id=int(strategy.get("user_id") or 0),
                     )
-                    if is_position_leg_blocked(
+                    if supports_position_coexistence(
+                        market_type, str(resolved_exchange.get("exchange_id") or "")
+                    ) and is_position_leg_blocked(
                         user_id=int(strategy.get("user_id") or 0),
                         credential_id=int(credential_id_from_exchange_config(resolved_exchange) or 0),
                         market_type=market_type,

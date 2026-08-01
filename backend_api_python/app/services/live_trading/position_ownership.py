@@ -26,6 +26,10 @@ STRICT_MODE = "strict"
 ADVANCED_MODE = "advanced"
 STATUS_OK = "ok"
 STATUS_BLOCKED = "drift_blocked"
+COEXISTENCE_MARKET_TYPES = frozenset({"spot", "swap"})
+CRYPTO_COEXISTENCE_EXCHANGES = frozenset({
+    "binance", "bitget", "bybit", "gate", "htx", "okx",
+})
 
 
 def normalize_market_type(value: str) -> str:
@@ -33,6 +37,15 @@ def normalize_market_type(value: str) -> str:
     if market in {"future", "futures", "perp", "perpetual"}:
         return "swap"
     return market
+
+
+def supports_position_coexistence(value: str, exchange_id: str = "") -> bool:
+    """Return whether account/strategy inventory can share one Crypto market leg."""
+    market = normalize_market_type(value)
+    if market not in COEXISTENCE_MARKET_TYPES:
+        return False
+    exchange = str(exchange_id or "").strip().lower()
+    return market == "swap" or not exchange or exchange in CRYPTO_COEXISTENCE_EXCHANGES
 
 
 def normalize_side(value: str) -> str:
@@ -283,6 +296,10 @@ def repair_position_ownership(
     action_name = str(action or "").strip().lower()
     if action_name not in {"protect_manual", "strict_mode", "recheck"}:
         raise ValueError("positionOwnership.invalidRepairAction")
+    if action_name == "protect_manual" and not supports_position_coexistence(
+        market_type, exchange_id
+    ):
+        raise ValueError("positionOwnership.coexistenceMarketUnsupported")
     existing = _fetch_reservation(
         user_id=user_id,
         credential_id=credential_id,

@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from app.services.live_trading.position_ownership import (
     evaluate_and_record_ownership,
+    normalize_market_type,
     ownership_log_message,
 )
 from app.services.live_trading.position_query import query_exchange_position_size
@@ -78,6 +79,12 @@ def evaluate_entry_position_guard(
             log_level="error" if snapshot.should_log else "",
             log_message=ownership_log_message(snapshot) if snapshot.should_log else "",
         )
+
+    # Spot has only the long inventory lane.  Its ownership baseline and drift
+    # rules are identical to swap, but there is no opposite exchange leg to
+    # inspect before an entry.
+    if normalize_market_type(market_type) == "spot":
+        return EntryPositionGuardResult(ownership=metadata)
 
     if strategy_allows_simultaneous_legs(strategy_config):
         return EntryPositionGuardResult(ownership=metadata)

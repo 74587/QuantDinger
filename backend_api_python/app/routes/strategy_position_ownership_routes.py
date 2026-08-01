@@ -107,6 +107,8 @@ def get_position_ownership():
     if not strategy_id:
         return jsonify({"code": 0, "msg": "positionOwnership.missingStrategyId", "data": {"items": []}}), 400
     try:
+        from app.services.live_trading.position_ownership import supports_position_coexistence
+
         rows, context = _load_ownership_rows(int(strategy_id), int(g.user_id))
         status = "drift_blocked" if any(row.get("status") == "drift_blocked" for row in rows) else "ok"
         return jsonify({
@@ -117,7 +119,10 @@ def get_position_ownership():
                 "status": status,
                 "market_type": context["market_type"],
                 "credential_id": context["credential_id"],
-                "advanced_coexistence_available": context["market_type"] in {"swap", "spot"},
+                "advanced_coexistence_available": supports_position_coexistence(
+                    context["market_type"],
+                    str(context["exchange"].get("exchange_id") or ""),
+                ),
             },
         })
     except LookupError:

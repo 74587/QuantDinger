@@ -45,6 +45,7 @@ from app.services.live_trading.leg_context import (
     credential_id_from_exchange_config,
 )
 from app.services.live_trading.position_query import resolve_reduce_only_quantity
+from app.services.live_trading.position_ownership import supports_position_coexistence
 from app.utils.pnl import calc_notional_value
 from app.services.live_trading.base import LiveTradingError, is_file_descriptor_exhausted
 from app.services.pending_orders.fill_records import (
@@ -1788,7 +1789,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             append_strategy_log(strategy_id, "error", f"Order rejected because the exchange position snapshot failed: {symbol}")
             return
 
-        if not reduce_only and market_type == "swap":
+        ownership_enabled = supports_position_coexistence(market_type, exchange_id)
+        if not reduce_only and ownership_enabled:
             credential_id = credential_id_from_exchange_config(exchange_config)
             guard = evaluate_entry_position_guard(
                 client=client,
@@ -1813,7 +1815,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
 
         # Collect raw exchange interactions / intermediate states for debugging & persistence.
         phases: Dict[str, Any] = {"pre_position_qty": pre_position_qty}
-        if not reduce_only and market_type == "swap":
+        if not reduce_only and ownership_enabled:
             phases["position_ownership"] = phases_ownership
 
         if not reduce_only and market_type == "swap":
@@ -1874,8 +1876,17 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 if close_meta:
                     phases["close_size_resolve"] = close_meta
             except Exception as e:
+                error = f"protected_position_check_failed:{e}"
                 logger.error(f"[RiskControl] Failed to resolve close quantity: {e}")
                 phases["close_size_resolve_error"] = str(e)
+                self._mark_failed(order_id=order_id, error=error)
+                _notify_live_best_effort(status="failed", error=error)
+                append_strategy_log(
+                    strategy_id,
+                    "error",
+                    f"Close rejected because protected inventory could not be verified: {symbol}",
+                )
+                return
 
         # Ensure ref price exists (used by maker pricing, fallbacks, and local DB snapshots).
         if ref_price <= 0:
