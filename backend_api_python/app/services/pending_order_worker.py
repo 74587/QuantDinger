@@ -96,6 +96,15 @@ from app.services.pending_orders.sent_order_recovery import (
     is_final_fill, normalize_live_order_status,
     tracked_fill_baseline,
 )
+from app.services.pending_orders.order_quantities import (
+    exchange_quantity_snapshot,
+    reconciled_queue_status,
+)
+from app.services.pending_orders.broker_support import (
+    broker_order_type as _broker_order_type,
+    broker_protection_prices as _broker_protection_prices,
+    redact_exchange_json as _redact_exchange_json,
+)
 from app.services.live_trading.binance import BinanceFuturesClient
 from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.okx import OkxClient
@@ -123,50 +132,6 @@ AlpacaClient = None
 logger = get_logger(__name__)
 
 ALPACA_FILL_DELTA_EPSILON = 1e-8
-
-
-def _broker_order_type(payload: Dict[str, Any], ref_price: float) -> Tuple[str, float]:
-    order_type = str(payload.get("order_type") or "market").strip().lower()
-    if order_type == "maker_then_market":
-        raise LiveTradingError("maker_then_market is not supported by broker execution")
-    if order_type not in ("market", "limit"):
-        raise LiveTradingError(f"unsupported_broker_order_type:{order_type}")
-    limit_price = float(payload.get("limit_price") or 0.0)
-    if order_type == "limit" and limit_price <= 0:
-        limit_price = float(ref_price or 0.0)
-    if order_type == "limit" and limit_price <= 0:
-        raise LiveTradingError("broker_limit_price_required")
-    return order_type, limit_price
-
-
-def _broker_protection_prices(
-    payload: Dict[str, Any],
-    *,
-    signal_type: str,
-    entry_price: float,
-) -> Tuple[float, float]:
-    sig = str(signal_type or "").strip().lower()
-    if sig not in ("open_long", "add_long", "open_short", "add_short") or entry_price <= 0:
-        return 0.0, 0.0
-    from app.services.live_trading.native_protection import protection_prices_from_payload
-
-    stop, take, _trailing, _activation = protection_prices_from_payload(
-        payload,
-        entry_price=float(entry_price),
-        pos_side="short" if "short" in sig else "long",
-    )
-    return float(stop or 0.0), float(take or 0.0)
-
-
-def _redact_exchange_json(value: str) -> str:
-    from app.services.live_trading.partner_attribution import redact_partner_attribution
-
-    text_value = str(value or "")
-    try:
-        parsed = json.loads(text_value or "{}")
-    except Exception:
-        return str(redact_partner_attribution(text_value))
-    return json.dumps(redact_partner_attribution(parsed), ensure_ascii=False)
 
 
 class PendingOrderWorker(PendingOrderPositionSyncMixin):
@@ -1064,11 +1029,21 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 commission_quote=cumulative_quote_fee,
             )
 
-        queue_status = "sent"
-        if exchange_status == "filled" and cumulative_avg > 0:
-            queue_status = "filled"
-        elif exchange_status == "cancelled":
-            queue_status = "cancelled"
+        requested_qty = max(
+            0.0,
+            float(payload.get("amount") or row.get("amount") or aggregate_filled or 0.0),
+        )
+        queue_status, executable_qty = reconciled_queue_status(
+            client,
+            exchange_id=exchange_id,
+            symbol=symbol,
+            market_type=market_type,
+            requested=requested_qty,
+            filled=aggregate_filled,
+            avg_price=aggregate_avg,
+            exchange_status=exchange_status,
+            exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+        )
 
         self._update_live_sent_order_snapshot(
             order_id=order_id,
@@ -1081,6 +1056,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                     "status": exchange_status,
                     "filled": aggregate_filled,
                     "avg_price": aggregate_avg,
+                    "requested_qty": requested_qty,
+                    "executable_qty": executable_qty,
                     "live_fill_sync": {
                         "tracked_filled": cumulative_filled,
                         "tracked_avg_price": cumulative_avg,
@@ -1970,6 +1947,12 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 )
                 phases["spot_prepare_error"] = str(e)
 
+        if market_type == "swap" and exchange_id == "bitget":
+            amount, phases["exchange_quantity_normalization"] = exchange_quantity_snapshot(
+                client, exchange_id=exchange_id, symbol=symbol, market_type=market_type,
+                requested=amount, exchange_config=exchange_config,
+            )
+
         self._log_live_order_sizing(
             strategy_id=strategy_id,
             client=client,
@@ -2019,6 +2002,12 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 if retry_meta:
                     phases["close_size_retry"].update(retry_meta)
                 remaining = float(amount or 0.0)
+                if remaining > 0 and market_type == "swap" and exchange_id == "bitget":
+                    amount, phases["exchange_quantity_normalization"] = exchange_quantity_snapshot(
+                        client, exchange_id=exchange_id, symbol=symbol, market_type=market_type,
+                        requested=remaining, exchange_config=exchange_config, source="close_size_retry",
+                    )
+                    remaining = float(amount or 0.0)
                 if remaining > 0:
                     logger.info(
                         "[CloseRetry] Resolved close qty=%s for strategy=%s %s %s",

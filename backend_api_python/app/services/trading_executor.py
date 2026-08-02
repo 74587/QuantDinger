@@ -416,8 +416,6 @@ class TradingExecutor:
                     runtime_price_client,
                 )
 
-            if execution_mode == "live":
-                frames = self._align_latest_frame_prices(frames, runtime_prices())
             initial_capital = float(
                 strategy.get("initial_capital") or trading_config.get("initial_capital") or 0
             )
@@ -708,52 +706,12 @@ class TradingExecutor:
                     # strategy position snapshot becomes flat.
                     protected = session.pending_protection_exit_symbols()
 
+                    # Realtime prices are an execution/risk input only. Normal
+                    # strategy entries and scale-ins remain completed-candle
+                    # driven through ``session.process(frames)`` below.
                     pending_count = len(equity_intents) + len(protection_intents)
-                    if execution_mode == "live" and not equity_stop_reason and active_prices:
-                        tick_intents, tick_messages = session.evaluate_price_tick(
-                            active_prices,
-                            timestamp=risk_timestamp,
-                        )
-                        tick_intents = [
-                            intent
-                            for intent in tick_intents
-                            if _runtime_position_key(
-                                intent.symbol,
-                                intent.position_side,
-                            ) not in protected
-                        ]
-                        pending_count += len(tick_intents)
-                        for message in tick_messages:
-                            append_strategy_log(strategy_id, "info", message)
-                        for intent in tick_intents:
-                            submitted = self._execute_strategy_v2_intent(
-                                strategy_id=strategy_id,
-                                strategy_name=strategy_name,
-                                intent=intent,
-                                frames=frames,
-                                candidates=candidates,
-                                initial_capital=initial_capital,
-                                leverage=leverage,
-                                execution_mode=execution_mode,
-                                notification_config=notification_config,
-                                trading_config=trading_config,
-                                exchange_config=exchange_config,
-                                signal_ts=self._intent_signal_timestamp(intent, risk_timestamp),
-                                strategy_run_id=run_id,
-                                current_price_override=active_prices.get(str(intent.symbol)),
-                                direction_mode=direction_mode,
-                            )
-                            if intent.client_order_id:
-                                session.context.update_order_statuses({
-                                    intent.client_order_id: {
-                                        "client_order_id": intent.client_order_id,
-                                        "status": "submitted" if submitted else "rejected",
-                                    },
-                                })
                     if not equity_stop_reason and cycle_started >= next_signal_poll:
                         frames = fetch_frames()
-                        if execution_mode == "live":
-                            frames = self._align_latest_frame_prices(frames, active_prices)
                         intents, messages, timestamp = session.process(frames)
                         intents = [
                             intent
@@ -1875,21 +1833,6 @@ class TradingExecutor:
         except Exception as exc:
             logger.warning("Execution-account price fetch failed: %s", exc)
         return prices
-
-    @staticmethod
-    def _align_latest_frame_prices(
-        frames: dict[str, pd.DataFrame],
-        prices: dict[str, float],
-    ) -> dict[str, pd.DataFrame]:
-        for key, price in prices.items():
-            frame = frames.get(str(key))
-            if frame is None or frame.empty or float(price or 0.0) <= 0:
-                continue
-            latest = frame.index[-1]
-            for column in ("open", "high", "low", "close"):
-                if column in frame.columns:
-                    frame.at[latest, column] = float(price)
-        return frames
 
     @staticmethod
     def _heartbeat(
