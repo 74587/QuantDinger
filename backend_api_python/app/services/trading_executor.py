@@ -133,7 +133,9 @@ class TradingExecutor:
             return
 
         direction_mode = resolve_strategy_direction_mode(strategy)
-        bot_type = str(trading_config.get("bot_type") or "").strip().lower()
+        from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+        bot_type = resolve_bot_type(strategy, trading_config)
         bot_params = (
             trading_config.get("bot_params")
             if isinstance(trading_config.get("bot_params"), dict)
@@ -454,9 +456,13 @@ class TradingExecutor:
             last_prices: dict[str, float] = {}
             last_price_seen_at: dict[str, float] = {}
             self._heartbeat(strategy_id, run_id, primary, last_prices, 0)
-            bot_type = str(
-                strategy.get("bot_type") or trading_config.get("bot_type") or ""
-            ).strip().lower()
+            from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+            bot_type = resolve_bot_type(strategy, trading_config)
+            if bot_type:
+                # Keep all downstream risk helpers on the same canonical
+                # classification, including legacy executor_type deployments.
+                trading_config["bot_type"] = bot_type
             if execution_mode == "live" and bot_type == "grid":
                 exit_reason = self._run_grid_resting_loop(
                     strategy_id=strategy_id,
@@ -991,6 +997,32 @@ class TradingExecutor:
         leverage = float(values.get("leverage") or 1)
         nominal_capacity = initial_capital * max(1.0, leverage)
         entry_pct = ((quantity * reference_price) / nominal_capacity * 100.0) if nominal_capacity > 0 else 0.0
+        from app.services.pending_orders.order_budget import strategy_order_budget_snapshot
+
+        budget = strategy_order_budget_snapshot(
+            action=str(values.get("signal_type") or ""),
+            quantity=quantity,
+            price=reference_price,
+            initial_capital=initial_capital,
+            leverage=leverage,
+            market_type=str(values.get("market_type") or "spot"),
+            current_positions=values.get("current_positions") or (),
+            buffer_ratio=float(
+                (_json_object(values.get("trading_config"))).get("order_budget_buffer_ratio")
+                or 0.02
+            ),
+        )
+        if not budget["allowed"]:
+            append_strategy_log(
+                strategy_id,
+                "error",
+                "Order rejected by strategy budget guard: "
+                f"action={budget['action']}, quantity={quantity:.12f}, price={reference_price:.8f}, "
+                f"order_notional={budget['order_notional']:.4f}, "
+                f"projected_notional={budget['projected_notional']:.4f}, "
+                f"limit={budget['limit']:.4f}, reason={budget['reason']}",
+            )
+            return False
         request = LiveOrderRequest(
             strategy_id=strategy_id,
             strategy_run_id=int(values.get("strategy_run_id") or 0),
@@ -1186,15 +1218,19 @@ class TradingExecutor:
                         "Live grid price unavailable; risk checks are paused while exchange resting orders remain active",
                     )
                     stale_logged = True
+                grid_health = runner.operational_snapshot()
+                runtime_error = "" if current_price > 0 else "live_price_unavailable"
+                if not runtime_error:
+                    runtime_error = str(grid_health.get("error") or "")
                 self._heartbeat(
                     strategy_id,
                     strategy_run_id,
                     primary,
                     last_prices,
-                    0,
+                    int(grid_health.get("open_orders") or 0),
                     loop_latency_ms=int((time.monotonic() - cycle_started) * 1000),
-                    status="healthy" if current_price > 0 else "degraded",
-                    last_error="" if current_price > 0 else "live_price_unavailable",
+                    status="healthy" if current_price > 0 and grid_health.get("healthy") else "degraded",
+                    last_error=runtime_error,
                     price_source=price_snapshot.source,
                     price_age_ms=price_snapshot.age_ms,
                     trigger_mode="exchange_resting_orders",
@@ -1692,6 +1728,21 @@ class TradingExecutor:
         code = str((source or {}).get("code") or "").strip()
         if not code:
             raise RuntimeError("strategyV2.codeRequired")
+        from app.services.strategy_runtime.bot_type import resolve_bot_type
+        from app.services.strategy_runtime.robot_v2 import migrate_legacy_robot_v2_source
+
+        bot_type = resolve_bot_type(strategy, trading_config)
+        migrated = migrate_legacy_robot_v2_source(code, bot_type) if bot_type else code
+        if migrated != code:
+            # Upgrade generated legacy allocation units at the execution
+            # boundary. The source record stays immutable; a future editor
+            # save can persist the newest generated template explicitly.
+            append_strategy_log(
+                int(strategy.get("id") or 0),
+                "warning",
+                f"Legacy {bot_type} robot allocation contract upgraded for this run",
+            )
+            code = migrated
         return source_id, code
 
     def _is_strategy_running(self, strategy_id: int, thread: threading.Thread) -> bool:

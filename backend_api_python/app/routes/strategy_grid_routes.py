@@ -1,4 +1,5 @@
 """Strategy grid route facade."""
+from datetime import datetime, timezone
 import traceback
 
 from flask import g, jsonify, request
@@ -26,7 +27,9 @@ def get_grid_resting_orders():
         if not st:
             return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': {'orders': [], 'items': []}}), 404
 
-        bot_type = str(st.get('bot_type') or (st.get('trading_config') or {}).get('bot_type') or '').lower()
+        from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+        bot_type = resolve_bot_type(st, st.get('trading_config') or {})
         if bot_type != 'grid':
             return jsonify({'code': 0, 'msg': 'Not a grid strategy', 'data': {'orders': [], 'items': []}}), 400
 
@@ -34,13 +37,16 @@ def get_grid_resting_orders():
         limit = request.args.get('limit', default=200, type=int)
         sync = request.args.get('sync', '').lower() in ('1', 'true', 'yes')
 
+        sync_error = ''
+        synced_count = 0
         if sync:
             try:
                 from app.services.grid.poller import sync_strategy_grid_orders
 
-                sync_strategy_grid_orders(int(strategy_id))
+                synced_count = int(sync_strategy_grid_orders(int(strategy_id)) or 0)
             except Exception as sync_err:
                 logger.debug("grid-resting sync sid=%s: %s", strategy_id, sync_err)
+                sync_error = str(sync_err)
 
         from app.services.grid.resting_orders_repo import GridRestingOrderRepository
         from app.utils.trade_close_reason import label_for_reason
@@ -76,8 +82,28 @@ def get_grid_resting_orders():
                 'filled_quantity': o.filled_quantity,
                 'avg_fill_price': o.avg_fill_price,
                 'extra': o.extra or {},
+                'created_at': o.created_at.isoformat() if hasattr(o.created_at, 'isoformat') else o.created_at,
+                'updated_at': o.updated_at.isoformat() if hasattr(o.updated_at, 'isoformat') else o.updated_at,
             })
-        return jsonify({'code': 1, 'msg': 'success', 'data': {'orders': out, 'items': out}})
+        status_counts = {}
+        for item in out:
+            key = str(item.get('status') or 'unknown')
+            status_counts[key] = int(status_counts.get(key, 0)) + 1
+        verified = sum(1 for item in out if str(item.get('exchange_order_id') or '').strip())
+        updated_values = [str(item.get('updated_at') or '') for item in out if item.get('updated_at')]
+        summary = {
+            'total': len(out),
+            'verified_exchange_orders': verified,
+            'unverified_orders': len(out) - verified,
+            'status_counts': status_counts,
+            'sync_requested': sync,
+            'sync_ok': not bool(sync_error),
+            'sync_error': sync_error,
+            'synced_count': synced_count,
+            'last_reconciled_at': max(updated_values) if updated_values else None,
+            'generated_at': datetime.now(timezone.utc).isoformat(),
+        }
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'orders': out, 'items': out, 'summary': summary}})
     except Exception as e:
         logger.error("get_grid_resting_orders failed: %s", e)
         logger.error(traceback.format_exc())

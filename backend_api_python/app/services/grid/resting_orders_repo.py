@@ -78,6 +78,8 @@ class GridRestingOrder:
     avg_fill_price: float = 0.0
     processed_fill_qty: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
+    created_at: Any = None
+    updated_at: Any = None
 
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> "GridRestingOrder":
@@ -106,6 +108,8 @@ class GridRestingOrder:
             avg_fill_price=float(row.get("avg_fill_price") or 0),
             processed_fill_qty=float(row.get("processed_fill_qty") or 0),
             extra=extra if isinstance(extra, dict) else {},
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
         )
 
 

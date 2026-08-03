@@ -1460,11 +1460,22 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
         payload: Dict[str, Any],
     ) -> str:
         raw = str(error or "")
-        lower = raw.lower()
-        is_size_error = bool(
-            re.search(r"below|step|minqty|min qty|minsize|min size|min_notional|minnotional|invalid (qty|quantity|size|amount)", lower)
-        )
-        if not is_size_error:
+        from app.services.pending_orders.error_classification import classify_exchange_order_error
+
+        classification = classify_exchange_order_error(raw)
+        category = str(classification.get("category") or "exchange_rejected")
+        if category == "transport":
+            return (
+                "Temporary exchange/network failure; the order was not confirmed. "
+                f"The exchange order state must be reconciled before any retry. Details: {raw}"
+            )
+        if category == "insufficient_funds":
+            return (
+                "Insufficient free balance or margin for this order. "
+                "Reduce the strategy allocation or free account collateral. "
+                f"Details: {raw}"
+            )
+        if category != "order_size":
             return raw
 
         px = float(price or payload.get("ref_price") or 0.0)
@@ -1781,6 +1792,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 strategy_config=cfg,
                 exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
                 account_qty=float(pre_position_qty),
+                reference_price=float(ref_price or 0.0),
             )
             phases_ownership = guard.ownership
             if guard.error:
@@ -1795,7 +1807,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
         if not reduce_only and ownership_enabled:
             phases["position_ownership"] = phases_ownership
 
-        if not reduce_only and market_type == "swap":
+        if not reduce_only and market_type in {"spot", "swap"}:
             try:
                 from app.services.live_trading.account_risk import (
                     account_risk_limits,

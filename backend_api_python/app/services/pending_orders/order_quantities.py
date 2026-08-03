@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple
 
 from app.services.pending_orders.sent_order_recovery import is_final_fill
+from app.services.live_trading.symbols import (
+    to_gate_currency_pair,
+    to_okx_spot_inst_id,
+    to_okx_swap_inst_id,
+)
 
 
 def exchange_executable_base_quantity(
@@ -18,23 +23,72 @@ def exchange_executable_base_quantity(
 ) -> float:
     """Return the base quantity accepted after exchange step-size flooring."""
     quantity = max(0.0, float(requested or 0.0))
-    if (
-        str(exchange_id or "").strip().lower() != "bitget"
-        or str(market_type or "").strip().lower() != "swap"
-        or not hasattr(client, "normalize_base_order_size")
-    ):
+    exchange = str(exchange_id or "").strip().lower()
+    market = str(market_type or "spot").strip().lower()
+    try:
+        if exchange == "bitget" and market == "swap" and hasattr(client, "normalize_base_order_size"):
+            product_type = str(
+                exchange_config.get("product_type")
+                or exchange_config.get("productType")
+                or "USDT-FUTURES"
+            )
+            normalized = client.normalize_base_order_size(
+                symbol=str(symbol),
+                product_type=product_type,
+                base_size=quantity,
+            )
+            return max(0.0, float(normalized or 0.0))
+        if exchange == "bitget" and market == "spot" and hasattr(client, "_normalize_base_size"):
+            normalized, _ = client._normalize_base_size(symbol=str(symbol), base_size=quantity)
+            return max(0.0, float(normalized or 0.0))
+        if exchange == "okx" and hasattr(client, "_normalize_order_size"):
+            inst_id = to_okx_spot_inst_id(symbol) if market == "spot" else to_okx_swap_inst_id(symbol)
+            normalized, _ = client._normalize_order_size(
+                inst_id=inst_id,
+                market_type=market,
+                size=quantity,
+            )
+            executable = max(0.0, float(normalized or 0.0))
+            if market != "spot" and executable > 0 and hasattr(client, "get_instrument"):
+                instrument = client.get_instrument(inst_type="SWAP", inst_id=inst_id) or {}
+                contract_value = max(0.0, float(instrument.get("ctVal") or 0.0))
+                if contract_value > 0:
+                    executable *= contract_value
+            return executable
+        if exchange in {"gate", "gateio"} and market == "swap" and hasattr(client, "_resolve_order_size"):
+            contract = to_gate_currency_pair(symbol)
+            contracts, _ = client._resolve_order_size(
+                contract=contract,
+                side="buy",
+                base_size=quantity,
+            )
+            count = abs(float(contracts or 0.0))
+            if count <= 0:
+                return 0.0
+            if hasattr(client, "contracts_signed_to_base_qty"):
+                return max(
+                    0.0,
+                    float(client.contracts_signed_to_base_qty(
+                        contract=contract,
+                        contracts_signed=count,
+                    ) or 0.0),
+                )
+        if exchange == "binance" and hasattr(client, "_normalize_quantity"):
+            normalized, _ = client._normalize_quantity(
+                symbol=str(symbol),
+                quantity=quantity,
+                for_market=True,
+            )
+            return max(0.0, float(normalized or 0.0))
+        if exchange == "bybit" and hasattr(client, "_normalize_qty"):
+            normalized, _ = client._normalize_qty(symbol=str(symbol), qty=quantity)
+            return max(0.0, float(normalized or 0.0))
+    except Exception:
+        # Reconciliation must never guess a smaller executable amount when
+        # exchange metadata is unavailable.  Keep the original request so a
+        # later poll can retry with authoritative metadata or terminal status.
         return quantity
-    product_type = str(
-        exchange_config.get("product_type")
-        or exchange_config.get("productType")
-        or "USDT-FUTURES"
-    )
-    normalized = client.normalize_base_order_size(
-        symbol=str(symbol),
-        product_type=product_type,
-        base_size=quantity,
-    )
-    return max(0.0, float(normalized or 0.0))
+    return quantity
 
 
 def exchange_quantity_snapshot(

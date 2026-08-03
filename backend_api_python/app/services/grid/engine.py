@@ -262,6 +262,7 @@ class GridEngine:
         pos_side: str,
         *,
         force: bool = False,
+        reference_price: float = 0.0,
     ) -> Tuple[bool, Dict[str, Any]]:
         """Run the same account/L3 ownership guard used by queued strategies."""
         from app.services.live_trading.position_ownership import supports_position_coexistence
@@ -320,6 +321,7 @@ class GridEngine:
                 },
                 exchange_config=self.exchange_config,
                 account_qty=float(account_qty or 0.0),
+                reference_price=float(reference_price or 0.0),
             )
             metadata = dict(guard.ownership or {})
             allowed = not bool(guard.error)
@@ -863,6 +865,7 @@ class GridEngine:
                     ownership_client,
                     pos_side,
                     force=True,
+                    reference_price=current_price,
                 )
                 allowed_sides[pos_side] = allowed
                 if allowed:
@@ -1425,7 +1428,11 @@ class GridEngine:
         try:
             client = self._create_client()
             if not reduce_only:
-                allowed, metadata = self._grid_entry_ownership_allowed(client, pos_side)
+                allowed, metadata = self._grid_entry_ownership_allowed(
+                    client,
+                    pos_side,
+                    reference_price=px,
+                )
                 if not allowed:
                     self.cancel_entry_orders_on_exchange(pos_side=pos_side)
                     if str(metadata.get("reason") or "") in {

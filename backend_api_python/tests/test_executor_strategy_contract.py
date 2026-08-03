@@ -275,7 +275,13 @@ def test_robot_trailing_take_profit_activates_and_closes_after_pullback(executor
     assert intents[0].protection.trailing_stop_pct == pytest.approx(0.003)
 
     session.synchronize_positions({
-        instrument: {"side": "long", "amount": 1, "avg_cost": 100, "last_price": 100}
+        instrument: {
+            "side": "long",
+            "position_side": "" if executor_type == "dca" else "long",
+            "amount": 1,
+            "avg_cost": 100,
+            "last_price": 100,
+        }
     })
     assert session.evaluate_protections(
         {instrument: 102},
@@ -288,7 +294,13 @@ def test_robot_trailing_take_profit_activates_and_closes_after_pullback(executor
     )
     restored.restore_protection_snapshot(session.protection_snapshot())
     restored.synchronize_positions({
-        instrument: {"side": "long", "amount": 1, "avg_cost": 100, "last_price": 102}
+        instrument: {
+            "side": "long",
+            "position_side": "" if executor_type == "dca" else "long",
+            "amount": 1,
+            "avg_cost": 100,
+            "last_price": 102,
+        }
     })
     exits = restored.evaluate_protections(
         {instrument: 101.5},
@@ -478,7 +490,7 @@ def test_martingale_generated_source_uses_confirmed_batched_incremental_orders()
     )
     source = payload["code"]
 
-    assert "ROBOT_TEMPLATE_VERSION = 5" in source
+    assert "ROBOT_TEMPLATE_VERSION = 6" in source
     assert "ENTRY_TRIGGER_MODE = 'realtime_price'" in source
     assert "def on_price_tick(context, prices):" in source
     assert "PERSIST_RUNTIME_STATE = True" in source
@@ -487,6 +499,7 @@ def test_martingale_generated_source_uses_confirmed_batched_incremental_orders()
     assert 'g.level_statuses = ["ready" for _ in PRICE_LEVELS]' in source
     assert "def _submit_levels(context, indexes):" in source
     assert "order_value(" in source
+    assert "position_side=POSITION_SIDE" in source
     assert "trailing_rebase_on_scale_in=False" in source
     assert "order_target_value(\n        INSTRUMENT,\n        DIRECTION * quote_total" not in source
     assert 'get_history(2, TIMEFRAME, ["high", "low", "close"], INSTRUMENT)' in source
@@ -495,7 +508,7 @@ def test_martingale_generated_source_uses_confirmed_batched_incremental_orders()
         _robot_payload("grid"),
         user_id=7,
     )
-    assert "GRID_TEMPLATE_VERSION = 5" in grid["code"]
+    assert "GRID_TEMPLATE_VERSION = 6" in grid["code"]
     assert "g.cell_states" in grid["code"]
     assert 'reason=side + "_exit"' in grid["code"]
 
@@ -751,6 +764,7 @@ def test_martingale_stop_loss_reentry_toggle_waits_for_flat_and_one_new_bar(
     session.synchronize_positions({
         instrument: {
             "side": "long",
+            "position_side": "long",
             "amount": 1,
             "avg_cost": 100,
             "last_price": 100,
@@ -861,7 +875,12 @@ def test_dca_catalog_and_source_use_a_time_based_fixed_allocation_plan():
     assert "Crypto:BTC/USDT@spot" in payload["code"]
     assert "allow_leverage" not in payload["code"]
     assert 'reason="dca_scheduled_order"' in payload["code"]
-    assert "g.dca_spent_value += purchase_value" in payload["code"]
+    assert "DCA_TEMPLATE_VERSION = 6" in payload["code"]
+    assert "get_order_status(reference)" in payload["code"]
+    assert "g.dca_pending_ref = order_value(" in payload["code"]
+    assert "client_order_id=reference" in payload["code"]
+    assert "g.dca_spent_value += purchase_value" not in payload["code"]
+    assert payload["code"].index('if name == "filled":') < payload["code"].index("g.dca_order_count += 1")
     assert "order_value(" in payload["code"]
     assert "PRICE_LEVELS" not in payload["code"]
     assert 'reason="robot_level"' not in payload["code"]
@@ -906,6 +925,58 @@ def test_dca_backtest_places_equal_orders_on_the_configured_time_schedule():
     ]
     assert len(dca_orders) == 3
     assert [item["notional"] for item in dca_orders] == pytest.approx([200, 200, 200])
+
+
+def test_dca_rejected_order_does_not_consume_cycle_budget_or_order_count():
+    payload = build_executor_strategy_payload(
+        _robot_payload(
+            "dca",
+            dca_interval_minutes=60,
+            dca_max_orders=2,
+            dca_total_budget_pct=0.4,
+            trailing_take_profit_enabled=False,
+            take_profit_pct=0,
+            hard_stop_pct=0,
+        ),
+        user_id=7,
+    )
+    instrument = "Crypto:BTC/USDT@spot"
+    index = pd.date_range("2026-01-01", periods=3, freq="1h")
+    frame = pd.DataFrame({
+        "open": [100.0] * 3,
+        "high": [100.0] * 3,
+        "low": [100.0] * 3,
+        "close": [100.0] * 3,
+        "volume": [100000.0] * 3,
+    }, index=index)
+    session = StrategyV2LiveSession(
+        code=payload["code"],
+        frames={instrument: frame.iloc[:1]},
+        initial_capital=1000,
+    )
+
+    first, _, _ = session.process(
+        {instrument: frame.iloc[:1]},
+        schedule_time=index[0],
+    )
+    assert len(first) == 1
+    session.context.update_order_statuses({
+        first[0].client_order_id: {
+            "status": "rejected",
+            "client_order_id": first[0].client_order_id,
+        }
+    })
+
+    retry, _, _ = session.process(
+        {instrument: frame.iloc[:2]},
+        schedule_time=index[1],
+    )
+    assert len(retry) == 1
+    assert retry[0].client_order_id != first[0].client_order_id
+    state = session.session_snapshot()["strategyState"]
+    assert state["dca_order_count"] == 0
+    assert state["dca_spent_value"] == 0
+    assert state["dca_attempt"] == 1
 
 
 def test_dca_rising_market_never_turns_a_scheduled_purchase_into_a_sale():

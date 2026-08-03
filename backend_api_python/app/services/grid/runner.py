@@ -49,7 +49,9 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
 
         sc = load_strategy_configs(sid) or {}
         tc = sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {}
-        bot_type = str(sc.get("bot_type") or tc.get("bot_type") or "").strip().lower()
+        from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+        bot_type = resolve_bot_type(sc, tc)
         if bot_type != "grid":
             return
         symbol = str(tc.get("symbol") or sc.get("symbol") or "").strip()
@@ -114,6 +116,8 @@ class GridRestingRunner:
         self._started = False
         self._last_sync_ts = 0.0
         self._last_exit_sync_ts = 0.0
+        self._last_operational_check_ts = 0.0
+        self._last_operational_snapshot: Dict[str, Any] = {}
 
     @property
     def engine(self) -> GridEngine:
@@ -238,6 +242,41 @@ class GridRestingRunner:
         finally:
             unregister_runner(self.strategy_id)
             self._started = False
+
+    def operational_snapshot(self, *, force: bool = False) -> Dict[str, Any]:
+        """Return whether exchange-resting coverage is verifiably active."""
+        now = time.time()
+        if (
+            not force
+            and self._last_operational_snapshot
+            and now - self._last_operational_check_ts < 5.0
+        ):
+            return dict(self._last_operational_snapshot)
+        orders = list(self._engine._orders.list_open(self.strategy_id) or [])
+        entries = [order for order in orders if str(order.purpose or "") in {"long_entry", "short_entry"}]
+        unverified = [order for order in orders if not str(order.exchange_order_id or "").strip()]
+        expected = bool(
+            int(self._engine.cfg.max_open_orders or 0) > 0
+            and not self._engine._paused_entries
+            and not self._engine.stop_requested
+            and not self._runtime_params.get("waterfall_pause")
+        )
+        error = ""
+        if unverified:
+            error = "grid_unverified_exchange_orders"
+        elif expected and not entries:
+            error = "grid_no_exchange_resting_orders"
+        snapshot = {
+            "open_orders": len(orders),
+            "open_entries": len(entries),
+            "unverified_orders": len(unverified),
+            "expected_entries": expected,
+            "healthy": not bool(error),
+            "error": error,
+        }
+        self._last_operational_check_ts = now
+        self._last_operational_snapshot = snapshot
+        return dict(snapshot)
 
     def tick(
         self,

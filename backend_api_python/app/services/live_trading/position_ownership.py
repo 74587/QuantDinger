@@ -87,6 +87,7 @@ def calculate_position_ownership(
     coexistence_mode: str = STRICT_MODE,
     previous_status: str = "",
     previous_reason: str = "",
+    absolute_tolerance: float = 0.0,
 ) -> OwnershipSnapshot:
     """Pure ownership calculation used by execution, APIs, and tests."""
     account = max(0.0, float(account_qty or 0.0))
@@ -97,7 +98,7 @@ def calculate_position_ownership(
         # A stale protected value must never silently weaken strict mode.
         protected = 0.0
     expected = strategy + protected
-    tolerance = max(1e-8, expected * 0.001)
+    tolerance = max(1e-8, expected * 0.001, max(0.0, float(absolute_tolerance or 0.0)))
     unknown = account - expected
     if abs(unknown) <= tolerance:
         status = STATUS_OK
@@ -173,6 +174,7 @@ def evaluate_and_record_ownership(
     account_qty: float,
     strategy_qty: float,
     inst_id: str = "",
+    absolute_tolerance: float = 0.0,
 ) -> OwnershipSnapshot:
     """Evaluate one leg and persist its block/recovery state atomically enough for workers."""
     row = _fetch_reservation(
@@ -191,6 +193,7 @@ def evaluate_and_record_ownership(
         coexistence_mode=str(row.get("coexistence_mode") or STRICT_MODE),
         previous_status=str(row.get("status") or ""),
         previous_reason=str(row.get("drift_reason") or ""),
+        absolute_tolerance=float(absolute_tolerance or 0.0),
     )
     with get_db_connection() as db:
         cur = db.cursor()

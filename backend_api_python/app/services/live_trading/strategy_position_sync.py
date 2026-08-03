@@ -39,12 +39,9 @@ def strategy_uses_fill_ledger(strategy_config: Dict[str, Any]) -> bool:
     # A grid owns only the fills created by its own resting orders. Replacing
     # that L3 ledger with the credential-wide exchange position would absorb
     # manual holdings and positions belonging to other strategies.
-    bot_type = str(
-        sc.get("bot_type")
-        or tc.get("bot_type")
-        or tc.get("executor_type")
-        or ""
-    ).strip().lower()
+    from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+    bot_type = resolve_bot_type(sc, tc)
     return bot_type == "grid"
 
 

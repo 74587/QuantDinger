@@ -50,6 +50,17 @@ def load_runtime_health(
             strategy_status=statuses.get(strategy_id, ""),
             now=now,
         )
+        reasons = []
+        if int(snapshot.get("failed_orders") or 0) > 0:
+            reasons.append("recent_order_failure")
+        if bool(snapshot.get("position_drift_blocked")) or int(snapshot.get("position_drift_count") or 0) > 0:
+            reasons.append("position_drift")
+        if str(snapshot.get("last_error") or "").strip():
+            reasons.append(str(snapshot.get("last_error") or ""))
+        if snapshot["health"] in {"stale", "offline", "unknown"}:
+            reasons.append(f"runtime_{snapshot['health']}")
+        snapshot["attention_reasons"] = list(dict.fromkeys(reasons))
+        snapshot["needs_attention"] = bool(reasons) or snapshot["health"] == "degraded"
         snapshot.pop("_ownership_context", None)
     return snapshots
 

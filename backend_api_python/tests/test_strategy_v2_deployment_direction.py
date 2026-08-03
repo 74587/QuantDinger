@@ -86,7 +86,7 @@ def test_deployment_rejects_direction_override_that_conflicts_with_manifest(monk
         StrategyV2DeploymentService().save(user_id=7, payload=_payload("long_only"))
 
 
-def test_deployment_recovers_visual_grid_runtime_from_source_metadata(monkeypatch):
+def test_deployment_recovers_legacy_visual_grid_runtime_from_executor_type(monkeypatch):
     class _GridSources:
         @staticmethod
         def get_source(_source_id, user_id=None):
@@ -98,7 +98,6 @@ def test_deployment_recovers_visual_grid_runtime_from_source_metadata(monkeypatc
                     "last_run_config": {
                         "strategy_family": "robot",
                         "executor_type": "grid",
-                        "bot_type": "grid",
                         "executor_config": {"grid_count": 4},
                         "bot_params": {
                             "gridCount": 4,

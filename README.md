@@ -47,7 +47,7 @@
 
   <p><sub>SUPPORTED BY</sub></p>
   <p>
-    <a href="https://www.atlascloud.ai/" title="Atlas Cloud — AI inference sponsor">
+    <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger" title="Atlas Cloud — AI inference sponsor">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
         <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="142">
@@ -625,7 +625,7 @@ QuantDinger's continued development and open-source community are supported by:
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://www.atlascloud.ai/">
+      <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger">
         <picture>
           <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
           <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="190">
@@ -651,7 +651,7 @@ QuantDinger's continued development and open-source community are supported by:
   </tr>
 </table>
 
-We are grateful to [Atlas Cloud](https://www.atlascloud.ai/) for supporting AI
+We are grateful to [Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger) for supporting AI
 model inference and to [Amazon Web Services](https://aws.amazon.com/) for
 supporting the cloud infrastructure that helps QuantDinger serve its community.
 

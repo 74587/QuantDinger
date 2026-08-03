@@ -278,6 +278,13 @@ This implements “confirm on close, fill at next open” without future leakage
 
 Live sessions process each closed bar once and preserve <code>g</code> state while the session remains alive. Receiving the same bar twice should not duplicate strategy work. Cross-restart state is opt-in as described in Section 9.
 
+### Closed bars versus real-time prices
+
+- The final row exposed by <code>get_history</code>, <code>data.current</code>, <code>data.history</code>, and indicator functions must be a completed bar. A real-time trade or mark price must not rewrite, overwrite, or extend that bar's OHLC.
+- Moving averages, breakouts, patterns, factors, and all other entry or scale-in signals must use completed bars so backtests, live runs, and restart replay share the same semantics.
+- Real-time prices are reserved for stop loss, take profit, trailing protection, and equity risk. They must not make an unfinished candle look complete or revise a confirmed strategy signal.
+- A future tick-driven strategy product needs a separate API, replay model, and contract. Do not simulate it inside ordinary Strategy API V2 source.
+
 ---
 
 ## 9. context, data, and g
@@ -482,7 +489,9 @@ def monitor_entry(cancel_requested):
         cancel_order(g.entry_ref)
 ~~~
 
-Order helpers preserve their historical <code>None</code> return when no explicit <code>client_order_id</code> is supplied. With an explicit ID they return that ID for status tracking. Typical status values include <code>unknown</code>, <code>queued</code>, <code>deferred</code>, <code>submitted</code>, <code>open</code>, <code>partial</code>, <code>filled</code>, <code>cancelled</code>, and <code>rejected</code>. Cancellation is asynchronous in live trading; wait for the reconciled terminal status before reusing capital or advancing state. <code>consume_last_exit_reason(symbol)</code> returns and clears the most recently recorded protection exit reason.
+In new strategies, every order that may be retried, cancelled, reconciled, or used to advance a cycle must supply a stable <code>client_order_id</code>. The order helper returns that ID for <code>get_order_status</code>. Legacy source without an explicit ID may still receive <code>None</code>, but that is migration behavior rather than the new-strategy contract.
+
+Typical working states are <code>unknown</code>, <code>queued</code>, <code>deferred</code>, <code>submitted</code>, <code>open</code>, and <code>partial</code>. Terminal states include <code>filled</code>, <code>rejected</code>, <code>failed</code>, <code>cancelled</code>/<code>canceled</code>, and <code>expired</code>. <code>partial</code> is not a full fill and must not advance state by the planned quantity. A terminal order status and synchronized exchange position can become visible at slightly different times; confirm both before reusing capital, beginning a new cycle, or opening the opposite leg. Live cancellation is also asynchronous. <code>consume_last_exit_reason(symbol)</code> returns and clears the most recently recorded protection exit reason.
 
 Write spot and all non-Crypto markets as long-only under the current product policy. A long exit and a short entry are independent; do not turn a zero target into a negative position automatically.
 
@@ -561,7 +570,7 @@ context.set_metadata(direction_mode="both")
 
 Supported values are `long_only`, `short_only`, `both`, and `neutral`. This declaration does not place orders or override strategy signals. It lets deployment validation reserve the correct hedge-mode leg or legs and reject new entry signals that exceed the declared capability. `both` and `neutral` require hedge mode for live execution.
 
-The compiler still recognizes legacy top-level `DIRECTION = 1/-1` constants and literal `position_side="long"/"short"` order arguments. If a legacy swap strategy cannot be inferred safely, the deployment form asks for a compatibility mode. Spot strategies are treated as `long_only` automatically.
+Every new Crypto swap strategy must declare <code>direction_mode</code> and pass an explicit <code>position_side</code> on each contract-position read and order call. Compiler inference from legacy <code>DIRECTION = 1/-1</code> constants or literal legs exists only for migration; it is not the recommended contract and must not be used by new templates. Write spot strategies as <code>long_only</code>.
 
 ### Hedge-mode example
 
@@ -871,9 +880,24 @@ Allowed import roots are <code>numpy</code>, <code>pandas</code>, <code>math</co
 
 ---
 
-## 20. Visual robot templates
+## 20. System presets and visual robot templates
+
+### System preset strategy templates
+
+The system preset catalog currently uses <code>system_seed version=11</code>. It contains eight CTA templates (single MA, dual MA, bullish candle through three averages, trend-filtered bullish candle, Turtle, indicator resonance, MACD/KDJ, and SuperTrend) and four portfolio templates (market-cap barbell, momentum Top N, low volatility, and quality growth). Presets are examples and the executable baseline for the current recommended Strategy API V2 contract.
+
+Every system preset must satisfy these rules:
+
+- Declare <code>direction_mode</code> explicitly; Crypto swap templates read and write explicit <code>position_side</code> legs.
+- A bidirectional trend template closes the opposite leg, waits for fill and position synchronization, and only then opens the target leg. It must not replace two hedge legs with one net-position variable.
+- Reconstructible state comes from synchronized <code>amount</code>, <code>avg_cost</code>, and order status. State that cannot be rebuilt reliably must enable <code>PERSIST_RUNTIME_STATE</code>.
+- Every catalog revision must pass parameter-contract, compilation, direction-capability, and synthetic-backtest tests. After copying a preset, revalidate the manifest whenever market, direction, or frequency changes.
+
+### Visual robot templates
 
 Robot templates generate editable Strategy API V2 source. The generated source—not the preview alone—is the deployable contract. Verify it after every manual edit.
+
+Current generated-source contract revisions are <code>GRID_TEMPLATE_VERSION = 6</code> for grid, <code>DCA_TEMPLATE_VERSION = 6</code> for DCA, and <code>ROBOT_TEMPLATE_VERSION = 6</code> for martingale and layered martingale. These constants help diagnose generated source; they do not replace manifest or preflight validation.
 
 | Template | Trigger and sizing | Current boundary |
 | --- | --- | --- |
@@ -893,6 +917,9 @@ DCA rules:
 
 - The interval is measured in elapsed minutes, not “number of K-lines.” The handler can only act when a subscribed bar is processed, so an interval shorter than the source timeframe becomes effective on the next available bar.
 - Each purchase is capped by both per-order percentage and total cycle budget. Optional price filters, take-profit, hard stop, and trailing protection do not remove the need for a maximum order count.
+- A submitted purchase first becomes pending. Only a <code>filled</code> result from <code>get_order_status</code> increments the order count and charges actual filled notional plus fees to cycle spend; calling <code>order_value</code> does not imply a fill.
+- <code>partial</code> remains pending and must not be treated as fully filled. <code>rejected</code>, <code>failed</code>, <code>cancelled/canceled</code>, or <code>expired</code> releases pending state without consuming count or filled budget, and a retry uses a new stable client reference.
+- Generated DCA source enables <code>PERSIST_RUNTIME_STATE</code>. After an exit, reset the cycle only when the account position is confirmed flat and an explicit exit reason exists; a short position-sync delay must not start a duplicate cycle.
 
 Martingale rules:
 
@@ -912,6 +939,7 @@ Martingale rules:
 - [ ] Parameter defaults and code fallbacks agree.
 - [ ] Every history window checks actual length.
 - [ ] No future rows, negative shifts, or centered rolling.
+- [ ] Indicators and entry/scale-in signals use completed bars only; real-time prices do not overwrite the last OHLC and are limited to protection and equity risk.
 - [ ] Long exits and short entries are independent.
 - [ ] Hedge-mode code reads and writes explicit <code>position_side</code> legs.
 - [ ] <code>direction_mode</code>, <code>position_side</code>, <code>execution_mode</code>, and account <code>coexistence_mode</code> are not conflated.

@@ -120,6 +120,14 @@ class StrategyV2DeploymentService:
         # observe different instruments for the same strategy.
         runtime_config["symbol"] = symbol
         runtime_config["market_type"] = manifest_market_type
+        # Older visual-builder sources persisted executor_type but omitted
+        # bot_type. Canonicalize it before grid budget/ledger setup so a grid
+        # can never silently deploy as a generic bar-driven strategy.
+        from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+        resolved_bot_type = resolve_bot_type(source, runtime_config)
+        if resolved_bot_type:
+            runtime_config["bot_type"] = resolved_bot_type
         self._normalize_grid_runtime_budget(runtime_config)
         if str(runtime_config.get("bot_type") or "").strip().lower() == "grid":
             runtime_config["position_ledger"] = "fills"

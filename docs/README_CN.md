@@ -47,7 +47,7 @@
 
   <p><sub>赞助支持</sub></p>
   <p>
-    <a href="https://www.atlascloud.ai/" title="Atlas Cloud — AI 推理赞助商">
+    <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger" title="Atlas Cloud — AI 推理赞助商">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
         <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="142">
@@ -541,7 +541,7 @@ QuantDinger 的持续开发和开源社区由以下赞助商共同支持：
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="https://www.atlascloud.ai/">
+      <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger">
         <picture>
           <source media="(prefers-color-scheme: dark)" srcset="https://www.atlascloud.ai/logo-white.svg">
           <img src="https://www.atlascloud.ai/logo.svg" alt="Atlas Cloud" width="190">
@@ -567,7 +567,7 @@ QuantDinger 的持续开发和开源社区由以下赞助商共同支持：
   </tr>
 </table>
 
-衷心感谢 [Atlas Cloud](https://www.atlascloud.ai/) 为 AI 模型推理提供赞助支持，
+衷心感谢 [Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger) 为 AI 模型推理提供赞助支持，
 以及 [Amazon Web Services](https://aws.amazon.com/cn/) 为 QuantDinger 社区服务所需的云基础设施提供赞助支持。
 
 ## 支持项目

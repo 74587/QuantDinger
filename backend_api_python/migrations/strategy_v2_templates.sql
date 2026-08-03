@@ -32,6 +32,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark(g.symbol)
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(260)
 
 
@@ -50,7 +51,7 @@ def handle_data(context, data):
         order_target_percent(g.symbol, target_pct, reason="single_ma_entry")
     elif price <= average and is_long:
         order_target_percent(g.symbol, 0.0, reason="single_ma_exit")
-$single$, '{"params":[{"name":"ma_period","type":"integer","default":50,"min":2,"max":250,"step":1,"labelKey":"strategyV2.params.maPeriod","descriptionKey":"strategyV2.params.maPeriodDesc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"}]}'::jsonb, '["strategy-v2","cta","moving-average","us-stock"]'::jsonb, 'line-chart', 'green', 10, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$single$, '{"params":[{"name":"ma_period","type":"integer","default":50,"min":2,"max":250,"step":1,"labelKey":"strategyV2.params.maPeriod","descriptionKey":"strategyV2.params.maPeriodDesc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"}]}'::jsonb, '["strategy-v2","cta","moving-average","us-stock"]'::jsonb, 'line-chart', 'green', 10, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_double_ma', 'script', 'Dual Moving Average', 'A parameterized BTC perpetual dual moving-average strategy with optional leverage.', $double$"""
 Dual Moving Average
@@ -67,6 +68,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark("Crypto:BTC/USDT@spot")
     context.subscribe(frequency="4h")
+    context.set_metadata(direction_mode="both")
     context.set_warmup(310)
     context.allow_leverage(max_leverage=20)
 
@@ -84,12 +86,24 @@ def handle_data(context, data):
     close = bars["close"]
     fast = float(close.tail(fast_period).mean())
     slow = float(close.tail(slow_period).mean())
-    position = get_position(g.symbol)
-    amount = float(position.amount or 0.0)
-    target = target_pct if fast > slow else (-target_pct if allow_short else 0.0)
-    if (target > 0 and amount <= 0) or (target < 0 and amount >= 0) or (target == 0 and amount != 0):
-        order_target_percent(g.symbol, target, reason="dual_ma_regime_change")
-$double$, '{"params":[{"name":"fast_period","type":"integer","default":20,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label","descriptionKey":"trading-assistant.templateParam.fast_period.desc"},{"name":"slow_period","type":"integer","default":60,"min":5,"max":300,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label","descriptionKey":"trading-assistant.templateParam.slow_period.desc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"},{"name":"allow_short","type":"boolean","default":true,"labelKey":"strategyV2.params.allowShort","descriptionKey":"strategyV2.params.allowShortDesc"}]}'::jsonb, '["strategy-v2","cta","moving-average","crypto","swap"]'::jsonb, 'swap', 'blue', 20, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+    long_position = get_position(g.symbol, position_side="long")
+    short_position = get_position(g.symbol, position_side="short")
+    long_open = abs(float(long_position.amount or 0.0)) > 1e-12
+    short_open = abs(float(short_position.amount or 0.0)) > 1e-12
+    bullish = fast > slow
+    if bullish:
+        if short_open:
+            order_target_percent(g.symbol, 0.0, position_side="short", reason="dual_ma_close_short")
+        elif not long_open:
+            order_target_percent(g.symbol, target_pct, position_side="long", reason="dual_ma_open_long")
+    else:
+        if long_open:
+            order_target_percent(g.symbol, 0.0, position_side="long", reason="dual_ma_close_long")
+        elif allow_short and not short_open:
+            order_target_percent(g.symbol, -target_pct, position_side="short", reason="dual_ma_open_short")
+        elif not allow_short and short_open:
+            order_target_percent(g.symbol, 0.0, position_side="short", reason="dual_ma_close_short_disabled")
+$double$, '{"params":[{"name":"fast_period","type":"integer","default":20,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label","descriptionKey":"trading-assistant.templateParam.fast_period.desc"},{"name":"slow_period","type":"integer","default":60,"min":5,"max":300,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label","descriptionKey":"trading-assistant.templateParam.slow_period.desc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"},{"name":"allow_short","type":"boolean","default":true,"labelKey":"strategyV2.params.allowShort","descriptionKey":"strategyV2.params.allowShortDesc"}]}'::jsonb, '["strategy-v2","cta","moving-average","crypto","swap"]'::jsonb, 'swap', 'blue', 20, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_bullish_three_lines', 'script', 'Bullish Candle Through Three Averages', 'An A-share bullish candle breakout through three configurable averages.', $three$"""
 Bullish Candle Through Three Averages
@@ -107,6 +121,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark(g.symbol)
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(260)
 
 
@@ -136,7 +151,7 @@ def handle_data(context, data):
         order_target_percent(g.symbol, target_pct, reason="bullish_three_lines_entry")
     elif is_long and close_price < averages[-1]:
         order_target_percent(g.symbol, 0.0, reason="bullish_three_lines_exit")
-$three$, '{"params":[{"name":"short_period","type":"integer","default":5,"min":2,"max":60,"step":1,"labelKey":"strategyV2.params.shortPeriod","descriptionKey":"strategyV2.params.shortPeriodDesc"},{"name":"mid_period","type":"integer","default":10,"min":3,"max":120,"step":1,"labelKey":"strategyV2.params.midPeriod","descriptionKey":"strategyV2.params.midPeriodDesc"},{"name":"long_period","type":"integer","default":20,"min":5,"max":250,"step":1,"labelKey":"strategyV2.params.longPeriod","descriptionKey":"strategyV2.params.longPeriodDesc"},{"name":"min_body_pct","type":"percent","default":0.02,"min":0,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.minBodyPct","descriptionKey":"strategyV2.params.minBodyPctDesc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"}]}'::jsonb, '["strategy-v2","cta","candlestick","a-share"]'::jsonb, 'rise', 'red', 30, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$three$, '{"params":[{"name":"short_period","type":"integer","default":5,"min":2,"max":60,"step":1,"labelKey":"strategyV2.params.shortPeriod","descriptionKey":"strategyV2.params.shortPeriodDesc"},{"name":"mid_period","type":"integer","default":10,"min":3,"max":120,"step":1,"labelKey":"strategyV2.params.midPeriod","descriptionKey":"strategyV2.params.midPeriodDesc"},{"name":"long_period","type":"integer","default":20,"min":5,"max":250,"step":1,"labelKey":"strategyV2.params.longPeriod","descriptionKey":"strategyV2.params.longPeriodDesc"},{"name":"min_body_pct","type":"percent","default":0.02,"min":0,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.minBodyPct","descriptionKey":"strategyV2.params.minBodyPctDesc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"}]}'::jsonb, '["strategy-v2","cta","candlestick","a-share"]'::jsonb, 'rise', 'red', 30, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_bullish_three_lines_trend', 'script', 'Bullish Three Averages With Trend Filter', 'The three-average breakout combined with a configurable rising trend filter.', $threetrend$"""
 Bullish Three Averages With Trend Filter
@@ -156,6 +171,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark(g.symbol)
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(340)
 
 
@@ -185,7 +201,7 @@ def handle_data(context, data):
         order_target_percent(g.symbol, target_pct, reason="bullish_three_lines_trend_entry")
     elif is_long and (close_price < averages[-1] or not trend_ok):
         order_target_percent(g.symbol, 0.0, reason="bullish_three_lines_trend_exit")
-$threetrend$, '{"params":[{"name":"short_period","type":"integer","default":5,"min":2,"max":60,"step":1,"labelKey":"strategyV2.params.shortPeriod"},{"name":"mid_period","type":"integer","default":10,"min":3,"max":120,"step":1,"labelKey":"strategyV2.params.midPeriod"},{"name":"long_period","type":"integer","default":20,"min":5,"max":250,"step":1,"labelKey":"strategyV2.params.longPeriod"},{"name":"trend_period","type":"integer","default":60,"min":20,"max":300,"step":1,"labelKey":"strategyV2.params.trendPeriod"},{"name":"trend_slope_bars","type":"integer","default":5,"min":1,"max":30,"step":1,"labelKey":"strategyV2.params.trendSlopeBars"},{"name":"min_body_pct","type":"percent","default":0.02,"min":0,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.minBodyPct"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","candlestick","trend","a-share"]'::jsonb, 'area-chart', 'orange', 40, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$threetrend$, '{"params":[{"name":"short_period","type":"integer","default":5,"min":2,"max":60,"step":1,"labelKey":"strategyV2.params.shortPeriod"},{"name":"mid_period","type":"integer","default":10,"min":3,"max":120,"step":1,"labelKey":"strategyV2.params.midPeriod"},{"name":"long_period","type":"integer","default":20,"min":5,"max":250,"step":1,"labelKey":"strategyV2.params.longPeriod"},{"name":"trend_period","type":"integer","default":60,"min":20,"max":300,"step":1,"labelKey":"strategyV2.params.trendPeriod"},{"name":"trend_slope_bars","type":"integer","default":5,"min":1,"max":30,"step":1,"labelKey":"strategyV2.params.trendSlopeBars"},{"name":"min_body_pct","type":"percent","default":0.02,"min":0,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.minBodyPct"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","candlestick","trend","a-share"]'::jsonb, 'area-chart', 'orange', 40, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_turtle', 'script', 'Turtle Trading', 'A configurable Donchian breakout, channel exit, and ATR stop strategy on SPY.', $turtle$"""
 Turtle Trading
@@ -200,10 +216,10 @@ Configurable Donchian breakout, channel exit, and ATR risk stop.
 
 def initialize(context):
     g.symbol = "USStock:SPY"
-    g.entry_price = None
     context.set_universe([g.symbol])
     context.set_benchmark(g.symbol)
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(140)
 
 
@@ -225,14 +241,13 @@ def handle_data(context, data):
     position = get_position(g.symbol)
     is_long = float(position.amount or 0.0) > 0
     if not is_long and close > entry_high:
-        g.entry_price = close
         order_target_percent(g.symbol, target_pct, reason="turtle_breakout")
     elif is_long:
-        stop_price = float(g.entry_price or close) - atr_stop_mult * atr_value
+        entry_price = float(position.avg_cost or close)
+        stop_price = entry_price - atr_stop_mult * atr_value
         if close < exit_low or close < stop_price:
             order_target_percent(g.symbol, 0.0, reason="turtle_exit")
-            g.entry_price = None
-$turtle$, '{"params":[{"name":"entry_period","type":"integer","default":20,"min":5,"max":120,"step":1,"labelKey":"strategyV2.params.entryPeriod"},{"name":"exit_period","type":"integer","default":10,"min":2,"max":60,"step":1,"labelKey":"strategyV2.params.exitPeriod"},{"name":"atr_period","type":"integer","default":14,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.atrPeriod"},{"name":"atr_stop_mult","type":"number","default":2,"min":0.5,"max":10,"step":0.25,"labelKey":"strategyV2.params.atrStopMult"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","breakout","turtle","us-stock"]'::jsonb, 'flag', 'cyan', 50, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$turtle$, '{"params":[{"name":"entry_period","type":"integer","default":20,"min":5,"max":120,"step":1,"labelKey":"strategyV2.params.entryPeriod"},{"name":"exit_period","type":"integer","default":10,"min":2,"max":60,"step":1,"labelKey":"strategyV2.params.exitPeriod"},{"name":"atr_period","type":"integer","default":14,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.atrPeriod"},{"name":"atr_stop_mult","type":"number","default":2,"min":0.5,"max":10,"step":0.25,"labelKey":"strategyV2.params.atrStopMult"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","breakout","turtle","us-stock"]'::jsonb, 'flag', 'cyan', 50, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_indicator_resonance', 'script', 'Indicator Resonance', 'A parameterized QQQ strategy requiring MACD, RSI, and ADX confirmation.', $resonance$"""
 Indicator Resonance
@@ -254,6 +269,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark(g.symbol)
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(210)
 
 
@@ -284,7 +300,7 @@ def handle_data(context, data):
         order_target_percent(g.symbol, target_pct, reason="indicator_resonance_entry")
     elif not bullish and is_long:
         order_target_percent(g.symbol, 0.0, reason="indicator_resonance_exit")
-$resonance$, '{"params":[{"name":"fast_period","type":"integer","default":12,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label"},{"name":"slow_period","type":"integer","default":26,"min":3,"max":200,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label"},{"name":"signal_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.signalPeriod"},{"name":"rsi_period","type":"integer","default":14,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.rsiPeriod"},{"name":"rsi_min","type":"number","default":50,"min":0,"max":100,"step":1,"labelKey":"strategyV2.params.rsiMin"},{"name":"rsi_max","type":"number","default":75,"min":0,"max":100,"step":1,"labelKey":"strategyV2.params.rsiMax"},{"name":"adx_period","type":"integer","default":14,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.adxPeriod"},{"name":"adx_min","type":"number","default":20,"min":0,"max":100,"step":1,"labelKey":"strategyV2.params.adxMin"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","ta-lib","resonance","us-stock"]'::jsonb, 'fund', 'purple', 60, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$resonance$, '{"params":[{"name":"fast_period","type":"integer","default":12,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label"},{"name":"slow_period","type":"integer","default":26,"min":3,"max":200,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label"},{"name":"signal_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.signalPeriod"},{"name":"rsi_period","type":"integer","default":14,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.rsiPeriod"},{"name":"rsi_min","type":"number","default":50,"min":0,"max":100,"step":1,"labelKey":"strategyV2.params.rsiMin"},{"name":"rsi_max","type":"number","default":75,"min":0,"max":100,"step":1,"labelKey":"strategyV2.params.rsiMax"},{"name":"adx_period","type":"integer","default":14,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.adxPeriod"},{"name":"adx_min","type":"number","default":20,"min":0,"max":100,"step":1,"labelKey":"strategyV2.params.adxMin"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","ta-lib","resonance","us-stock"]'::jsonb, 'fund', 'purple', 60, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_macd_kdj', 'script', 'MACD and KDJ Confirmation', 'A BTC perpetual strategy combining MACD momentum, stochastic KDJ confirmation, and explicit position protection.', $macdkdj$"""
 MACD and KDJ Confirmation
@@ -308,6 +324,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark("Crypto:BTC/USDT@spot")
     context.subscribe(frequency="4h")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(210)
     context.allow_leverage(max_leverage=5)
 
@@ -340,20 +357,21 @@ def handle_data(context, data):
     kdj_cross_up = previous_k <= previous_d and k_value > d_value
     enter = histogram > 0 and (macd_cross_up or kdj_cross_up) and k_value < overbought
     exit_signal = histogram <= 0 or (previous_k >= previous_d and k_value < d_value)
-    position = get_position(g.symbol)
+    position = get_position(g.symbol, position_side="long")
     is_long = float(position.amount or 0.0) > 0
     if enter and not is_long:
         order_target_percent(
             g.symbol,
             target_pct,
+            position_side="long",
             reason="macd_kdj_entry",
             stop_loss_pct=stop_loss_pct,
             trailing_activation_pct=trailing_activation_pct,
             trailing_stop_pct=trailing_stop_pct,
         )
     elif exit_signal and is_long:
-        order_target_percent(g.symbol, 0.0, reason="macd_kdj_exit")
-$macdkdj$, '{"params":[{"name":"fast_period","type":"integer","default":12,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label"},{"name":"slow_period","type":"integer","default":26,"min":3,"max":200,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label"},{"name":"signal_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.signalPeriod"},{"name":"kdj_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.kdjPeriod"},{"name":"kdj_smooth_k","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothK"},{"name":"kdj_smooth_d","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothD"},{"name":"overbought","type":"number","default":85,"min":50,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.overbought.label"},{"name":"target_pct","type":"number","default":0.95,"min":0.1,"max":5,"step":0.05,"labelKey":"strategyV2.params.targetExposure"},{"name":"stop_loss_pct","type":"percent","default":0.02,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.stopLoss"},{"name":"trailing_activation_pct","type":"percent","default":0.05,"min":0.005,"max":0.5,"step":0.005,"labelKey":"strategyV2.params.trailingActivation"},{"name":"trailing_stop_pct","type":"percent","default":0.01,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.trailingDrawdown"}]}'::jsonb, '["strategy-v2","cta","ta-lib","macd","kdj","crypto","swap","risk"]'::jsonb, 'bar-chart', 'gold', 70, TRUE, '{"source":"system_seed","version":10,"apiVersion":2}'::jsonb, NOW()),
+        order_target_percent(g.symbol, 0.0, position_side="long", reason="macd_kdj_exit")
+$macdkdj$, '{"params":[{"name":"fast_period","type":"integer","default":12,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label"},{"name":"slow_period","type":"integer","default":26,"min":3,"max":200,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label"},{"name":"signal_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.signalPeriod"},{"name":"kdj_period","type":"integer","default":9,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.kdjPeriod"},{"name":"kdj_smooth_k","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothK"},{"name":"kdj_smooth_d","type":"integer","default":3,"min":1,"max":20,"step":1,"labelKey":"strategyV2.params.kdjSmoothD"},{"name":"overbought","type":"number","default":85,"min":50,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.overbought.label"},{"name":"target_pct","type":"number","default":0.95,"min":0.1,"max":5,"step":0.05,"labelKey":"strategyV2.params.targetExposure"},{"name":"stop_loss_pct","type":"percent","default":0.02,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.stopLoss"},{"name":"trailing_activation_pct","type":"percent","default":0.05,"min":0.005,"max":0.5,"step":0.005,"labelKey":"strategyV2.params.trailingActivation"},{"name":"trailing_stop_pct","type":"percent","default":0.01,"min":0.005,"max":0.2,"step":0.005,"labelKey":"strategyV2.params.trailingDrawdown"}]}'::jsonb, '["strategy-v2","cta","ta-lib","macd","kdj","crypto","swap","risk"]'::jsonb, 'bar-chart', 'gold', 70, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_supertrend', 'script', 'SuperTrend', 'A configurable SPY SuperTrend strategy using ATR trailing bands.', $supertrend$"""
 SuperTrend
@@ -364,6 +382,8 @@ ATR trailing bands define a stateful SPY trend regime.
 # @param atr_multiplier float 3 range=0.5:10:0.25
 # @param target_pct float 0.95 range=0.05:1:0.05
 
+PERSIST_RUNTIME_STATE = True
+
 def initialize(context):
     g.symbol = "USStock:SPY"
     g.trend = 0
@@ -372,6 +392,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark(g.symbol)
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(120)
 
 
@@ -405,7 +426,7 @@ def handle_data(context, data):
         order_target_percent(g.symbol, target_pct, reason="supertrend_entry")
     elif g.trend < 0 and is_long:
         order_target_percent(g.symbol, 0.0, reason="supertrend_exit")
-$supertrend$, '{"params":[{"name":"atr_period","type":"integer","default":10,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.atrPeriod"},{"name":"atr_multiplier","type":"number","default":3,"min":0.5,"max":10,"step":0.25,"labelKey":"strategyV2.params.atrMultiplier"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","supertrend","atr","us-stock"]'::jsonb, 'stock', 'lime', 80, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$supertrend$, '{"params":[{"name":"atr_period","type":"integer","default":10,"min":2,"max":100,"step":1,"labelKey":"strategyV2.params.atrPeriod"},{"name":"atr_multiplier","type":"number","default":3,"min":0.5,"max":10,"step":0.25,"labelKey":"strategyV2.params.atrMultiplier"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition"}]}'::jsonb, '["strategy-v2","cta","supertrend","atr","us-stock"]'::jsonb, 'stock', 'lime', 80, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_market_cap_barbell', 'portfolio_strategy', 'Small and Large Cap Barbell', 'A weekly cross-sectional portfolio combining small and large eligible U.S. companies.', $marketcap$"""
 Small and Large Cap Barbell
@@ -424,6 +445,7 @@ def initialize(context):
     context.set_universe(g.universe)
     context.set_benchmark("USStock:SPY")
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(10)
     run_weekly(rebalance, weekday=1, time="09:35")
 
@@ -447,7 +469,7 @@ def rebalance(context, data):
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="market_cap_barbell")
-$marketcap$, '{"params":[{"name":"per_side","type":"integer","default":3,"min":1,"max":6,"step":1,"labelKey":"strategyV2.params.perSide"},{"name":"min_roe","type":"number","default":0,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","market-cap"]'::jsonb, 'appstore', 'geekblue', 110, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$marketcap$, '{"params":[{"name":"per_side","type":"integer","default":3,"min":1,"max":6,"step":1,"labelKey":"strategyV2.params.perSide"},{"name":"min_roe","type":"number","default":0,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","market-cap"]'::jsonb, 'appstore', 'geekblue', 110, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_momentum_top_n', 'portfolio_strategy', 'Momentum Top-N Rotation', 'A weekly U.S. stock portfolio selecting the strongest trailing momentum.', $momentum$"""
 Momentum Top-N Rotation
@@ -466,6 +488,7 @@ def initialize(context):
     context.set_universe(g.universe)
     context.set_benchmark("USStock:SPY")
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(260)
     run_weekly(rebalance, weekday=1, time="09:35")
 
@@ -490,7 +513,7 @@ def rebalance(context, data):
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="momentum_top_n")
-$momentum$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":4,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","momentum","rotation"]'::jsonb, 'rocket', 'blue', 120, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$momentum$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":4,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","momentum","rotation"]'::jsonb, 'rocket', 'blue', 120, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_low_volatility', 'portfolio_strategy', 'Low Volatility Rotation', 'A weekly U.S. stock portfolio selecting the lowest realized volatility names.', $lowvol$"""
 Low Volatility Rotation
@@ -509,6 +532,7 @@ def initialize(context):
     context.set_universe(g.universe)
     context.set_benchmark("USStock:SPY")
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(260)
     run_weekly(rebalance, weekday=1, time="09:35")
 
@@ -532,7 +556,7 @@ def rebalance(context, data):
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="low_volatility")
-$lowvol$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":4,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","low-volatility","rotation"]'::jsonb, 'safety', 'cyan', 130, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW()),
+$lowvol$, '{"params":[{"name":"lookback","type":"integer","default":60,"min":10,"max":250,"step":5,"labelKey":"strategyV2.params.lookback"},{"name":"top_n","type":"integer","default":4,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"max_weight","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","low-volatility","rotation"]'::jsonb, 'safety', 'cyan', 130, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_quality_growth', 'portfolio_strategy', 'Quality Growth Multi-Factor', 'A weekly point-in-time portfolio combining profitability, growth, and balance-sheet quality.', $quality$"""
 Quality Growth Multi-Factor
@@ -553,6 +577,7 @@ def initialize(context):
     context.set_universe(g.universe)
     context.set_benchmark("USStock:SPY")
     context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
     context.set_warmup(10)
     run_weekly(rebalance, weekday=1, time="09:35")
 
@@ -580,7 +605,7 @@ def rebalance(context, data):
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="quality_growth")
-$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":8,"apiVersion":2}'::jsonb, NOW())
+$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW())
 ON CONFLICT (template_key) DO UPDATE SET
     asset_type = EXCLUDED.asset_type,
     title = EXCLUDED.title,

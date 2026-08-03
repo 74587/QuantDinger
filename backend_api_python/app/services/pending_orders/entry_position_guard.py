@@ -46,6 +46,7 @@ def evaluate_entry_position_guard(
     strategy_config: Dict[str, Any],
     exchange_config: Dict[str, Any],
     account_qty: float,
+    reference_price: float = 0.0,
 ) -> EntryPositionGuardResult:
     """Validate ownership drift and an optional opposite strategy leg."""
     strategy_qty = fetch_allocated_position_size(
@@ -55,6 +56,18 @@ def evaluate_entry_position_guard(
         symbol=str(symbol),
         side=str(side),
     )
+    trading_config = strategy_config.get("trading_config") if isinstance(strategy_config.get("trading_config"), dict) else {}
+    try:
+        dust_quote = float(
+            trading_config.get("position_drift_tolerance_quote")
+            or strategy_config.get("position_drift_tolerance_quote")
+            or 1.0
+        )
+    except (TypeError, ValueError):
+        dust_quote = 1.0
+    dust_quote = min(5.0, max(0.0, dust_quote))
+    price = max(0.0, float(reference_price or 0.0))
+    absolute_tolerance = dust_quote / price if dust_quote > 0 and price > 0 else 0.0
     snapshot = evaluate_and_record_ownership(
         user_id=int(user_id or 1),
         credential_id=int(credential_id or 0),
@@ -64,6 +77,7 @@ def evaluate_entry_position_guard(
         side=str(side),
         account_qty=float(account_qty or 0.0),
         strategy_qty=float(strategy_qty or 0.0),
+        absolute_tolerance=absolute_tolerance,
     )
     metadata = snapshot.metadata()
     if not snapshot.allowed:

@@ -163,7 +163,7 @@ def _build_grid_v2_source(
         f"MAX_OPEN_ENTRY_ORDERS = {max_open_orders!r}\n"
         f"{_equity_risk_constants(config)}"
         "PERSIST_RUNTIME_STATE = True\n"
-        "GRID_TEMPLATE_VERSION = 5\n"
+        "GRID_TEMPLATE_VERSION = 6\n"
     )
     body = f'''
 
@@ -633,6 +633,7 @@ def _build_dca_v2_source(
         f"TRAILING_CALLBACK = {trailing_callback!r}\n"
         f"{_equity_risk_constants(config)}"
         "PERSIST_RUNTIME_STATE = True\n"
+        "DCA_TEMPLATE_VERSION = 6\n"
     )
     body = f'''
 
@@ -646,6 +647,11 @@ def initialize(context):
     g.dca_spent_value = 0.0
     g.dca_cycle_capital = 0.0
     g.dca_anchor_price = 0.0
+    g.dca_pending_ref = ""
+    g.dca_pending_value = 0.0
+    g.dca_attempt = 0
+    g.dca_cycle_no = 1
+    g.dca_exit_pending = False
     g.equity_peak_return = 0.0
     g.equity_trailing_armed = False
     g.equity_halted = False
@@ -659,6 +665,11 @@ def _reset():
     g.dca_spent_value = 0.0
     g.dca_cycle_capital = 0.0
     g.dca_anchor_price = 0.0
+    g.dca_pending_ref = ""
+    g.dca_pending_value = 0.0
+    g.dca_attempt = 0
+    g.dca_exit_pending = False
+    g.dca_cycle_no += 1
 
 
 def _position_state():
@@ -666,6 +677,34 @@ def _position_state():
     amount = float(position.amount or 0.0)
     average = float(position.avg_cost or 0.0)
     return amount, average
+
+
+def _status_name(value):
+    return str((value or {{}}).get("status") or "unknown").strip().lower()
+
+
+def _reconcile_purchase():
+    reference = str(g.dca_pending_ref or "")
+    if not reference:
+        return
+    status = get_order_status(reference)
+    name = _status_name(status)
+    if name == "filled":
+        settled_value = (
+            float(status.get("filled_notional") or 0.0)
+            + float(status.get("fee") or 0.0)
+        )
+        if settled_value <= 0:
+            settled_value = float(g.dca_pending_value or 0.0)
+        g.dca_spent_value += settled_value
+        g.dca_order_count += 1
+        g.dca_pending_ref = ""
+        g.dca_pending_value = 0.0
+        g.dca_attempt = 0
+    elif name in ("rejected", "failed", "cancelled", "canceled", "expired"):
+        g.dca_pending_ref = ""
+        g.dca_pending_value = 0.0
+        g.dca_attempt += 1
 
 
 {EQUITY_RISK_HELPERS}
@@ -681,6 +720,7 @@ def _equity_risk_exit(context):
     order_target_value(INSTRUMENT, 0.0, reason=full_reason)
     g.equity_halted = True
     g.equity_exit_pending = True
+    g.dca_exit_pending = True
     g.equity_stop_reason = full_reason
     return True
 
@@ -688,6 +728,7 @@ def _equity_risk_exit(context):
 def _release_equity_risk_exit():
     g.equity_halted = False
     g.equity_exit_pending = False
+    g.dca_exit_pending = False
     g.equity_stop_reason = ""
 
 
@@ -698,11 +739,11 @@ def _risk_exit(price):
     profit = (price - average) / average
     if TAKE_PROFIT > 0 and profit >= TAKE_PROFIT:
         order_target_value(INSTRUMENT, 0.0, reason="dca_take_profit")
-        _reset()
+        g.dca_exit_pending = True
         return True
     if HARD_STOP > 0 and -profit >= HARD_STOP:
         order_target_value(INSTRUMENT, 0.0, reason="dca_hard_stop")
-        _reset()
+        g.dca_exit_pending = True
         return True
     return False
 
@@ -720,16 +761,24 @@ def _price_filter_allows(price):
 
 def handle_data(context, data):
     bars = get_history(2, TIMEFRAME, "close", INSTRUMENT)
-    if len(bars) < 1 or g.equity_halted:
+    if len(bars) < 1:
         return
     price = float(bars["close"].iloc[-1])
+    _reconcile_purchase()
+    amount, _ = _position_state()
+    if amount == 0 and not g.dca_pending_ref:
+        exit_reason = ""
+        if g.dca_exit_pending or g.dca_order_count > 0:
+            exit_reason = consume_last_exit_reason(INSTRUMENT) or ""
+        if g.dca_exit_pending or exit_reason:
+            _reset()
+            return
+    if g.equity_halted or g.dca_pending_ref or g.dca_exit_pending:
+        return
     if _equity_risk_exit(context):
         return
     if _risk_exit(price):
         return
-    amount, _ = _position_state()
-    if amount == 0 and g.dca_order_count > 0:
-        _reset()
     if g.dca_order_count >= DCA_MAX_ORDERS:
         return
     now = context.current_dt
@@ -743,19 +792,24 @@ def handle_data(context, data):
     if not _price_filter_allows(price):
         return
     if g.dca_cycle_capital <= 0:
-        g.dca_cycle_capital = max(0.0, float(context.portfolio.total_value))
+        g.dca_cycle_capital = max(0.0, float(context.portfolio.starting_cash))
     budget_value = g.dca_cycle_capital * DCA_TOTAL_BUDGET_PCT
     purchase_value = g.dca_cycle_capital * DCA_ORDER_PCT
     remaining_value = max(0.0, budget_value - g.dca_spent_value)
     purchase_value = min(purchase_value, remaining_value)
     if purchase_value <= 0:
         return
-    g.dca_spent_value += purchase_value
-    g.dca_order_count += 1
-    order_value(
+    reference = "dca:%s:order:%s:attempt:%s" % (
+        g.dca_cycle_no,
+        g.dca_order_count + 1,
+        g.dca_attempt,
+    )
+    g.dca_pending_value = purchase_value
+    g.dca_pending_ref = order_value(
         INSTRUMENT,
         purchase_value,
         reason="dca_scheduled_order",
+        client_order_id=reference,
         stop_loss_pct=HARD_STOP,
         take_profit_pct=TAKE_PROFIT,
         trailing_stop_pct=TRAILING_CALLBACK if TRAILING_TAKE_PROFIT_ENABLED else 0.0,
@@ -840,6 +894,7 @@ def build_robot_v2_source(
         f"DYNAMIC_ANCHOR = {dynamic_anchor!r}\n"
         f"AMOUNT_WEIGHTS = {amount_weights!r}\n"
         f"DIRECTION = {direction!r}\n"
+        f"POSITION_SIDE = {'short' if direction < 0 else 'long'!r}\n"
         f"TAKE_PROFIT = {take_profit!r}\n"
         f"HARD_STOP = {hard_stop!r}\n"
         f"TRAILING_TAKE_PROFIT_ENABLED = {trailing_enabled!r}\n"
@@ -851,7 +906,7 @@ def build_robot_v2_source(
         f"RESTART_AFTER_STOP = {restart_after_stop!r}\n"
         "ENTRY_TRIGGER_MODE = 'realtime_price'\n"
         "PERSIST_RUNTIME_STATE = True\n"
-        "ROBOT_TEMPLATE_VERSION = 5\n"
+        "ROBOT_TEMPLATE_VERSION = 6\n"
         "FINAL_SWEEP_MIN_QUOTE = 1.0\n"
     )
     initialize = (
@@ -902,7 +957,7 @@ def _level_price(index, current_price):
 
 
 def _position_state():
-    position = get_position(INSTRUMENT)
+    position = get_position(INSTRUMENT, position_side=POSITION_SIDE)
     amount = float(position.amount or 0.0)
     average = float(position.avg_cost or 0.0)
     return amount, average
@@ -940,11 +995,11 @@ def _risk_exit(price):
     profit = ((price - average) / average) * DIRECTION
     loss = -profit
     if TAKE_PROFIT > 0 and profit >= TAKE_PROFIT:
-        order_target_value(INSTRUMENT, 0.0, reason="robot_take_profit")
+        order_target_value(INSTRUMENT, 0.0, position_side=POSITION_SIDE, reason="robot_take_profit")
         _reset()
         return True
     if HARD_STOP > 0 and loss >= HARD_STOP:
-        order_target_value(INSTRUMENT, 0.0, reason="robot_hard_stop")
+        order_target_value(INSTRUMENT, 0.0, position_side=POSITION_SIDE, reason="robot_hard_stop")
         _reset()
         return True
     return False
@@ -1116,6 +1171,7 @@ def _submit_levels(context, indexes):
     submitted_reference = order_value(
         INSTRUMENT,
         DIRECTION * quote_total,
+        position_side=POSITION_SIDE,
         reason="robot_level",
         client_order_id=reference,
         stop_loss_pct=HARD_STOP,
@@ -1143,6 +1199,7 @@ def _submit_final_sweep(context):
     g.final_sweep_ref = order_value(
         INSTRUMENT,
         DIRECTION * quote,
+        position_side=POSITION_SIDE,
         reason="robot_final_sweep",
         client_order_id=reference,
         stop_loss_pct=HARD_STOP,
@@ -1168,7 +1225,7 @@ def _reconcile_final_sweep():
 
 
 def _request_exit(reason):
-    order_target_value(INSTRUMENT, 0.0, reason=reason)
+    order_target_value(INSTRUMENT, 0.0, position_side=POSITION_SIDE, reason=reason)
     g.exit_pending_reason = reason
 
 

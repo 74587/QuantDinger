@@ -70,6 +70,30 @@ def test_strict_mode_blocks_unallocated_manual_position_once():
     assert duplicate.should_log is False
 
 
+def test_exchange_dust_tolerance_does_not_block_entries():
+    snapshot = calculate_position_ownership(
+        symbol="BTC/USDT",
+        side="long",
+        account_qty=0.00045188,
+        strategy_qty=0.00045,
+        absolute_tolerance=1.0 / 63_000.0,
+    )
+    assert snapshot.status == STATUS_OK
+    assert snapshot.allowed is True
+
+
+def test_material_unknown_position_still_blocks_with_dust_tolerance():
+    snapshot = calculate_position_ownership(
+        symbol="BTC/USDT",
+        side="long",
+        account_qty=0.009499333,
+        strategy_qty=0.007926070,
+        absolute_tolerance=1.0 / 63_000.0,
+    )
+    assert snapshot.status == STATUS_BLOCKED
+    assert snapshot.reason == "unallocated_account_position"
+
+
 def test_manual_reduction_below_protected_total_blocks_entries():
     snapshot = calculate_position_ownership(
         symbol="BTC/USDT",

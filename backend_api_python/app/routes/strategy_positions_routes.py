@@ -356,7 +356,9 @@ def get_positions():
                 )
             except Exception as e:
                 account_risk = {"allowed": False, "violations": [f"accountRisk.snapshotFailed:{e}"]}
-        bot_type = str(st.get("bot_type") or trading_config.get("bot_type") or "").strip().lower()
+        from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+        bot_type = resolve_bot_type(st, trading_config)
         if execution_mode == "live" and bot_type == "grid":
             try:
                 from app.services.exchange_execution import resolve_exchange_config

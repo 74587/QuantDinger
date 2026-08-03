@@ -280,6 +280,13 @@ def initialize(context):
 
 实盘会对每根已收盘 bar 只处理一次，并在当前会话存活期间保留 <code>g</code> 状态。重复收到同一根 bar 不应重复触发策略。跨重启状态需要显式开启，见第 9 节。
 
+### 已完成 K 线与实时价格的边界
+
+- <code>get_history</code>、<code>data.current</code>、<code>data.history</code> 和指标函数看到的最后一行必须是已经完成的 K 线。实时成交价或 mark price 不能回写、覆盖或延长这根 K 线的 OHLC。
+- 均线、突破、形态、因子和其他入场/加仓信号只能根据已完成 K 线计算，保证回测、实盘和重启重放具有相同语义。
+- 实时价格仅供止损、止盈、追踪止损和权益风控使用；它不能把一根尚未收盘的 K 线伪装成完成 bar，也不能改变已经确认的策略信号。
+- 如果产品以后提供独立的逐 tick 策略契约，应使用单独的 API、回测模型和文档；不要在普通 Strategy API V2 源码中自行模拟。
+
 ---
 
 ## 9. context、data 和 g
@@ -484,7 +491,9 @@ def monitor_entry(cancel_requested):
         cancel_order(g.entry_ref)
 ~~~
 
-未显式传 <code>client_order_id</code> 时，订单函数为了兼容旧代码仍返回 <code>None</code>；传入后会返回该 ID，用于状态跟踪。常见状态包括 <code>unknown</code>、<code>queued</code>、<code>deferred</code>、<code>submitted</code>、<code>open</code>、<code>partial</code>、<code>filled</code>、<code>cancelled</code> 和 <code>rejected</code>。实盘撤单是异步过程，必须等待对账后的终态才能复用资金或推进状态。<code>consume_last_exit_reason(symbol)</code> 会返回并清除最近一次保护离场原因。
+新策略中，所有需要重试、取消、对账或推进运行周期的订单都必须显式传入稳定的 <code>client_order_id</code>。订单函数会返回该 ID，供 <code>get_order_status</code> 查询。旧源码未传 ID 时仍可能返回 <code>None</code>，但这只是迁移行为，不是新策略契约。
+
+常见活动状态包括 <code>unknown</code>、<code>queued</code>、<code>deferred</code>、<code>submitted</code>、<code>open</code> 和 <code>partial</code>；终态包括 <code>filled</code>、<code>rejected</code>、<code>failed</code>、<code>cancelled</code>/<code>canceled</code> 和 <code>expired</code>。<code>partial</code> 不是完全成交，不能按计划数量推进状态。订单终态和交易所仓位同步可能短暂错开，因此复用资金、开始新周期或反向开仓前，必须同时确认订单终态和同步仓位。实盘撤单也是异步过程。<code>consume_last_exit_reason(symbol)</code> 会返回并清除最近一次保护离场原因。
 
 现货和所有非 Crypto 市场当前按 long-only 编写。多头离场条件与空头入场条件必须独立；不要把 <code>target=0</code> 的离场自动改成负仓位。
 
@@ -563,7 +572,7 @@ context.set_metadata(direction_mode="both")
 
 支持 `long_only`（仅做多）、`short_only`（仅做空）、`both`（多空双向）和 `neutral`（中性双腿）。这个声明不会下单，也不会覆盖策略信号；它用于在部署时分配正确的双向持仓腿，并拒绝超出声明能力的新开仓信号。`both` 和 `neutral` 在实盘中要求交易所账户开启双向持仓模式。
 
-编译器仍会兼容识别旧策略顶层的 `DIRECTION = 1/-1` 常量，以及订单中的字面量 `position_side="long"/"short"`。如果无法安全推断旧版合约策略，部署页面才会要求选择兼容模式。现货策略会自动视为 `long_only`。
+新建 Crypto swap 策略必须显式声明 <code>direction_mode</code>，并在每次合约仓位读取和订单调用中显式传入 <code>position_side</code>。编译器对旧源码中 <code>DIRECTION = 1/-1</code> 或字面量仓位腿的推断只用于迁移，不属于推荐契约，也不应作为新模板的实现方式。现货策略按 <code>long_only</code> 编写。
 
 ### 双向持仓示例
 
@@ -875,9 +884,24 @@ def rebalance(context, data):
 
 ---
 
-## 20. 可视化机器人模板
+## 20. 系统预设与可视化机器人模板
+
+### 系统预设策略模板
+
+系统预设目录当前使用 <code>system_seed version=11</code>，包含 8 个 CTA 模板（单均线、双均线、阳线穿三线、趋势过滤阳线穿三线、海龟、指标共振、MACD/KDJ、SuperTrend）和 4 个组合模板（市值杠铃、动量 Top N、低波动、质量成长）。预设模板既是示例，也是当前 Strategy API V2 推荐契约的可执行基线。
+
+系统预设必须满足：
+
+- 每个模板显式声明 <code>direction_mode</code>；Crypto swap 模板显式读取和操作 <code>position_side</code> 分腿。
+- 双向趋势模板执行“先平反向腿，等待成交与仓位同步，再开目标腿”，不能用一个净仓位变量代替两条腿。
+- 可从交易所仓位恢复的状态应以同步后的 <code>amount</code>、<code>avg_cost</code> 和订单状态为准；无法可靠重建的状态必须启用 <code>PERSIST_RUNTIME_STATE</code>。
+- 每次目录更新都必须通过参数契约、编译、方向能力和合成回测测试。复制模板后如果修改了市场、方向或周期，应重新验证 manifest，而不是继续依赖模板身份。
+
+### 可视化机器人模板
 
 机器人模板会生成可编辑的 Strategy API V2 源码。真正可部署的契约是生成后的源码，不是右侧预览；每次手工修改后都必须重新验证。
+
+当前生成源码的契约版本为：网格 <code>GRID_TEMPLATE_VERSION = 6</code>、DCA <code>DCA_TEMPLATE_VERSION = 6</code>、马丁与分仓马丁 <code>ROBOT_TEMPLATE_VERSION = 6</code>。版本常量用于诊断生成源码，不能代替 manifest 和运行前验证。
 
 | 模板 | 触发与资金分配 | 当前边界 |
 | --- | --- | --- |
@@ -897,6 +921,9 @@ DCA 规则：
 
 - 定投间隔按实际经过的分钟数计算，不是“K 线根数”。处理器只能在订阅 bar 到达时执行，因此间隔小于源码周期时，实际会在下一根可用 bar 执行。
 - 每次投入同时受单次比例和周期总预算限制。即使启用了价格过滤、止盈、硬止损或追踪保护，也仍需设置最大定投次数。
+- 提交定投后先进入 pending。只有 <code>get_order_status</code> 返回 <code>filled</code>，才按实际成交额和手续费扣减周期预算并增加定投次数；调用 <code>order_value</code> 本身不代表成交。
+- <code>partial</code> 必须继续等待对账，不能按完全成交处理。<code>rejected</code>、<code>failed</code>、<code>cancelled/canceled</code> 或 <code>expired</code> 应释放挂起状态，不消耗次数和成交预算，并使用新的稳定客户端引用重试。
+- DCA 生成源码开启 <code>PERSIST_RUNTIME_STATE</code>。退出后只有在账户仓位确认归零且存在明确离场原因时才能重置周期；不能因为仓位同步暂时落后就重复开始新周期。
 
 马丁规则：
 
@@ -916,6 +943,7 @@ DCA 规则：
 - [ ] 参数默认值与代码回退值一致。
 - [ ] 所有历史窗口都检查长度。
 - [ ] 不使用未来行、负 shift 或居中 rolling。
+- [ ] 指标和入场/加仓信号只读取已完成 K 线；实时价格没有覆盖最后一根 OHLC，且只用于保护与权益风控。
 - [ ] 多头离场与空头入场独立。
 - [ ] 双向持仓代码显式读取和操作 <code>position_side</code> 分腿。
 - [ ] 已区分 <code>direction_mode</code>、<code>position_side</code>、<code>execution_mode</code> 与账户 <code>coexistence_mode</code>。

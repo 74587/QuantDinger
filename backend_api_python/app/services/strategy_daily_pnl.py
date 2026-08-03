@@ -99,6 +99,7 @@ def load_strategy_daily_metrics(
     _capture_rows(current.values())
     before = _load_boundary_snapshots(strategy_ids, day_start, before=True)
     after = _load_boundary_snapshots(strategy_ids, day_start, before=False, day_end=day_end)
+    capital_resets = _load_latest_capital_resets(strategy_ids, day_start, day_end)
     reconstructed = _load_reconstructed_opening(strategy_ids, int(user_id), day_start)
 
     metrics: Dict[int, Dict[str, Any]] = {}
@@ -109,6 +110,11 @@ def load_strategy_daily_metrics(
             after=after.get(strategy_id),
             reconstructed=float(reconstructed.get(strategy_id, item["initial_capital"])),
         )
+        reset = capital_resets.get(strategy_id)
+        if reset:
+            opening = float(reset.get("equity") or 0.0)
+            estimated = False
+            source = "capital_change"
         current_equity = float(item["equity"])
         metrics[strategy_id] = {
             "current_equity": round(current_equity, 8),
@@ -259,13 +265,32 @@ def _capture_rows(rows: Iterable[Dict[str, Any]]) -> None:
                 )
                 cur.execute(
                     """
+                    SELECT initial_capital
+                    FROM qd_strategy_equity_snapshots
+                    WHERE strategy_id = %s
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (int(row.get("strategy_id") or 0),),
+                )
+                previous = cur.fetchone() or {}
+                previous_capital = previous.get("initial_capital")
+                current_capital = float(row.get("initial_capital") or 0.0)
+                capital_changed = (
+                    previous_capital not in (None, "")
+                    and abs(float(previous_capital or 0.0) - current_capital) > 1e-8
+                )
+                cur.execute(
+                    """
                     INSERT INTO qd_strategy_equity_snapshots
-                        (user_id, strategy_id, equity, realized_pnl, unrealized_pnl, captured_at)
-                    SELECT %s, %s, %s, %s, %s, NOW()
+                        (user_id, strategy_id, equity, realized_pnl, unrealized_pnl,
+                         initial_capital, basis_reason, captured_at)
+                    SELECT %s, %s, %s, %s, %s, %s, %s, NOW()
                     WHERE NOT EXISTS (
                         SELECT 1 FROM qd_strategy_equity_snapshots
                         WHERE strategy_id = %s
                           AND captured_at >= NOW() - (%s * INTERVAL '1 second')
+                          AND NOT %s
                     )
                     """,
                     (
@@ -274,8 +299,11 @@ def _capture_rows(rows: Iterable[Dict[str, Any]]) -> None:
                         float(row.get("equity") or 0.0),
                         float(row.get("realized_net") or 0.0),
                         float(row.get("unrealized") or 0.0),
+                        current_capital,
+                        "capital_change" if capital_changed else "",
                         int(row.get("strategy_id") or 0),
                         capture_interval,
+                        bool(capital_changed),
                     ),
                 )
             db.commit()
@@ -311,6 +339,30 @@ def _load_boundary_snapshots(
             ORDER BY strategy_id, {order}
             """,
             params,
+        )
+        rows = cur.fetchall() or []
+        cur.close()
+    return {int(row.get("strategy_id") or 0): dict(row) for row in rows}
+
+
+def _load_latest_capital_resets(
+    strategy_ids: list[int],
+    day_start: datetime,
+    day_end: datetime,
+) -> Dict[int, Dict[str, Any]]:
+    placeholders = ",".join(["%s"] * len(strategy_ids))
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (strategy_id) strategy_id, equity, captured_at
+            FROM qd_strategy_equity_snapshots
+            WHERE strategy_id IN ({placeholders})
+              AND basis_reason = 'capital_change'
+              AND captured_at >= %s AND captured_at < %s
+            ORDER BY strategy_id, captured_at DESC, id DESC
+            """,
+            tuple(strategy_ids + [day_start, day_end]),
         )
         rows = cur.fetchall() or []
         cur.close()
