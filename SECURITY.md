@@ -93,6 +93,29 @@ in release notes or documentation, if desired.
 
 ---
 
+## Security Advisories
+
+### August 2026 — Strategy and indicator execution isolation
+
+Deployments that accepted untrusted strategy or indicator code before the
+August 2026 hardening update should assume application environment secrets may
+have been exposed. Upgrade to the latest `main` revision, review access logs,
+and rotate JWT/session secrets, database credentials, provider tokens, and
+connected broker or exchange credentials. Preserve access to credentials
+encrypted with the previous `CREDENTIAL_ENCRYPTION_KEY` until they have been
+re-encrypted or re-entered; changing that key without a migration makes stored
+credentials unreadable.
+
+## Security Acknowledgments
+
+- **Satrio**, independent security researcher — responsibly disclosed a
+  critical runtime-built attribute-traversal issue in the strategy and
+  indicator execution boundary in August 2026. The research was performed
+  against the public repository only and did not access the hosted service or
+  real user data.
+
+---
+
 ## ⚠️ Disclaimer
 
 QuantDinger is provided **as-is**, without warranty.
