@@ -29,6 +29,7 @@ from app.services.strategy_v2 import (
 from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2OrderGateway
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.numeric_precision import format_decimal
 from app.utils.strategy_runtime_logs import append_strategy_log
 from app.utils.thread_capacity import format_thread_capacity
 
@@ -1017,7 +1018,8 @@ class TradingExecutor:
                 strategy_id,
                 "error",
                 "Order rejected by strategy budget guard: "
-                f"action={budget['action']}, quantity={quantity:.12f}, price={reference_price:.8f}, "
+                f"action={budget['action']}, quantity={format_decimal(quantity)}, "
+                f"price={format_decimal(reference_price, decimal_places=8)}, "
                 f"order_notional={budget['order_notional']:.4f}, "
                 f"projected_notional={budget['projected_notional']:.4f}, "
                 f"limit={budget['limit']:.4f}, reason={budget['reason']}",
@@ -1063,7 +1065,8 @@ class TradingExecutor:
             append_strategy_log(
                 strategy_id,
                 "trade",
-                f"Order queued: {request.action} {request.symbol} quantity={request.quantity:.12f}",
+                f"Order queued: {request.action} {request.symbol} "
+                f"quantity={format_decimal(request.quantity)}",
             )
         return bool(pending_id)
 
