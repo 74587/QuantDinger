@@ -144,6 +144,34 @@ def test_agent_intent_preserves_every_requested_strategy_timeframe():
     assert plan["entities"]["timeframe"] == "15m"
 
 
+def test_explicit_single_timeframe_does_not_inherit_selected_chart_timeframe():
+    message = "Create a BTC strategy using a 1m golden cross"
+    context = {
+        "market": "Crypto",
+        "symbol": "BTC/USDT",
+        "timeframe": "4h",
+        "timeframes": ["4h"],
+    }
+    fallback = _fallback_agent_intent(message, False, context, "en-US")
+    normalized = _normalize_agent_intent(
+        {
+            "intent": "strategy_build",
+            "target_type": "script",
+            "workflow": "script_strategy",
+            "should_execute": True,
+            "entities": {"symbol": "BTC/USDT", "timeframe": "1m"},
+        },
+        message,
+        False,
+        context,
+        "en-US",
+    )
+
+    for plan in (fallback, normalized):
+        assert plan["entities"]["timeframes"] == ["1m"]
+        assert plan["entities"]["timeframe"] == "1m"
+
+
 def test_stream_recovery_replaces_partial_provider_output(monkeypatch):
     class FakeLLMService:
         def stream_llm_api(self, messages, temperature):

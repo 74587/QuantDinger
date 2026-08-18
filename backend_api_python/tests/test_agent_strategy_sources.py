@@ -163,8 +163,8 @@ def test_strategy_authoring_starter_compiles_with_strategy_v2():
 
     assert compiled.manifest.strategy_type == "cta"
     assert compiled.manifest.subscriptions[0].frequency == "1d"
-    assert multi_timeframe.manifest.frequencies == ("1d", "4h", "1h")
-    assert multi_timeframe.manifest.driving_frequency == "1h"
+    assert multi_timeframe.manifest.frequencies == ("1m", "1h")
+    assert multi_timeframe.manifest.driving_frequency == "1m"
     assert contract["timeframes"]["weekly_literal"] == "1w"
 
 

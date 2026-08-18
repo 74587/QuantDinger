@@ -5,7 +5,7 @@
 
 QuantDinger has one current executable Python strategy contract: **Strategy API V2**. The same source compiles into a strategy manifest used by backtest and live runtimes for instruments, subscriptions, events, order intents, portfolio accounting, and protection rules.
 
-The source owns its market, instruments, one or more timeframes, schedules, and trading logic. Run forms provide dates, initial capital, costs, source-permitted leverage, and user parameters; they do not override source-controlled markets, symbols, or timeframes.
+The source owns its market, instruments, timeframe, schedules, and trading logic. Single-timeframe is the default; a source declares several timeframes only when its logic explicitly requires cross-timeframe confirmation. Run forms provide dates, initial capital, costs, source-permitted leverage, and user parameters; they do not override source-controlled markets, symbols, or timeframes.
 
 Chart indicators are separate artifacts. Their plots, signals, and layers cannot place orders. Convert an indicator into Strategy API V2 before backtesting or deploying it.
 
@@ -220,41 +220,45 @@ Rules:
 
 ### 6.1 Native multi-timeframe data
 
-A strategy may subscribe to and read several independently loaded timeframes. The runtime does not build higher bars ad hoc from the driving frame:
+Multi-timeframe data is an optional capability, not a mode that every strategy or robot must use. A normal strategy declares and reads one timeframe by default; subscriptions are added only when the user or existing source explicitly requires cross-timeframe validation. Grid, DCA, and other robots that do not depend on cross-timeframe signals do not gain extra periods merely because the capability exists.
+
+A strategy may subscribe to and read several independently loaded timeframes. The runtime does not build higher bars ad hoc from the driving frame. This example treats a completed one-minute golden cross as the entry event and confirms it against the bullish alignment of completed hourly bars:
 
 ~~~python
 def initialize(context):
     g.symbol = "Crypto:BTC/USDT@swap"
     context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
     context.subscribe(frequency="1h")
-    context.subscribe(frequency="4h")
-    context.subscribe(frequency="1d")
-    context.set_warmup(220)
+    context.set_warmup(62)
 
 
 def handle_data(context, data):
-    bars_1h = get_history(50, "1h", "close", g.symbol)
-    bars_4h = get_history(50, "4h", "close", g.symbol)
-    bars_1d = get_history(50, "1d", "close", g.symbol)
-    if min(len(bars_1h), len(bars_4h), len(bars_1d)) < 50:
+    bars_1m = get_history(32, "1m", "close", g.symbol)
+    bars_1h = get_history(52, "1h", "close", g.symbol)
+    if len(bars_1m) < 31 or len(bars_1h) < 50:
         return
 
-    trigger = float(bars_1h["close"].iloc[-1]) > float(
-        bars_1h["close"].tail(20).mean()
+    close_1m = bars_1m["close"]
+    fast_now = float(close_1m.tail(10).mean())
+    fast_prev = float(close_1m.iloc[:-1].tail(10).mean())
+    slow_now = float(close_1m.tail(30).mean())
+    slow_prev = float(close_1m.iloc[:-1].tail(30).mean())
+    golden_cross = fast_prev <= slow_prev and fast_now > slow_now
+    death_cross = fast_prev >= slow_prev and fast_now < slow_now
+    hourly_bullish = float(bars_1h["close"].tail(20).mean()) > float(
+        bars_1h["close"].tail(50).mean()
     )
-    trend_4h = float(bars_4h["close"].tail(20).mean()) > float(
-        bars_4h["close"].tail(50).mean()
-    )
-    trend_1d = float(bars_1d["close"].tail(20).mean()) > float(
-        bars_1d["close"].tail(50).mean()
-    )
-    target = 0.95 if trigger and trend_4h and trend_1d else 0.0
-    order_target_percent(g.symbol, target, reason="mtf_trend_alignment")
+    amount = float(get_position(g.symbol).amount or 0.0)
+    if amount <= 0 and golden_cross and hourly_bullish:
+        order_target_percent(g.symbol, 0.95, reason="one_minute_cross_hourly_confirmed")
+    elif amount > 0 and (death_cross or not hourly_bullish):
+        order_target_percent(g.symbol, 0.0, reason="cross_or_hourly_filter_exit")
 ~~~
 
 Multi-timeframe runtime rules:
 
-- The fastest subscribed timeframe becomes <code>drivingFrequency</code>. The example runs <code>handle_data</code> once per completed one-hour bar; declaration order does not change the driving timeframe.
+- The fastest subscribed timeframe becomes <code>drivingFrequency</code>. The example runs <code>handle_data</code> once per completed one-minute bar; declaration order does not change the driving timeframe.
 - <code>get_history(..., frequency, ...)</code> routes to that timeframe's independent frame. Requesting an unsubscribed timeframe raises <code>strategyV2.frequencyNotSubscribed</code> instead of silently falling back.
 - A higher-timeframe bar becomes visible only when its close is no later than the driving bar's close. For example, a four-hour bar opened at 08:00 cannot affect a signal until 12:00.
 - <code>set_warmup(n)</code> requests an appropriate lookback for every subscribed timeframe. The source must still guard the length of every returned DataFrame.
@@ -263,9 +267,9 @@ Multi-timeframe runtime rules:
 - Manifest <code>primaryFrequency</code> remains the first declaration for compatibility. Scheduling, execution, and performance annualization use <code>drivingFrequency</code>.
 - <code>data.history(..., frequency="4h")</code>, <code>data.current(..., frequency="4h")</code>, <code>indicator(..., frequency="4h")</code>, and <code>factor(..., frequency="4h")</code> also accept an explicit timeframe. <code>data[symbol]</code> uses the driving timeframe.
 
-A robust design usually filters trend on higher timeframes, confirms entries on the driving timeframe, and keeps orders idempotent. Because <code>handle_data</code> runs on the fastest timeframe, a daily bullish state must not become an unconditional hourly scale-in.
+When cross-timeframe confirmation is explicitly requested, a design can filter trend on the higher timeframe, confirm entries on the driving timeframe, and keep orders idempotent. Because <code>handle_data</code> runs on the fastest timeframe, a persistent higher-timeframe bullish state must not become an unconditional scale-in on every lower-timeframe bar. “Higher timeframe is bullish” and “higher timeframe has just crossed bullish” are different conditions; strategy code and AI generation must preserve the user's intended meaning.
 
-AI-generated strategy source follows the same contract: when a request names several timeframes, generation and repair must preserve every requested subscription rather than selecting one, resampling the lowest frame, or rewriting all history reads to the driver.
+AI-generated strategy source follows the same contract: when a request names one timeframe, it must remain single-timeframe and the AI must not invent confirmation periods. When a request names several timeframes, generation and repair must preserve every requested subscription rather than selecting one, resampling the lowest frame, or rewriting all history reads to the driver.
 
 ---
 

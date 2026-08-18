@@ -8,7 +8,7 @@ Return Python source only. Do not use markdown fences or explanatory prose.
 ## Required structure
 - Start with a triple-quoted docstring. Its first non-empty line is the strategy name; the following lines explain the universe, signals, schedule, and risk controls.
 - Define `initialize(context)` and at least one executable handler or schedule callback.
-- The strategy source owns the universe, market, instrument type, one or more data frequencies, subscriptions, benchmark, schedules, and trading rules.
+- The strategy source owns the universe, market, instrument type, the exact data frequency or frequencies required by its logic, subscriptions, benchmark, schedules, and trading rules.
 - The run panel owns only initial capital, the backtest date range, and an optional leverage value when the source explicitly permits leverage.
 
 ## Universe and market ownership
@@ -16,7 +16,7 @@ Return Python source only. Do not use markdown fences or explanatory prose.
 - For a fixed universe call `context.set_universe([...])`.
 - For a platform universe pool call `context.set_universe(pool='sp500')` and obtain its point-in-time members with `get_universe_stocks()`.
 - For an index universe call `context.set_universe(index='INDEX:NASDAQ100')` and obtain members with `get_index_stocks(...)` when needed.
-- Call `context.subscribe(frequency='1d', fields=[...])`. For a requested multi-timeframe strategy, call it once for each required timeframe (at most eight). If the user names several timeframes, preserve every one of them; never collapse `1d + 4h + 1h` into a single subscription. Do not ask the run panel for a symbol, market, exchange, or timeframe.
+- Call `context.subscribe(frequency='1d', fields=[...])`. Single-timeframe is the default: emit exactly one subscription unless the user explicitly requests cross-timeframe confirmation or the supplied strategy logic already reads several timeframes. For an explicit multi-timeframe strategy, call it once for each required timeframe (at most eight), preserve every requested timeframe, and never collapse `1d + 4h + 1h` into one subscription. Do not ask the run panel for a symbol, market, exchange, or timeframe.
 - Use `context.set_warmup(bars)` for indicator history and `context.set_benchmark(...)` when a benchmark is meaningful.
 
 ## Event model
@@ -45,11 +45,11 @@ Return Python source only. Do not use markdown fences or explanatory prose.
 - Use `get_index_stocks(reference)` for dynamic index constituents.
 - Use `get_universe_stocks()` for the currently selected platform universe pool. Do not copy pool constituents into source code.
 - Native strategy timeframes are exactly `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, and `1w`. Use these lowercase canonical literals in generated source. `1w` is weekly; monthly bars are not part of the current strategy contract.
-- Every frequency requested by `get_history`, `data.history`, `data.current`, `indicator`, `factor`, or `get_factors` must be declared with `context.subscribe`. A professional `1d + 4h + 1h` strategy therefore has three subscribe calls and three explicit history reads.
+- Every frequency requested by `get_history`, `data.history`, `data.current`, `indicator`, `factor`, or `get_factors` must be declared with `context.subscribe`. If the user explicitly requests `1d + 4h + 1h`, the strategy therefore has three subscribe calls and three explicit history reads.
 - The fastest subscribed timeframe drives `handle_data`. Higher-timeframe bars remain invisible until their own close; never emulate them by resampling visible lower bars or by reading an unfinished candle.
 - Guard the history length of every timeframe independently. Size `context.set_warmup(...)` for the largest required lookback, while retaining a separate `len(...)` guard for every returned frame.
-- Use higher timeframes for regime/trend filters and the fastest timeframe for entry or exit confirmation. Make low-timeframe order conditions idempotent by comparing the desired target with the synchronized position or by tracking a completed signal transition, so a persistent daily state does not cause repeated scale-ins.
-- Do not subscribe to extra timeframes that the requested logic never reads. Conversely, do not silently replace an unavailable requested timeframe with a different one; generated code must compile against the exact source-owned subscriptions.
+- Only when cross-timeframe confirmation is explicitly requested, use the completed higher timeframe as the requested regime, trend, or crossover confirmation and the fastest timeframe as the execution clock. Preserve whether the request means higher-timeframe bullish alignment (`fast > slow`) or a fresh higher-timeframe crossover event; do not silently substitute one meaning for the other. Make low-timeframe order conditions idempotent so a persistent higher-timeframe state does not cause repeated scale-ins.
+- Do not invent or subscribe to extra confirmation timeframes. A request naming one timeframe must remain single-timeframe. Conversely, do not silently replace an unavailable requested timeframe with a different one; generated code must compile against the exact source-owned subscriptions.
 
 ## Orders and positions
 - Order-helper signatures are exact: `order(symbol, amount)`, `order_value(symbol, value)`, `order_target(symbol, amount)`, `order_target_value(symbol, value)`, and `order_target_percent(symbol, percent)`.
@@ -79,7 +79,7 @@ SCRIPT_STRATEGY_QUICK_TOOL_SYSTEM_PROMPT = SCRIPT_STRATEGY_SYSTEM_PROMPT + """
 # Homepage quick-tool entry
 - Generate a complete Strategy API V2 draft immediately.
 - Make conservative source-controlled choices for universe, market, and frequency when the request omits them.
-- Preserve all explicitly requested timeframes and use the fastest one as the execution driver.
+- Preserve all explicitly requested timeframes and use the fastest one as the execution driver. Otherwise generate a single-timeframe strategy and do not add confirmation periods.
 - Do not return a research memo, checklist, or pseudo-code.
 """
 
@@ -100,6 +100,7 @@ SCRIPT_STRATEGY_REPAIR_REQUIREMENTS = """# Strategy API V2 repair requirements
 - Replace legacy `.quantity` and `.cost_basis` position access with `.amount` and `.avg_cost`.
 - Preserve completed-data-only execution and remove look-ahead.
 - Preserve native multi-timeframe subscriptions when requested: keep every user-requested timeframe, subscribe every used timeframe, let the fastest timeframe drive execution, and never expose a higher-timeframe bar before its close.
+- Never add a new timeframe during repair unless it is explicitly requested or an existing history/factor read already requires it. Keep single-timeframe source single-timeframe.
 - Canonicalize supported literals to `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, or `1w`; weekly is `1w` and monthly is unsupported.
 - Repair undeclared literal reads by adding the matching subscription instead of rewriting every read to the driving timeframe. Do not collapse, resample, or otherwise erase requested higher-timeframe confirmation logic.
 - Keep symbol, market, frequency, schedule, and universe in source code.

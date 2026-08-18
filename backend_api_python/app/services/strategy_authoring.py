@@ -35,34 +35,41 @@ def handle_data(context, data):
 '''
 
 _MULTI_TIMEFRAME_TEMPLATE = '''"""
-Three-Timeframe Trend Confirmation
-Uses completed daily and four-hour trend filters with one-hour execution.
+One-Minute Cross with Hourly Confirmation
+Enters on a completed one-minute golden cross only while completed hourly bars are bullish.
 """
 
 
 def initialize(context):
     g.symbol = "Crypto:BTC/USDT@swap"
     context.set_universe([g.symbol])
-    context.subscribe(frequency="1d")
-    context.subscribe(frequency="4h")
+    context.subscribe(frequency="1m")
     context.subscribe(frequency="1h")
-    context.set_warmup(52)
+    context.set_warmup(62)
     context.allow_leverage(max_leverage=5)
 
 
 def handle_data(context, data):
-    bars_1d = get_history(52, "1d", "close", g.symbol)
-    bars_4h = get_history(52, "4h", "close", g.symbol)
-    bars_1h = get_history(22, "1h", "close", g.symbol)
-    if len(bars_1d) < 50 or len(bars_4h) < 50 or len(bars_1h) < 20:
+    bars_1m = get_history(32, "1m", "close", g.symbol)
+    bars_1h = get_history(52, "1h", "close", g.symbol)
+    if len(bars_1m) < 31 or len(bars_1h) < 50:
         return
-    daily_up = float(bars_1d["close"].tail(20).mean()) > float(bars_1d["close"].tail(50).mean())
-    four_hour_up = float(bars_4h["close"].tail(20).mean()) > float(bars_4h["close"].tail(50).mean())
-    hourly_trigger = float(bars_1h["close"].iloc[-1]) > float(bars_1h["close"].tail(20).mean())
-    target = 0.5 if daily_up and four_hour_up and hourly_trigger else 0.0
+    close_1m = bars_1m["close"]
+    fast_now = float(close_1m.tail(10).mean())
+    fast_prev = float(close_1m.iloc[:-1].tail(10).mean())
+    slow_now = float(close_1m.tail(30).mean())
+    slow_prev = float(close_1m.iloc[:-1].tail(30).mean())
+    golden_cross = fast_prev <= slow_prev and fast_now > slow_now
+    death_cross = fast_prev >= slow_prev and fast_now < slow_now
+    hourly_bullish = float(bars_1h["close"].tail(20).mean()) > float(
+        bars_1h["close"].tail(50).mean()
+    )
     position = get_position(g.symbol)
-    if (target > 0 and float(position.amount or 0.0) <= 0) or (target == 0 and float(position.amount or 0.0) != 0):
-        order_target_percent(g.symbol, target, reason="three_timeframe_confirmation")
+    amount = float(position.amount or 0.0)
+    if amount <= 0 and golden_cross and hourly_bullish:
+        order_target_percent(g.symbol, 0.5, reason="one_minute_cross_hourly_confirmed")
+    elif amount > 0 and (death_cross or not hourly_bullish):
+        order_target_percent(g.symbol, 0.0, reason="cross_or_hourly_filter_exit")
 '''
 
 
@@ -117,6 +124,7 @@ def get_strategy_authoring_contract() -> dict[str, Any]:
             "driver": "fastest subscribed timeframe",
             "higher_timeframe_visibility": "completed bars only",
             "rules": [
+                "Single-timeframe is the default; never add confirmation timeframes unless the user explicitly requests them.",
                 "Preserve every timeframe explicitly requested by the user.",
                 "Subscribe every timeframe read by history, current, indicator, or factor APIs.",
                 "Never resample the driving frame to emulate a native higher timeframe.",

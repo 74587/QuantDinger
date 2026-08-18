@@ -124,7 +124,8 @@ def _normalize_strategy_timeframes(
     else:
         candidates.extend(_strategy_timeframes_from_text(values))
     candidates.extend(_strategy_timeframes_from_text(message))
-    candidates.extend(_strategy_timeframes_from_text(fallback))
+    if not candidates:
+        candidates.extend(_strategy_timeframes_from_text(fallback))
     return list(dict.fromkeys(
         item for item in candidates if item in _AGENT_STRATEGY_TIMEFRAME_SECONDS
     ))
@@ -256,9 +257,9 @@ def _fallback_agent_intent(
     if should_execute and not selected_symbol:
         required_missing.append("symbol")
 
+    explicit_timeframes = _strategy_timeframes_from_text(message)
     requested_timeframes = _normalize_strategy_timeframes(
-        (context or {}).get("timeframes"),
-        message=message,
+        explicit_timeframes or (context or {}).get("timeframes"),
         fallback=(context or {}).get("timeframe"),
     )
     driving_timeframe = min(
@@ -389,7 +390,7 @@ def _classify_agent_intent(message: str, attachments: list[dict], context: dict,
         "workflow such as indicator creation, strategy creation, backtest, or scheduled analysis. "
         "For creation, use indicator_ide only for chart-only indicators and visual overlays. "
         "Use script_strategy for executable Strategy API V2 sources, backtestable strategies, live strategies, robots, or template-style requests. "
-        "Preserve selected timeframe, exchange_id, market_type, and instrument_id in entities. When the user requests multiple strategy timeframes, preserve all of them in the ordered timeframes array and put the fastest one in timeframe. Never collapse a multi-timeframe request to one period. A missing timeframe is not blocking for strategy creation because the source generator chooses a conservative source-owned default. "
+        "Preserve selected timeframe, exchange_id, market_type, and instrument_id in entities. Single-timeframe is the default: never add a selected chart timeframe or an invented confirmation timeframe when the user names only one. When the user explicitly requests multiple strategy timeframes, preserve all of them in the ordered timeframes array and put the fastest one in timeframe. Never collapse a multi-timeframe request to one period. A missing timeframe is not blocking for strategy creation because the source generator chooses one conservative source-owned default. "
         "If the user asks to create/build/write/generate a runnable strategy and enough target context "
         "is available, set should_execute=true. If required data is missing, list it in required_missing. "
         "Support every configured UI language and mixed multilingual prompts."

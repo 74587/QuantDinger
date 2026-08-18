@@ -5,7 +5,7 @@
 
 QuantDinger 只有一套当前可执行的 Python 策略契约：**Strategy API V2**。同一份源码会编译成策略清单，并由回测和实盘运行时共享标的、订阅、事件模型、订单意图、组合记账和保护规则。
 
-策略源码拥有市场、标的、一个或多个周期、调度和交易逻辑。运行面板只提供日期、初始资金、交易成本、源码允许范围内的杠杆，以及用户参数；它不能改写源码声明的市场、标的或周期。
+策略源码拥有市场、标的、周期、调度和交易逻辑。单周期是默认模式；只有策略逻辑明确需要跨周期确认时，源码才声明多个周期。运行面板只提供日期、初始资金、交易成本、源码允许范围内的杠杆，以及用户参数；它不能改写源码声明的市场、标的或周期。
 
 图表指标是另一种产物。指标中的 plots、signals 和 layers 不能下单，必须先转换成 Strategy API V2。
 
@@ -222,41 +222,45 @@ context.set_benchmark("USStock:SPY")
 
 ### 6.1 原生多周期
 
-同一策略可以独立订阅并读取多个周期。每个周期由数据服务单独加载，不会从最细周期在策略内临时拼接：
+多周期是一项可选能力，不是所有策略或机器人必须采用的模式。普通策略默认只声明并读取一个周期；只有用户或原策略明确要求跨周期验证时，才增加相应订阅。网格、定投等不依赖跨周期信号的机器人不会因为这项能力自动增加周期。
+
+同一策略可以独立订阅并读取多个周期。每个周期由数据服务单独加载，不会从最细周期在策略内临时拼接。下面示例用 1 分钟金叉作为入场事件，并用已完成的 1 小时均线多头状态进行确认：
 
 ~~~python
 def initialize(context):
     g.symbol = "Crypto:BTC/USDT@swap"
     context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
     context.subscribe(frequency="1h")
-    context.subscribe(frequency="4h")
-    context.subscribe(frequency="1d")
-    context.set_warmup(220)
+    context.set_warmup(62)
 
 
 def handle_data(context, data):
-    bars_1h = get_history(50, "1h", "close", g.symbol)
-    bars_4h = get_history(50, "4h", "close", g.symbol)
-    bars_1d = get_history(50, "1d", "close", g.symbol)
-    if min(len(bars_1h), len(bars_4h), len(bars_1d)) < 50:
+    bars_1m = get_history(32, "1m", "close", g.symbol)
+    bars_1h = get_history(52, "1h", "close", g.symbol)
+    if len(bars_1m) < 31 or len(bars_1h) < 50:
         return
 
-    trigger = float(bars_1h["close"].iloc[-1]) > float(
-        bars_1h["close"].tail(20).mean()
+    close_1m = bars_1m["close"]
+    fast_now = float(close_1m.tail(10).mean())
+    fast_prev = float(close_1m.iloc[:-1].tail(10).mean())
+    slow_now = float(close_1m.tail(30).mean())
+    slow_prev = float(close_1m.iloc[:-1].tail(30).mean())
+    golden_cross = fast_prev <= slow_prev and fast_now > slow_now
+    death_cross = fast_prev >= slow_prev and fast_now < slow_now
+    hourly_bullish = float(bars_1h["close"].tail(20).mean()) > float(
+        bars_1h["close"].tail(50).mean()
     )
-    trend_4h = float(bars_4h["close"].tail(20).mean()) > float(
-        bars_4h["close"].tail(50).mean()
-    )
-    trend_1d = float(bars_1d["close"].tail(20).mean()) > float(
-        bars_1d["close"].tail(50).mean()
-    )
-    target = 0.95 if trigger and trend_4h and trend_1d else 0.0
-    order_target_percent(g.symbol, target, reason="mtf_trend_alignment")
+    amount = float(get_position(g.symbol).amount or 0.0)
+    if amount <= 0 and golden_cross and hourly_bullish:
+        order_target_percent(g.symbol, 0.95, reason="one_minute_cross_hourly_confirmed")
+    elif amount > 0 and (death_cross or not hourly_bullish):
+        order_target_percent(g.symbol, 0.0, reason="cross_or_hourly_filter_exit")
 ~~~
 
 多周期运行规则：
 
-- 最细的已订阅周期自动成为 <code>drivingFrequency</code>。上例每根已完成 1 小时 K 线驱动一次 <code>handle_data</code>；声明顺序不会改变驱动周期。
+- 最细的已订阅周期自动成为 <code>drivingFrequency</code>。上例每根已完成 1 分钟 K 线驱动一次 <code>handle_data</code>；声明顺序不会改变驱动周期。
 - <code>get_history(..., frequency, ...)</code> 会路由到该周期的独立历史帧。请求未订阅周期会报 <code>strategyV2.frequencyNotSubscribed</code>，不会静默回退到其他周期。
 - 高周期 K 线只有在其收盘时间不晚于当前驱动 K 线的收盘时间时才可见。例如 08:00 开始的 4 小时 K 线，要到 12:00 后才能参与信号。
 - <code>set_warmup(n)</code> 对每个已订阅周期都请求至少相应的预热窗口；策略仍须分别检查每个 DataFrame 的长度。
@@ -265,9 +269,9 @@ def handle_data(context, data):
 - 清单中的 <code>primaryFrequency</code> 为首个声明周期的兼容字段；调度、执行时钟和绩效年化使用 <code>drivingFrequency</code>。
 - <code>data.history(..., frequency="4h")</code>、<code>data.current(..., frequency="4h")</code>、<code>indicator(..., frequency="4h")</code> 和 <code>factor(..., frequency="4h")</code> 同样支持显式周期。<code>data[symbol]</code> 默认使用驱动周期。
 
-专业实践上，建议用高周期过滤趋势、低周期确认入场，并让下单条件保持幂等。因为 <code>handle_data</code> 按最细周期运行，不能把“日线多头”直接写成每小时无条件加仓。
+当用户明确要求跨周期确认时，可以用高周期过滤趋势、低周期确认入场，并让下单条件保持幂等。因为 <code>handle_data</code> 按最细周期运行，不能把“高周期多头”直接写成每个低周期 bar 都无条件加仓。“高周期处于多头排列”和“高周期刚刚发生金叉”是不同条件；策略和 AI 必须按用户原意实现，不能相互替换。
 
-AI 生成策略同样遵守这份契约：用户明确给出多个周期时，生成和修复流程必须保留全部订阅，不能只挑一个周期、用最低周期自行重采样，或把全部历史读取改写成驱动周期。
+AI 生成策略同样遵守这份契约：用户只给出一个周期时必须保持单周期，不得主动添加确认周期；用户明确给出多个周期时，生成和修复流程必须保留全部订阅，不能只挑一个周期、用最低周期自行重采样，或把全部历史读取改写成驱动周期。
 
 ---
 
