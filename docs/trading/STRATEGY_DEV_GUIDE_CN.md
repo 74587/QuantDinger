@@ -5,7 +5,7 @@
 
 QuantDinger 只有一套当前可执行的 Python 策略契约：**Strategy API V2**。同一份源码会编译成策略清单，并由回测和实盘运行时共享标的、订阅、事件模型、订单意图、组合记账和保护规则。
 
-策略源码拥有市场、标的、周期、调度和交易逻辑。运行面板只提供日期、初始资金、交易成本、源码允许范围内的杠杆，以及用户参数；它不能改写源码声明的市场、标的或周期。
+策略源码拥有市场、标的、一个或多个周期、调度和交易逻辑。运行面板只提供日期、初始资金、交易成本、源码允许范围内的杠杆，以及用户参数；它不能改写源码声明的市场、标的或周期。
 
 图表指标是另一种产物。指标中的 plots、signals 和 layers 不能下单，必须先转换成 Strategy API V2。
 
@@ -116,7 +116,7 @@ def handle_data(context, data):
 - API 版本与源码哈希；
 - CTA 或 portfolio 类型；
 - 静态/动态 universe；
-- 订阅标的、周期和字段；
+- 订阅标的、全部周期、驱动周期和字段；
 - 定时任务；
 - benchmark；
 - 生命周期处理器；
@@ -217,7 +217,57 @@ context.set_benchmark("USStock:SPY")
 - 未指定 symbols 时，订阅当前 universe。
 - <code>set_warmup</code> 告诉数据服务在回测开始日前额外获取历史数据；它不代表策略可以跳过 <code>len(bars)</code> 检查。
 - benchmark 只用于对比收益，不会自动交易。
-- <code>get_history</code> 的 frequency 参数用于 API 兼容；当前运行时从已订阅数据取历史，因此调用周期应与订阅周期保持一致。
+- 最多可声明 8 个不同周期。当前原生支持 <code>1m</code>、<code>3m</code>、<code>5m</code>、<code>15m</code>、<code>30m</code>、<code>1h</code>、<code>4h</code>、<code>1d</code> 和 <code>1w</code>。
+- 5 分钟、15 分钟、30 分钟可以和小时线、日线、周线同时用于一个策略。周线统一写成小写 <code>1w</code>；月线目前不是 Strategy API V2 原生周期。
+
+### 6.1 原生多周期
+
+同一策略可以独立订阅并读取多个周期。每个周期由数据服务单独加载，不会从最细周期在策略内临时拼接：
+
+~~~python
+def initialize(context):
+    g.symbol = "Crypto:BTC/USDT@swap"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1h")
+    context.subscribe(frequency="4h")
+    context.subscribe(frequency="1d")
+    context.set_warmup(220)
+
+
+def handle_data(context, data):
+    bars_1h = get_history(50, "1h", "close", g.symbol)
+    bars_4h = get_history(50, "4h", "close", g.symbol)
+    bars_1d = get_history(50, "1d", "close", g.symbol)
+    if min(len(bars_1h), len(bars_4h), len(bars_1d)) < 50:
+        return
+
+    trigger = float(bars_1h["close"].iloc[-1]) > float(
+        bars_1h["close"].tail(20).mean()
+    )
+    trend_4h = float(bars_4h["close"].tail(20).mean()) > float(
+        bars_4h["close"].tail(50).mean()
+    )
+    trend_1d = float(bars_1d["close"].tail(20).mean()) > float(
+        bars_1d["close"].tail(50).mean()
+    )
+    target = 0.95 if trigger and trend_4h and trend_1d else 0.0
+    order_target_percent(g.symbol, target, reason="mtf_trend_alignment")
+~~~
+
+多周期运行规则：
+
+- 最细的已订阅周期自动成为 <code>drivingFrequency</code>。上例每根已完成 1 小时 K 线驱动一次 <code>handle_data</code>；声明顺序不会改变驱动周期。
+- <code>get_history(..., frequency, ...)</code> 会路由到该周期的独立历史帧。请求未订阅周期会报 <code>strategyV2.frequencyNotSubscribed</code>，不会静默回退到其他周期。
+- 高周期 K 线只有在其收盘时间不晚于当前驱动 K 线的收盘时间时才可见。例如 08:00 开始的 4 小时 K 线，要到 12:00 后才能参与信号。
+- <code>set_warmup(n)</code> 对每个已订阅周期都请求至少相应的预热窗口；策略仍须分别检查每个 DataFrame 的长度。
+- 回测日期范围必须同时满足所有周期的数据源限制；任一必需周期缺失的标的不会以不完整周期集合继续运行。
+- 各数据源的历史深度限制仍分别生效。分钟线通常比日线、周线保留时间短，所以 <code>5m + 1w</code> 虽然是合法组合，回测区间仍可能需要按 5 分钟数据的可用范围缩短；加密货币、股票和外汇数据源的历史深度也可能不同。
+- 清单中的 <code>primaryFrequency</code> 为首个声明周期的兼容字段；调度、执行时钟和绩效年化使用 <code>drivingFrequency</code>。
+- <code>data.history(..., frequency="4h")</code>、<code>data.current(..., frequency="4h")</code>、<code>indicator(..., frequency="4h")</code> 和 <code>factor(..., frequency="4h")</code> 同样支持显式周期。<code>data[symbol]</code> 默认使用驱动周期。
+
+专业实践上，建议用高周期过滤趋势、低周期确认入场，并让下单条件保持幂等。因为 <code>handle_data</code> 按最细周期运行，不能把“日线多头”直接写成每小时无条件加仓。
+
+AI 生成策略同样遵守这份契约：用户明确给出多个周期时，生成和修复流程必须保留全部订阅，不能只挑一个周期、用最低周期自行重采样，或把全部历史读取改写成驱动周期。
 
 ---
 
@@ -285,6 +335,7 @@ def initialize(context):
 - <code>get_history</code>、<code>data.current</code>、<code>data.history</code> 和指标函数看到的最后一行必须是已经完成的 K 线。实时成交价或 mark price 不能回写、覆盖或延长这根 K 线的 OHLC。
 - 均线、突破、形态、因子和其他入场/加仓信号只能根据已完成 K 线计算，保证回测、实盘和重启重放具有相同语义。
 - 实时价格仅供止损、止盈、追踪止损和权益风控使用；它不能把一根尚未收盘的 K 线伪装成完成 bar，也不能改变已经确认的策略信号。
+- 多周期策略对每个周期分别执行已完成 K 线约束；低周期推进不会提前暴露仍在形成中的 4 小时线或日线。
 - 如果产品以后提供独立的逐 tick 策略契约，应使用单独的 API、回测模型和文档；不要在普通 Strategy API V2 源码中自行模拟。
 
 ---
@@ -304,7 +355,7 @@ def initialize(context):
 | <code>context.portfolio.positions</code> | 当前持仓字典 |
 | <code>context.data</code> | 数据视图 |
 
-<code>data.current(symbol, field)</code> 读取当前可见值；<code>data.history(symbols, count, fields)</code> 读取历史；<code>data[symbol]</code> 返回当前可见 DataFrame。
+<code>data.current(symbol, field, frequency="1h")</code> 读取当前可见值；<code>data.history(symbols, count, fields, frequency="4h")</code> 读取指定周期历史；<code>data[symbol]</code> 返回驱动周期的当前可见 DataFrame。
 
 跨回调状态放在 <code>g</code>：
 
@@ -869,6 +920,9 @@ def rebalance(context, data):
 | <code>strategyV2.leverageNotAllowed</code> | 面板开了源码未许可的杠杆 | 源码合法许可或关闭杠杆 |
 | <code>strategyV2.leverageExceedsStrategyLimit</code> | 请求杠杆超过上限 | 降低请求值 |
 | <code>strategyV2.dataUnavailable:...</code> | 标的没有可用数据 | 检查规范标的和数据范围 |
+| <code>strategyV2.frequencyUnsupported:...</code> | 声明了运行时不支持的周期 | 改用第 6 节列出的原生周期 |
+| <code>strategyV2.tooManyFrequencies:8</code> | 策略声明超过 8 个周期 | 删除非必需订阅 |
+| <code>strategyV2.frequencyNotSubscribed:...</code> | 代码读取了未订阅周期 | 在 <code>initialize</code> 中声明该周期或修正调用 |
 | <code>strategyV2.noMarketData</code> | 实盘周期没有可用行情帧 | 检查标的、数据源、连接和订阅周期 |
 | <code>strategyV2.initializeParamsUnavailable</code> | 在清单发现阶段读取参数 | 把读取移到处理器 |
 | <code>strategyV2.directionModeViolation:...</code> | 开仓方向超出声明能力 | 修正 metadata 或信号方向；平仓仍允许 |

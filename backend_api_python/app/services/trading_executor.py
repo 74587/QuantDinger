@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,12 +12,15 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import pandas as pd
 
 from app.data_sources import DataSourceFactory
-from app.services.fundamental_data import get_fundamental_data_service
 from app.services.script_source import get_script_source_service
 from app.services.strategy_runtime.health import record_runtime_heartbeat
 from app.services.strategy_runtime.identity import ensure_strategy_run, finish_strategy_run
 from app.services.strategy_runtime.order_intents import OrderIntentService
 from app.services.strategy_runtime.state import RuntimeStateStore
+from app.services.strategy_runtime.timeframes import (
+    live_history_days,
+    load_live_frequency_frames,
+)
 from app.services.strategy_v2 import (
     OrderIntent,
     StrategyV2BacktestService,
@@ -37,24 +38,13 @@ from app.utils.thread_capacity import format_thread_capacity
 logger = get_logger(__name__)
 
 MIN_LIVE_ORDER_NOTIONAL = 1.0
+__all__ = ["TradingExecutor", "live_history_days"]
 
 
 def _runtime_position_key(symbol: object, position_side: object = "") -> str:
     base = str(symbol or "")
     side = str(position_side or "").strip().lower()
     return f"{base}::{side}" if side in {"long", "short"} else base
-
-
-def live_history_days(frequency: str, warmup_bars: int) -> int:
-    """Return a frequency-aware live lookback with a small startup buffer."""
-    value = str(frequency or "1d").strip().lower()
-    match = re.fullmatch(r"(\d+)\s*(m|h|d|w)", value)
-    if not match:
-        return 30
-    count = max(1, int(match.group(1)))
-    unit_seconds = {"m": 60, "h": 3600, "d": 86400, "w": 604800}[match.group(2)]
-    bars = max(10, max(1, int(warmup_bars or 0)) * 3)
-    return max(1, int(math.ceil(count * unit_seconds * bars / 86400)))
 
 
 class TradingExecutor:
@@ -364,37 +354,20 @@ class TradingExecutor:
                         member["exchange_id"] = account_exchange
                         member["key"] = _member_key(member)
 
-            frequency = program.manifest.primary_frequency
-            history_days = live_history_days(
-                frequency,
-                int(program.manifest.warmup_bars or 0),
-            )
+            frequency = program.manifest.driving_frequency
 
-            def fetch_frames() -> dict[str, pd.DataFrame]:
-                end = datetime.now(timezone.utc)
-                frames, skipped = service.fetch_frames(
-                    candidates,
-                    frequency,
-                    end - timedelta(days=history_days),
-                    end,
-                )
-                if skipped:
-                    details = ", ".join(
-                        f"{item.get('symbol') or '?'}:{item.get('reason') or 'unavailable'}"
-                        for item in skipped[:5]
-                    )
-                    suffix = f" ({details})" if details else ""
-                    append_strategy_log(
+            def fetch_runtime_frames() -> dict[str, dict[str, pd.DataFrame]]:
+                return load_live_frequency_frames(
+                    service=service,
+                    candidates=candidates,
+                    manifest=program.manifest,
+                    end_date=datetime.now(timezone.utc),
+                    warn=lambda message: append_strategy_log(
                         strategy_id,
                         "warning",
-                        f"Skipped {len(skipped)} instrument(s) without usable market data{suffix}",
-                    )
-                if program.manifest.fundamental_dependencies:
-                    frames = get_fundamental_data_service().enrich_panel(frames, candidates)
-                    service.validate_fundamental_dependencies(frames, program.manifest)
-                if not frames:
-                    raise RuntimeError("strategyV2.noMarketData")
-                return frames
+                        message,
+                    ),
+                )
 
             def resolve_universe(reference: str, timestamp: pd.Timestamp) -> list[str]:
                 del reference
@@ -407,7 +380,8 @@ class TradingExecutor:
                 )
                 return [_member_key(item) for item in members]
 
-            frames = fetch_frames()
+            frequency_frames = fetch_runtime_frames()
+            frames = frequency_frames[frequency]
             runtime_price_client: Dict[str, Any] = {}
 
             def runtime_prices() -> dict[str, float]:
@@ -433,6 +407,7 @@ class TradingExecutor:
             session = StrategyV2LiveSession(
                 code=code,
                 frames=frames,
+                frequency_frames=frequency_frames,
                 initial_capital=initial_capital,
                 params=runtime_params,
                 universe_resolver=resolve_universe,
@@ -718,8 +693,12 @@ class TradingExecutor:
                     # driven through ``session.process(frames)`` below.
                     pending_count = len(equity_intents) + len(protection_intents)
                     if not equity_stop_reason and cycle_started >= next_signal_poll:
-                        frames = fetch_frames()
-                        intents, messages, timestamp = session.process(frames)
+                        frequency_frames = fetch_runtime_frames()
+                        frames = frequency_frames[frequency]
+                        intents, messages, timestamp = session.process(
+                            frames,
+                            frequency_frames=frequency_frames,
+                        )
                         intents = [
                             intent
                             for intent in intents

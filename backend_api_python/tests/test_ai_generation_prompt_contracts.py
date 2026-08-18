@@ -71,6 +71,33 @@ def test_strategy_generation_prompt_documents_parameter_discovery_boundary():
     assert "initial capital, date range, commission, or slippage" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
 
 
+def test_strategy_generation_prompt_preserves_native_multi_timeframes():
+    for frequency in ("5m", "15m", "30m", "1h", "4h", "1d", "1w"):
+        assert f"`{frequency}`" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "preserve every one of them" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "never collapse `1d + 4h + 1h`" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "fastest subscribed timeframe drives" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "monthly bars are not part" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "Do not collapse, resample" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
+
+
+def test_ai_robot_recommendation_accepts_weekly_as_one_native_execution_frame():
+    from app.services.strategy_bot_recommend import _normalize_recommendation
+
+    result = _normalize_recommendation(
+        {
+            "botType": "grid",
+            "baseConfig": {"marketCategory": "Crypto", "timeframe": "1W"},
+            "strategyParams": {},
+            "riskConfig": {},
+        },
+        "Crypto",
+        "BTC/USDT",
+    )
+
+    assert result["baseConfig"]["timeframe"] == "1w"
+
+
 def test_indicator_prompt_remains_chart_only():
     assert "chart indicator is visual analysis code only" in INDICATOR_SYSTEM_CONTRACT
     assert "must not open, close, size, backtest, or live trade" in INDICATOR_SYSTEM_CONTRACT

@@ -180,7 +180,8 @@ def _bot_recommend_system_prompt(detected_market: str, allowed_bots: list[str]) 
         "Also suggest base config:\n"
         f"- marketCategory: 'Crypto'|'USStock'|'Forex' (must match the detected market: '{detected_market or 'Crypto'}')\n"
         "- symbol: string\n"
-        "- timeframe: '1m'|'5m'|'15m'|'1h'|'4h'|'1d'\n"
+        "- timeframe: one execution timeframe from '1m'|'3m'|'5m'|'15m'|'30m'|'1h'|'4h'|'1d'|'1w' "
+        "(visual robots are single-timeframe; executable script strategies may subscribe to several)\n"
         "- marketType: 'swap'|'spot' (USStock and Forex are always 'spot')\n"
         "- leverage: int(1-125, only for swap; ignored on spot/USStock/Forex)\n"
         f"- initialCapital: number (in {quote_label})\n\n"
@@ -216,6 +217,9 @@ def _normalize_recommendation(result: Dict[str, Any], detected_market: str, dete
         base_cfg["leverage"] = 1
     if detected_symbol:
         base_cfg["symbol"] = detected_symbol
+    timeframe = str(base_cfg.get("timeframe") or "").strip().lower()
+    native_timeframes = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}
+    base_cfg["timeframe"] = timeframe if timeframe in native_timeframes else "1h"
     result["baseConfig"] = base_cfg
 
     params = result.get("strategyParams") if isinstance(result.get("strategyParams"), dict) else {}

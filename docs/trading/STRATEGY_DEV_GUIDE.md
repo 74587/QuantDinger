@@ -5,7 +5,7 @@
 
 QuantDinger has one current executable Python strategy contract: **Strategy API V2**. The same source compiles into a strategy manifest used by backtest and live runtimes for instruments, subscriptions, events, order intents, portfolio accounting, and protection rules.
 
-The source owns its market, instruments, frequency, schedules, and trading logic. Run forms provide dates, initial capital, costs, source-permitted leverage, and user parameters; they do not override source-controlled markets, symbols, or timeframes.
+The source owns its market, instruments, one or more timeframes, schedules, and trading logic. Run forms provide dates, initial capital, costs, source-permitted leverage, and user parameters; they do not override source-controlled markets, symbols, or timeframes.
 
 Chart indicators are separate artifacts. Their plots, signals, and layers cannot place orders. Convert an indicator into Strategy API V2 before backtesting or deploying it.
 
@@ -116,7 +116,7 @@ Compilation discovers:
 - API version and source hash;
 - CTA or portfolio classification;
 - static or dynamic universe;
-- subscribed instruments, frequency, and fields;
+- subscribed instruments, all timeframes, the driving timeframe, and fields;
 - schedules;
 - benchmark;
 - lifecycle handlers;
@@ -215,7 +215,57 @@ Rules:
 - Omitting symbols subscribes the current universe.
 - <code>set_warmup</code> asks the data service for history before the requested backtest start. It does not remove the need for <code>len(bars)</code> guards.
 - A benchmark is for comparison; it is not traded automatically.
-- The <code>get_history</code> frequency argument is API-compatible metadata. The current runtime reads subscribed frames, so request the same frequency the source subscribes.
+- A source may declare at most eight distinct timeframes. Native timeframes are <code>1m</code>, <code>3m</code>, <code>5m</code>, <code>15m</code>, <code>30m</code>, <code>1h</code>, <code>4h</code>, <code>1d</code>, and <code>1w</code>.
+- Five-, fifteen-, and thirty-minute bars can be combined with hourly, daily, and weekly bars in one source. Use lowercase <code>1w</code> for weekly data. Monthly bars are not currently a native Strategy API V2 timeframe.
+
+### 6.1 Native multi-timeframe data
+
+A strategy may subscribe to and read several independently loaded timeframes. The runtime does not build higher bars ad hoc from the driving frame:
+
+~~~python
+def initialize(context):
+    g.symbol = "Crypto:BTC/USDT@swap"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1h")
+    context.subscribe(frequency="4h")
+    context.subscribe(frequency="1d")
+    context.set_warmup(220)
+
+
+def handle_data(context, data):
+    bars_1h = get_history(50, "1h", "close", g.symbol)
+    bars_4h = get_history(50, "4h", "close", g.symbol)
+    bars_1d = get_history(50, "1d", "close", g.symbol)
+    if min(len(bars_1h), len(bars_4h), len(bars_1d)) < 50:
+        return
+
+    trigger = float(bars_1h["close"].iloc[-1]) > float(
+        bars_1h["close"].tail(20).mean()
+    )
+    trend_4h = float(bars_4h["close"].tail(20).mean()) > float(
+        bars_4h["close"].tail(50).mean()
+    )
+    trend_1d = float(bars_1d["close"].tail(20).mean()) > float(
+        bars_1d["close"].tail(50).mean()
+    )
+    target = 0.95 if trigger and trend_4h and trend_1d else 0.0
+    order_target_percent(g.symbol, target, reason="mtf_trend_alignment")
+~~~
+
+Multi-timeframe runtime rules:
+
+- The fastest subscribed timeframe becomes <code>drivingFrequency</code>. The example runs <code>handle_data</code> once per completed one-hour bar; declaration order does not change the driving timeframe.
+- <code>get_history(..., frequency, ...)</code> routes to that timeframe's independent frame. Requesting an unsubscribed timeframe raises <code>strategyV2.frequencyNotSubscribed</code> instead of silently falling back.
+- A higher-timeframe bar becomes visible only when its close is no later than the driving bar's close. For example, a four-hour bar opened at 08:00 cannot affect a signal until 12:00.
+- <code>set_warmup(n)</code> requests an appropriate lookback for every subscribed timeframe. The source must still guard the length of every returned DataFrame.
+- The requested backtest window must satisfy every timeframe's provider limit. An instrument missing any required timeframe is not run with a partial bundle.
+- Provider history limits still apply independently. Intraday feeds often retain less history than daily or weekly feeds, so a <code>5m + 1w</code> design may need a shorter backtest range even though both subscriptions are valid. Crypto venues, stock feeds, and forex feeds may expose different historical depths.
+- Manifest <code>primaryFrequency</code> remains the first declaration for compatibility. Scheduling, execution, and performance annualization use <code>drivingFrequency</code>.
+- <code>data.history(..., frequency="4h")</code>, <code>data.current(..., frequency="4h")</code>, <code>indicator(..., frequency="4h")</code>, and <code>factor(..., frequency="4h")</code> also accept an explicit timeframe. <code>data[symbol]</code> uses the driving timeframe.
+
+A robust design usually filters trend on higher timeframes, confirms entries on the driving timeframe, and keeps orders idempotent. Because <code>handle_data</code> runs on the fastest timeframe, a daily bullish state must not become an unconditional hourly scale-in.
+
+AI-generated strategy source follows the same contract: when a request names several timeframes, generation and repair must preserve every requested subscription rather than selecting one, resampling the lowest frame, or rewriting all history reads to the driver.
 
 ---
 
@@ -283,6 +333,7 @@ Live sessions process each closed bar once and preserve <code>g</code> state whi
 - The final row exposed by <code>get_history</code>, <code>data.current</code>, <code>data.history</code>, and indicator functions must be a completed bar. A real-time trade or mark price must not rewrite, overwrite, or extend that bar's OHLC.
 - Moving averages, breakouts, patterns, factors, and all other entry or scale-in signals must use completed bars so backtests, live runs, and restart replay share the same semantics.
 - Real-time prices are reserved for stop loss, take profit, trailing protection, and equity risk. They must not make an unfinished candle look complete or revise a confirmed strategy signal.
+- Multi-timeframe strategies apply the completed-bar rule separately to every timeframe. A lower-timeframe advance never exposes a still-forming four-hour or daily bar.
 - A future tick-driven strategy product needs a separate API, replay model, and contract. Do not simulate it inside ordinary Strategy API V2 source.
 
 ---
@@ -302,7 +353,7 @@ Common context fields:
 | <code>context.portfolio.positions</code> | current position map |
 | <code>context.data</code> | data view |
 
-Use <code>data.current(symbol, field)</code> for a current visible value, <code>data.history(symbols, count, fields)</code> for history, and <code>data[symbol]</code> for its current visible DataFrame.
+Use <code>data.current(symbol, field, frequency="1h")</code> for a current visible value, <code>data.history(symbols, count, fields, frequency="4h")</code> for a selected timeframe, and <code>data[symbol]</code> for the driving timeframe's current visible DataFrame.
 
 Persist state across callbacks on <code>g</code>:
 
@@ -865,6 +916,9 @@ Allowed import roots are <code>numpy</code>, <code>pandas</code>, <code>math</co
 | <code>strategyV2.leverageNotAllowed</code> | run requests unpermitted leverage | permit it legally or disable it |
 | <code>strategyV2.leverageExceedsStrategyLimit</code> | requested leverage too high | lower the request |
 | <code>strategyV2.dataUnavailable:...</code> | instrument data unavailable | check canonical symbol and range |
+| <code>strategyV2.frequencyUnsupported:...</code> | source declares an unsupported timeframe | use a native timeframe listed in Section 6 |
+| <code>strategyV2.tooManyFrequencies:8</code> | source declares more than eight timeframes | remove unnecessary subscriptions |
+| <code>strategyV2.frequencyNotSubscribed:...</code> | source reads an undeclared timeframe | subscribe it in <code>initialize</code> or correct the call |
 | <code>strategyV2.noMarketData</code> | live cycle has no usable frame | verify symbol, source, connection, and subscribed timeframe |
 | <code>strategyV2.initializeParamsUnavailable</code> | params read during discovery | move the read to a handler |
 | <code>strategyV2.directionModeViolation:...</code> | entry exceeds declared direction | fix metadata or signal direction; exits remain allowed |

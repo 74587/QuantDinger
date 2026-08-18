@@ -21,6 +21,7 @@ from app.services.factors import (
 )
 from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strategy_v2
 from .data import MultiAssetDataPortal
+from .frequencies import normalize_frequency
 from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, ProtectionState
 
 
@@ -139,11 +140,25 @@ class StrategyDataView:
     def __init__(self, portal: MultiAssetDataPortal):
         self.portal = portal
 
-    def history(self, symbols: object, count: int, fields: object = None, **_: Any):
-        return self.portal.history(symbols, count=count, fields=fields)
+    def history(
+        self,
+        symbols: object,
+        count: int,
+        fields: object = None,
+        *,
+        frequency: object = None,
+        **_: Any,
+    ):
+        return self.portal.history(symbols, count=count, fields=fields, frequency=frequency)
 
-    def current(self, symbol: object, field: str = "close") -> float:
-        return self.portal.current(symbol, field)
+    def current(
+        self,
+        symbol: object,
+        field: str = "close",
+        *,
+        frequency: object = None,
+    ) -> float:
+        return self.portal.current(symbol, field, frequency=frequency)
 
     def __getitem__(self, symbol: object) -> pd.DataFrame:
         return self.portal.visible_frame(symbol)
@@ -323,9 +338,14 @@ class StrategyRuntimeContext:
         security_list: object = None,
         **_: Any,
     ):
-        del frequency
-        symbols = security_list or list(self.portal.frames.keys())
-        return self.portal.history(symbols, count=int(count), fields=field)
+        frames = self.portal.frames_for_frequency(frequency)
+        symbols = security_list or list(frames.keys())
+        return self.portal.history(
+            symbols,
+            count=int(count),
+            fields=field,
+            frequency=frequency,
+        )
 
     def get_index_stocks(self, reference: object, **_: Any) -> list[str]:
         return self.portal.universe(str(reference or ""))
@@ -341,14 +361,24 @@ class StrategyRuntimeContext:
 
     def indicator(self, name: object, symbol: object = None, **params: Any):
         target = symbol or self._default_symbol()
-        frame = self.portal.visible_frame(target)
+        frequency = normalize_frequency(
+            params.pop("frequency", None),
+            self.portal.driving_frequency,
+        )
+        frame = self.portal.visible_frame(target, frequency=frequency)
         library_id = str(name or "").strip()
         if is_talib_available():
             try:
                 return compute_talib_indicator(library_id, frame, params)
             except Exception:
                 pass
-        return self._compute_builtin_indicator(library_id, target, frame, params)
+        return self._compute_builtin_indicator(
+            library_id,
+            target,
+            frame,
+            params,
+            frequency=frequency,
+        )
 
     def _compute_builtin_indicator(
         self,
@@ -356,11 +386,14 @@ class StrategyRuntimeContext:
         target: object,
         frame: pd.DataFrame,
         params: Mapping[str, Any],
+        *,
+        frequency: str,
     ) -> pd.Series | pd.DataFrame:
         factor_id, normalized, outputs = _builtin_indicator_contract(library_id, params)
-        resolved_target = self.portal.resolve_key(target)
+        resolved_target = self.portal.resolve_key(target, frequency=frequency)
         cache_key = (
             resolved_target,
+            frequency,
             factor_id,
             tuple(sorted((str(key), repr(value)) for key, value in normalized.items())),
             tuple(outputs),
@@ -410,7 +443,11 @@ class StrategyRuntimeContext:
 
     def factor(self, name: object, symbol: object = None, **params: Any) -> float:
         target = symbol or self._default_symbol()
-        frame = self.portal.visible_frame(target)
+        frequency = normalize_frequency(
+            params.pop("frequency", None),
+            self.portal.driving_frequency,
+        )
+        frame = self.portal.visible_frame(target, frequency=frequency)
         factor_id = str(name or "").strip()
         try:
             get_factor(factor_id.lower())
@@ -1469,6 +1506,7 @@ class StrategyV2BacktestRunner:
         *,
         code: str,
         frames: Mapping[str, pd.DataFrame],
+        frequency_frames: Mapping[str, Mapping[str, pd.DataFrame]] | None = None,
         initial_capital: float,
         params: Mapping[str, Any] | None = None,
         leverage_enabled: bool = False,
@@ -1483,7 +1521,12 @@ class StrategyV2BacktestRunner:
             raise StrategyV2ContractError("strategyV2.leverageNotAllowed")
         if requested_leverage > self.program.manifest.max_leverage:
             raise StrategyV2ContractError("strategyV2.leverageExceedsStrategyLimit")
-        self.portal = MultiAssetDataPortal(frames, universe_resolver=universe_resolver)
+        self.portal = MultiAssetDataPortal(
+            frames,
+            frequency_frames=frequency_frames,
+            driving_frequency=self.program.manifest.driving_frequency,
+            universe_resolver=universe_resolver,
+        )
         self.broker = MultiAssetSimulationBroker(
             initial_capital=initial_capital,
             leverage=requested_leverage,
@@ -1538,7 +1581,7 @@ class StrategyV2BacktestRunner:
                     schedule,
                     timestamp,
                     previous,
-                    self.program.manifest.primary_frequency,
+                    self.program.manifest.driving_frequency,
                 ):
                     self._invoke(schedule.callback, self.context, self.context.data)
                     pending_orders = self._remove_cancelled_orders(pending_orders)
@@ -1742,7 +1785,7 @@ class StrategyV2BacktestRunner:
         returns = pd.Series(values, dtype="float64").pct_change().dropna() if values else pd.Series(dtype="float64")
         volatility = float(returns.std(ddof=0)) if not returns.empty else 0.0
         periods_per_year = _periods_per_year(
-            self.program.manifest.primary_frequency,
+            self.program.manifest.driving_frequency,
             self.program.manifest.markets,
         )
         sharpe_ratio = float(returns.mean() / volatility * math.sqrt(periods_per_year)) if volatility > 0 else 0.0
@@ -1991,6 +2034,7 @@ class StrategyV2LiveSession:
         *,
         code: str,
         frames: Mapping[str, pd.DataFrame],
+        frequency_frames: Mapping[str, Mapping[str, pd.DataFrame]] | None = None,
         initial_capital: float,
         params: Mapping[str, Any] | None = None,
         universe_resolver=None,
@@ -1998,7 +2042,12 @@ class StrategyV2LiveSession:
     ) -> None:
         self.program = compile_strategy_v2(code)
         self._universe_resolver = universe_resolver
-        self.portal = MultiAssetDataPortal(frames, universe_resolver=universe_resolver)
+        self.portal = MultiAssetDataPortal(
+            frames,
+            frequency_frames=frequency_frames,
+            driving_frequency=self.program.manifest.driving_frequency,
+            universe_resolver=universe_resolver,
+        )
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
         self.context = StrategyRuntimeContext(portal=self.portal, portfolio=self.portfolio, params=params)
         self.persist_strategy_state = (
@@ -2018,9 +2067,15 @@ class StrategyV2LiveSession:
         self,
         frames: Mapping[str, pd.DataFrame],
         *,
+        frequency_frames: Mapping[str, Mapping[str, pd.DataFrame]] | None = None,
         schedule_time: Any = None,
     ) -> tuple[list[OrderIntent], list[str], pd.Timestamp]:
-        portal = MultiAssetDataPortal(frames, universe_resolver=self._universe_resolver)
+        portal = MultiAssetDataPortal(
+            frames,
+            frequency_frames=frequency_frames,
+            driving_frequency=self.program.manifest.driving_frequency,
+            universe_resolver=self._universe_resolver,
+        )
         if portal.timestamps.empty:
             raise StrategyV2ContractError("strategyV2.noMarketData")
         timestamp = pd.Timestamp(portal.timestamps[-1])
