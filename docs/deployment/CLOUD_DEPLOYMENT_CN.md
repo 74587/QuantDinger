@@ -87,7 +87,7 @@ DB_PORT=127.0.0.1:5432
 REDIS_PORT=127.0.0.1:6379
 
 # 固定版本，避免一直使用 latest，例如：
-# IMAGE_TAG=5.0.1
+# IMAGE_TAG=5.0.18
 
 # postgres/redis 拉取慢时可设置 Docker Hub 镜像前缀：
 # IMAGE_PREFIX=docker.m.daocloud.io/library/

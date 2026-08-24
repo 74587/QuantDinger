@@ -1,4 +1,4 @@
-# 📧 Email SMTP Notification Configuration Guide
+# Email SMTP Notification Configuration Guide
 
 > QuantDinger supports strategy signal notifications via email, ideal for users who need detailed notification records.
 

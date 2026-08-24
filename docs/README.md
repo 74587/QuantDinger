@@ -1,68 +1,115 @@
 # QuantDinger Documentation
 
-This directory contains maintained documentation for the current QuantDinger
-release. Start with the [project README](../README.md) or the
-[Chinese project README](README_CN.md).
+QuantDinger is a self-hosted AI trading platform that connects market research,
+Strategy API V2 development, backtesting, paper/live execution, operations, and
+AI-agent access. This documentation describes the current v5 release.
 
-## Architecture and contracts
+[中文文档](README_CN.md) · [Official website](https://quantdinger.com) ·
+[Web app](https://ai.quantdinger.com) · [GitHub](https://github.com/OpenByteInc/QuantDinger)
 
-| Document | Purpose |
+> Live trading can submit real orders. Start in paper mode, grant exchange keys
+> the minimum permissions required, and confirm the legal and operational
+> requirements for your jurisdiction. QuantDinger does not provide investment
+> advice.
+
+## Choose your goal
+
+| Goal | Start here | Continue with |
+| --- | --- | --- |
+| Install QuantDinger | [Cloud deployment](deployment/CLOUD_DEPLOYMENT_EN.md) | [Installation troubleshooting](deployment/INSTALL_TROUBLESHOOTING.md) |
+| Prepare production | [Production hardening](deployment/PRODUCTION_HARDENING.md) | [Observability](deployment/OBSERVABILITY.md) |
+| Develop a strategy | [Strategy API V2 guide](trading/STRATEGY_DEV_GUIDE.md) | [Indicator guide](trading/INDICATOR_DEV_GUIDE.md) |
+| Connect an AI agent | [MCP setup](agent/MCP_SETUP.md) | [Agent Gateway quickstart](agent/AGENT_QUICKSTART.md) |
+| Integrate over HTTP | [Human OpenAPI](api/README.md) | [API conventions](architecture/API_CONVENTIONS.md) |
+| Extend the backend | [Architecture overview](architecture/README.md) | [Extension guide](architecture/EXTENSION_GUIDE.md) |
+
+## Five-minute installation
+
+Prerequisites: Docker with Compose v2. The installer asks for an administrator
+account, generates the required secrets, writes the deployment environment, and
+starts the prebuilt GHCR stack.
+
+Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OpenByteInc/QuantDinger/main/install.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/OpenByteInc/QuantDinger/main/install.ps1 | iex
+```
+
+After startup:
+
+| Surface | Default local address |
 | --- | --- |
-| [Architecture](architecture/ARCHITECTURE.md) | Backend ownership map and contributor design rules. |
-| [Module boundaries](architecture/MODULE_BOUNDARIES.md) | Dependency direction and package responsibilities. |
-| [Concurrency model](architecture/CONCURRENCY_MODEL.md) | Database, worker, and thread ownership rules. |
-| [Process roles](architecture/PROCESS_ROLES_AND_TASKS.md) | API, trading, scheduler, Celery, and migration boundaries. |
-| [API conventions](architecture/API_CONVENTIONS.md) | Human API envelopes, authentication, and stability classes. |
-| [Extension guide](architecture/EXTENSION_GUIDE.md) | How to add routes, services, adapters, and tasks safely. |
+| Desktop web app | `http://127.0.0.1:8888` |
+| Mobile web app | `http://127.0.0.1:8889` |
+| Backend health check | `http://127.0.0.1:5000/api/health` |
 
-## Deployment and operations
+For source builds, reverse proxies, HTTPS, upgrades, and proxy settings, use the
+[cloud deployment guide](deployment/CLOUD_DEPLOYMENT_EN.md).
 
-| Document | Purpose |
+## System map
+
+The v5 runtime separates long-lived ownership from request handling:
+
+| Process | Responsibility |
 | --- | --- |
-| [Production hardening](deployment/PRODUCTION_HARDENING.md) | Locked runtime and production preflight. |
-| [Observability](deployment/OBSERVABILITY.md) | Prometheus, Grafana, Alertmanager, and exporters. |
-| [Installation troubleshooting](deployment/INSTALL_TROUBLESHOOTING.md) | Docker, mirrors, ports, and PostgreSQL problems. |
-| [Cloud deployment (English)](deployment/CLOUD_DEPLOYMENT_EN.md) | Reverse proxy and cloud deployment. |
-| [云部署（中文）](deployment/CLOUD_DEPLOYMENT_CN.md) | 反向代理与云部署。 |
-| [Multi-user setup](deployment/MULTI_USER_SETUP.md) | Roles and multi-user deployment. |
-| [OAuth (English)](deployment/OAUTH_CONFIG_EN.md) | Google and GitHub OAuth configuration. |
-| [OAuth（中文）](deployment/OAUTH_CONFIG_CN.md) | Google 与 GitHub OAuth 配置。 |
-| [USDT payment](deployment/USDT_PAYMENT_GUIDE.md) | Optional USDT billing configuration. |
+| `migration` | Applies database schema changes before dependent services start. |
+| `backend` | HTTP authentication, validation, queries, and durable command submission. |
+| `trading-worker` | Strategy runtimes, broker sessions, orders, leases, and reconciliation. |
+| `scheduler-worker` | Portfolio, deployment, payment, and notification schedules. |
+| `celery-worker` | Finite retryable work such as AI jobs, backtests, reports, and maintenance. |
+| `celery-beat` | Periodically enqueues Celery work. |
 
-Notification configuration:
+PostgreSQL is the system of record. `redis` is an evictable cache;
+`redis-jobs` is the durable Celery broker/result tier. See the
+[architecture overview](architecture/README.md) before changing process
+ownership or shared state.
 
-- [Email (English)](deployment/NOTIFICATION_EMAIL_CONFIG_EN.md) /
-  [邮件（中文）](deployment/NOTIFICATION_EMAIL_CONFIG_CN.md)
-- [SMS (English)](deployment/NOTIFICATION_SMS_CONFIG_EN.md) /
-  [短信（中文）](deployment/NOTIFICATION_SMS_CONFIG_CN.md)
-- [Telegram (English)](deployment/NOTIFICATION_TELEGRAM_CONFIG_EN.md) /
-  [Telegram（中文）](deployment/NOTIFICATION_TELEGRAM_CONFIG_CN.md)
+## Documentation map
 
-## Trading and research
+### Deployment and operations
 
-| Document | Purpose |
-| --- | --- |
-| [Indicator guide](trading/INDICATOR_DEV_GUIDE.md) | Chart-only Python indicator contract. |
-| [指标指南](trading/INDICATOR_DEV_GUIDE_CN.md) | 图表指标开发契约。 |
-| [Strategy guide](trading/STRATEGY_DEV_GUIDE.md) | Strategy API V2, risk, backtest, and live execution. |
-| [策略指南](trading/STRATEGY_DEV_GUIDE_CN.md) | 脚本策略、风控、回测与实盘。 |
-| [Public universes and fundamentals](trading/PUBLIC_UNIVERSE_AND_FUNDAMENTALS_CN.md) | 股票池来源、时点数据和已知限制。 |
-| [IBKR guide](trading/IBKR_TRADING_GUIDE_EN.md) | IBKR connectivity and trading workflow. |
+- [Cloud deployment](deployment/CLOUD_DEPLOYMENT_EN.md)
+- [Installation troubleshooting](deployment/INSTALL_TROUBLESHOOTING.md)
+- [Production hardening](deployment/PRODUCTION_HARDENING.md)
+- [Observability](deployment/OBSERVABILITY.md)
+- [Multi-user operation](deployment/MULTI_USER_SETUP.md)
+- [OAuth configuration](deployment/OAUTH_CONFIG_EN.md)
+- [Administrator and settings troubleshooting](deployment/ADMIN_AND_SETTINGS_TROUBLESHOOTING_EN.md)
+- Notifications: [Email](deployment/NOTIFICATION_EMAIL_CONFIG_EN.md),
+  [SMS](deployment/NOTIFICATION_SMS_CONFIG_EN.md), and
+  [Telegram](deployment/NOTIFICATION_TELEGRAM_CONFIG_EN.md)
 
-Runnable examples are in [`examples/`](examples/).
+### Trading and research
 
-## API and AI agents
+- [Strategy API V2 development](trading/STRATEGY_DEV_GUIDE.md)
+- [Chart indicator development](trading/INDICATOR_DEV_GUIDE.md)
+- [Interactive Brokers](trading/IBKR_TRADING_GUIDE_EN.md)
+- Runnable examples in [`examples/`](examples/)
 
-- [`api/`](api/) contains the generated human OpenAPI contract and ReDoc viewer.
-- [`agent/`](agent/) contains Agent Gateway, MCP, security, and integration docs.
-- [`mcp_server/`](../mcp_server/) contains the standalone MCP package.
+### APIs and agents
 
-## Maintenance policy
+- [Human Web API and OpenAPI](api/README.md)
+- [Agent documentation](agent/README.md)
+- [MCP setup](agent/MCP_SETUP.md)
+- [Agent Gateway quickstart](agent/AGENT_QUICKSTART.md)
+- Machine-readable contracts:
+  [`api/openapi.yaml`](api/openapi.yaml) and
+  [`agent/agent-openapi.json`](agent/agent-openapi.json)
 
-- Keep one maintained document for each operational or architectural concern.
-- Put implementation decisions in architecture or contract documents, not in
-  one-off planning files.
-- Do not commit temporary audits, validation snapshots, generated screenshots,
-  or completed roadmaps. Git history already preserves them.
-- Update links and the relevant index in the same change when a document moves.
-- Keep generated OpenAPI artifacts committed because CI checks them.
+## Language and maintenance policy
+
+Each human-readable page uses one primary language. English and Chinese pages
+are paired when both are maintained; the website language switch links directly
+to the paired page. Machine-readable schemas, identifiers, environment variable
+names, and code remain in their canonical English form.
+
+The repository `docs/` directory is the source of truth. Update the relevant
+index and counterpart language page when a contract or workflow changes. Do not
+publish planning notes, completed roadmaps, or temporary audits as product
+documentation.

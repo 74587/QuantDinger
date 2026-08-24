@@ -1,6 +1,6 @@
-# USDT 支付配置指南（v3.0.6+）
+# USDT 支付配置指南
 
-本文档面向运营人员，目标是 30 分钟内把 USDT 收款打通到生产环境。
+本文档描述 QuantDinger v5 当前的 USDT 收款流程，面向需要完成生产配置与验收的运营人员。
 
 > **核心机制**：所有用户付到**同一个主钱包地址**，订单通过「**金额尾数**」识别（base 价格 + 一个不超过 0.01 USDT 的小尾数）。**不再有派生地址，不再需要归集**。
 
@@ -101,7 +101,7 @@ USDT_WORKER_POLL_INTERVAL=30
 
 ```bash
 # 看后端 worker 日志
-docker compose logs -f api | grep -E "UsdtOrderWorker|USDT reconcile|USDT order"
+docker compose logs -f backend | grep -E "UsdtOrderWorker|USDT reconcile|USDT order"
 
 # 直接 ping API（带登录 Cookie 或 Bearer Token）
 curl -H "Authorization: Bearer <token>" http://localhost:5000/api/billing/usdt/chains

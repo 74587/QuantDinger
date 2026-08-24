@@ -1,4 +1,4 @@
-# 📱 Telegram Notification Configuration Guide
+# Telegram Notification Configuration Guide
 
 > QuantDinger supports real-time strategy signal notifications via Telegram Bot.
 

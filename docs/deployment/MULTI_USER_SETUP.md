@@ -1,213 +1,75 @@
-# Multi-User System Setup Guide
+# Multi-User Operation
 
-This guide explains how to configure QuantDinger for multi-user mode with PostgreSQL database.
+QuantDinger v5 uses PostgreSQL-backed users by default. `SINGLE_USER_MODE` is a
+legacy compatibility option and should remain `false` for a normal deployment.
 
-## Architecture Overview
+[中文](MULTI_USER_SETUP_CN.md)
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│    Frontend     │────▶│  Backend API    │────▶│   PostgreSQL    │
-│  (Vue.js)       │     │   (Flask)       │     │   Database      │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                               │
-                        ┌──────┴──────┐
-                        │ User Auth   │
-                        │ JWT Token   │
-                        │ Role-based  │
-                        │ Access      │
-                        └─────────────┘
-```
+## Initial setup
 
-## Quick Start (Docker)
+The recommended installers prompt for the initial administrator and write the
+required environment files. For a source deployment, set at least:
 
-### 1. Update docker-compose.yml
+```text
+# .env
+POSTGRES_PASSWORD=<strong unique password>
 
-The new `docker-compose.yml` already includes PostgreSQL. Just set the password:
-
-```bash
-# Create .env file in project root
-cat > .env << EOF
-POSTGRES_USER=quantdinger
-POSTGRES_PASSWORD=your_secure_password_here
-POSTGRES_DB=quantdinger
-EOF
-```
-
-### 2. Start Services
-
-```bash
-docker-compose up -d
-```
-
-This will:
-- Start PostgreSQL database
-- Initialize schema automatically (via `init.sql`)
-- Start backend API connected to PostgreSQL
-- Start frontend
-
-### 3. Default Credentials
-
-- **Username**: `admin`
-- **Password**: `admin123`
-
-**Important**: Change the admin password immediately after first login!
-
-## Manual Setup (Development)
-
-### 1. Install PostgreSQL
-
-```bash
-# Ubuntu/Debian
-sudo apt install postgresql postgresql-contrib
-
-# macOS
-brew install postgresql
-
-# Windows
-# Download from https://www.postgresql.org/download/windows/
-```
-
-### 2. Create Database
-
-```bash
-# Connect to PostgreSQL
-sudo -u postgres psql
-
-# Create database and user
-CREATE DATABASE quantdinger;
-CREATE USER quantdinger WITH ENCRYPTED PASSWORD 'your_password';
-GRANT ALL PRIVILEGES ON DATABASE quantdinger TO quantdinger;
-\q
-```
-
-### 3. Initialize Schema
-
-```bash
-# Run init.sql
-psql -U quantdinger -d quantdinger -f backend_api_python/migrations/init.sql
-```
-
-### 4. Configure Backend
-
-Create/update `backend_api_python/.env`:
-
-```bash
-# Database Configuration
-DB_TYPE=postgresql
-DATABASE_URL=postgresql://quantdinger:your_password@localhost:5432/quantdinger
-
-# Disable single-user legacy mode
+# backend_api_python/.env
+ADMIN_USER=<administrator username>
+ADMIN_PASSWORD=<strong unique password>
+SECRET_KEY=<independent random secret>
+CREDENTIAL_ENCRYPTION_KEY=<stable independent encryption key>
 SINGLE_USER_MODE=false
 ```
 
-### 5. Install Dependencies
+Start the stack with `docker compose up -d --build`. PostgreSQL initializes a
+new database from `backend_api_python/migrations/init.sql`; later schema changes
+are applied by the one-shot `migration` service. Do not run `init.sql` manually
+against an existing database.
 
-```bash
-cd backend_api_python
-pip install -r requirements.txt
-```
+## Administrator bootstrap
 
-### 6. Start Backend
+When no user exists, the backend creates the first administrator from
+`ADMIN_USER`, `ADMIN_PASSWORD`, and optional `ADMIN_EMAIL`. The built-in example
+password `123456` is not suitable for deployment; the installers reject it.
 
-```bash
-python run.py
-```
+If an existing database still has the untouched bootstrap administrator, the
+backend can synchronize configured non-default credentials. Use the dedicated
+[administrator troubleshooting guide](ADMIN_AND_SETTINGS_TROUBLESHOOTING_EN.md)
+before editing database rows.
 
-## Migration from SQLite
+## Roles
 
-If you have existing data in SQLite:
+| Role | Intended access |
+| --- | --- |
+| `viewer` | Dashboard and read-only views |
+| `user` | Personal indicators, backtests, strategies, and portfolio |
+| `manager` | User capabilities plus operational settings |
+| `admin` | Full administration, user management, settings, and credentials |
 
-```bash
-# Set environment variables
-export DATABASE_URL=postgresql://quantdinger:your_password@localhost:5432/quantdinger
+The server remains authoritative. Hiding a menu item in the frontend is not an
+authorization control.
 
-# Run migration script
-python scripts/migrate_sqlite_to_postgres.py
-```
+## Current API surfaces
 
-## User Roles & Permissions
+- Authentication: `/api/auth/login`, `/api/auth/logout`, `/api/auth/info`
+- Registration and recovery: `/api/auth/register`, `/api/auth/reset-password`
+- Admin user management: `/api/users/list`, `/api/users/create`,
+  `/api/users/update`, `/api/users/delete`, `/api/users/reset-password`
+- Self-service: `/api/users/profile`, `/api/users/profile/update`,
+  `/api/users/change-password`, and MFA endpoints under `/api/users/mfa/*`
 
-| Role    | Permissions |
-|---------|-------------|
-| admin   | Full access, user management, settings |
-| manager | Strategy, backtest, portfolio, settings |
-| user    | Strategy, backtest, portfolio (own data) |
-| viewer  | View only (dashboard) |
+Use [Human OpenAPI](../api/README.md) for request and response schemas.
 
-## API Endpoints
+## Production checklist
 
-### Authentication
+1. Keep PostgreSQL and Redis on private/loopback networks.
+2. Persist `SECRET_KEY`; changing it invalidates sessions.
+3. Persist `CREDENTIAL_ENCRYPTION_KEY`; changing it can make stored credentials unreadable.
+4. Enable HTTPS before allowing remote login.
+5. Back up PostgreSQL and test restoration.
+6. Review administrator login logs, MFA, user status, and role assignments.
 
-```
-POST /api/user/login       - Login
-POST /api/user/logout      - Logout
-GET  /api/user/info        - Get current user info
-```
-
-### User Management (Admin only)
-
-```
-GET    /api/users/list           - List all users
-GET    /api/users/detail?id=     - Get user detail
-POST   /api/users/create         - Create user
-PUT    /api/users/update?id=     - Update user
-DELETE /api/users/delete?id=     - Delete user
-POST   /api/users/reset-password - Reset user password
-GET    /api/users/roles          - Get available roles
-```
-
-### Self-Service
-
-```
-GET  /api/users/profile         - Get own profile
-PUT  /api/users/profile/update  - Update own profile
-POST /api/users/change-password - Change own password
-```
-
-## Security Recommendations
-
-1. **Change default admin password** immediately
-2. **Use strong passwords** (min 12 characters)
-3. **Enable HTTPS** in production
-4. **Restrict database access** to backend only
-5. **Regular backups** of PostgreSQL data
-
-## Troubleshooting
-
-### Cannot connect to PostgreSQL
-
-```bash
-# Check PostgreSQL is running
-sudo systemctl status postgresql
-
-# Check connection
-psql -U quantdinger -d quantdinger -c "SELECT 1"
-```
-
-### Migration fails
-
-```bash
-# Check SQLite path
-ls -la backend_api_python/data/quantdinger.db
-
-# Check PostgreSQL tables
-psql -U quantdinger -d quantdinger -c "\dt"
-```
-
-### Token invalid after restart
-
-JWT tokens are validated using `SECRET_KEY`. Ensure the same key is used:
-
-```bash
-# Generate a secure key
-python -c "import secrets; print(secrets.token_hex(32))"
-
-# Set in .env
-SECRET_KEY=your_generated_key
-```
-
-## Legacy Support
-
-The system now requires PostgreSQL for multi-user support. SQLite is no longer supported.
-
-If you need to migrate from an older SQLite-based installation, contact the project maintainers for assistance.
+There is no maintained automatic SQLite-to-PostgreSQL migration command in the
+current repository. For a legacy SQLite installation, keep a verified backup
+and plan a controlled data migration instead of running an obsolete script.

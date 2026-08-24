@@ -1,4 +1,4 @@
-# 📱 Telegram 通知配置指南
+# Telegram 通知配置指南
 
 > QuantDinger 支持通过 Telegram Bot 推送策略信号通知，实时获取交易提醒。
 

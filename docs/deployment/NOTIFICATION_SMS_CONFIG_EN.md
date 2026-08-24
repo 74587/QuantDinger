@@ -1,4 +1,4 @@
-# 📲 SMS Notification Configuration Guide
+# SMS Notification Configuration Guide
 
 > QuantDinger supports SMS notifications via Twilio, ensuring you receive critical trading signals anywhere.
 

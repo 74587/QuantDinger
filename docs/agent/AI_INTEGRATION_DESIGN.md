@@ -236,7 +236,7 @@ QuantDinger ships as a **single backend** that intentionally supports two operat
 | Audit visibility | Operator | SaaS operator (you) sees everyone; tenant admins see only their own (already enforced by `user_id` filter in `/admin/audit`) |
 | MCP `BASE_URL` | `http://localhost:8888` (or LAN URL) | `https://ai.quantdinger.com` (or your hosted URL) |
 
-### 8.2 The hosted-mode guard (V3.1.0+)
+### 8.2 The hosted-mode guard
 
 When `QUANTDINGER_DEPLOYMENT_MODE` is a hosted spelling, self-service issuance still excludes C scope and defaults every T token to paper-only. A live-capable T token requires `ack_live_trading_risk=true`, positive per-order and per-day notional caps, and `AGENT_LIVE_TRADING_ENABLED=true`. The emergency stop revokes all tenant T tokens and reports any live exchange order that could not be cancelled.
 

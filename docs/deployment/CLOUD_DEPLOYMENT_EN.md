@@ -87,7 +87,7 @@ DB_PORT=127.0.0.1:5432
 REDIS_PORT=127.0.0.1:6379
 
 # Pin a release instead of floating latest, for example:
-# IMAGE_TAG=5.0.1
+# IMAGE_TAG=5.0.18
 
 # Use a Docker Hub mirror for postgres/redis when needed:
 # IMAGE_PREFIX=docker.m.daocloud.io/library/
