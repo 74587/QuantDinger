@@ -3368,6 +3368,27 @@ paths:
       - Indicator
       operationId: getApiIndicatorGetIndicatorParams
       x-visibility: public
+  /api/indicator/chart-preview:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Return candles, indicator plots, and visual signals without creating
+        a task.
+      tags:
+      - Indicator
+      operationId: postApiIndicatorChartPreview
+      x-visibility: public
   /api/indicator/aiGenerate:
     post:
       responses:
@@ -4254,6 +4275,46 @@ paths:
       tags:
       - Strategy
       operationId: getApiStrategiesPositions
+      x-visibility: internal
+  /api/strategies/position-ownership:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Strategy
+      operationId: getApiStrategiesPositionOwnership
+      summary: Get Api Strategies Position Ownership
+      x-visibility: internal
+  /api/strategies/position-ownership/repair:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Strategy
+      operationId: postApiStrategiesPositionOwnershipRepair
+      summary: Post Api Strategies Position Ownership Repair
       x-visibility: internal
   /api/strategies/review-report:
     post:
