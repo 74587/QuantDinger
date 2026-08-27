@@ -80,8 +80,10 @@ The GHCR backend entrypoint can generate `SECRET_KEY` on first start and write i
 Create an optional project-root `.env` for Compose orchestration:
 
 ```ini
-FRONTEND_PORT=127.0.0.1:8888
-MOBILE_PORT=127.0.0.1:8889
+FRONTEND_HOST=127.0.0.1
+FRONTEND_PORT=8888
+MOBILE_HOST=127.0.0.1
+MOBILE_PORT=8889
 BACKEND_PORT=127.0.0.1:5000
 DB_PORT=127.0.0.1:5432
 REDIS_PORT=127.0.0.1:6379
@@ -100,6 +102,18 @@ docker compose -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.ghcr.yml up -d
 docker compose -f docker-compose.ghcr.yml ps
 ```
+
+### BT Panel Docker plugin and port changes
+
+After BT Panel imports a Compose project, its container detail page usually cannot reliably change ports managed by Compose. Do not edit the port mapping on an already-created container. Update the project-root `.env`, then recreate the affected services:
+
+```bash
+docker compose -f docker-compose.ghcr.yml up -d --force-recreate frontend mobile backend
+```
+
+The `backend` container listening internally on port `5000` is part of the application contract and is expected to remain fixed. `BACKEND_PORT=127.0.0.1:5000` controls only the host binding; frontend containers reach the API through `backend:5000` on the Docker network. To change the user-facing local port, update `FRONTEND_PORT` / `MOBILE_PORT` and recreate the containers.
+
+In production, never publish `5000`, `5432`, or `6379` directly to the internet. Configure the BT Panel Nginx/site reverse proxy to expose only `80/443` and forward to the host-local Web frontend (default `127.0.0.1:8888`); the frontend container continues to proxy API requests internally.
 
 ### Optional: full repository deployment
 

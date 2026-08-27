@@ -9,6 +9,7 @@ from typing import Optional
 import pandas as pd
 
 from app.data_sources import DataSourceFactory
+from app.data_sources.errors import MarketDataUnavailableError
 from app.services.backtest_cache import KlineCache
 from app.utils.logger import get_logger
 
@@ -74,16 +75,24 @@ def load_strategy_frame(
     if cached is not None and not cached.empty:
         return cached.copy()
     try:
-        rows = DataSourceFactory.get_kline(
-            market=market,
-            symbol=symbol,
-            timeframe=provider_timeframe,
-            limit=limit,
-            before_time=before_time,
-            after_time=after_time,
-            exchange_id=exchange_id,
-            market_type=market_type,
-        )
+        kwargs = {
+            "market": market,
+            "symbol": symbol,
+            "timeframe": provider_timeframe,
+            "limit": limit,
+            "before_time": before_time,
+            "after_time": after_time,
+            "exchange_id": exchange_id,
+            "market_type": market_type,
+        }
+        if exchange_id:
+            rows, failure = DataSourceFactory.get_kline_with_diagnostics(**kwargs)
+            if not rows and failure is not None:
+                raise MarketDataUnavailableError(failure)
+        else:
+            rows = DataSourceFactory.get_kline(**kwargs)
+    except MarketDataUnavailableError:
+        raise
     except Exception as exc:
         logger.warning(
             "Strategy market-data fetch failed for %s:%s %s via %s/%s: %s",

@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from app.data_sources.errors import MarketDataUnavailableError
 from app.services.backtest_limits import (
     BacktestRangeLimitError,
     backtest_warmup_calendar_days,
@@ -371,9 +372,9 @@ class StrategyV2BacktestService:
         frequency: str,
         start_date: datetime,
         end_date: datetime,
-    ) -> tuple[dict[str, pd.DataFrame], list[dict[str, str]]]:
+    ) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
         frames: dict[str, pd.DataFrame] = {}
-        skipped: list[dict[str, str]] = []
+        skipped: list[dict[str, Any]] = []
 
         def fetch(member: dict[str, Any]):
             frame = self.frame_fetcher(
@@ -389,8 +390,11 @@ class StrategyV2BacktestService:
 
         workers = min(8, max(1, len(candidates)))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="strategy-v2-data") as executor:
-            futures = [executor.submit(fetch, member) for member in candidates]
+            futures = {
+                executor.submit(fetch, member): member for member in candidates
+            }
             for future in as_completed(futures):
+                member = futures[future]
                 try:
                     member, frame = future.result()
                     if frame is None or frame.empty:
@@ -398,7 +402,14 @@ class StrategyV2BacktestService:
                         continue
                     frames[member["key"]] = frame
                 except Exception as exc:
-                    skipped.append({"symbol": "", "reason": str(exc)[:240]})
+                    if isinstance(exc, MarketDataUnavailableError):
+                        skipped.append({
+                            "symbol": member.get("key") or "",
+                            "reason": str(exc),
+                            "market_data_error": exc.failure.as_dict(),
+                        })
+                    else:
+                        skipped.append({"symbol": member.get("key") or "", "reason": str(exc)[:240]})
         return dict(sorted(frames.items())), skipped
 
     def fetch_frequency_frames(
@@ -407,12 +418,12 @@ class StrategyV2BacktestService:
         frequencies: tuple[str, ...],
         start_dates: dict[str, datetime],
         end_date: datetime,
-    ) -> tuple[dict[str, dict[str, pd.DataFrame]], list[dict[str, str]]]:
+    ) -> tuple[dict[str, dict[str, pd.DataFrame]], list[dict[str, Any]]]:
         """Load every declared timeframe and retain only complete symbol bundles."""
         bundles: dict[str, dict[str, pd.DataFrame]] = {
             frequency: {} for frequency in frequencies
         }
-        skipped: list[dict[str, str]] = []
+        skipped: list[dict[str, Any]] = []
 
         def fetch(member: dict[str, Any], frequency: str):
             frame = self.frame_fetcher(
@@ -453,11 +464,14 @@ class StrategyV2BacktestService:
                         continue
                     bundles[frequency][member["key"]] = frame
                 except Exception as exc:
-                    skipped.append({
+                    item: dict[str, Any] = {
                         "symbol": member.get("key") or "",
                         "frequency": frequency,
                         "reason": str(exc)[:240],
-                    })
+                    }
+                    if isinstance(exc, MarketDataUnavailableError):
+                        item["market_data_error"] = exc.failure.as_dict()
+                    skipped.append(item)
 
         complete_symbols = set.intersection(
             *(set(frames) for frames in bundles.values())

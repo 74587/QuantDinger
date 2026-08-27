@@ -80,8 +80,10 @@ GHCR 后端入口脚本可以在首次启动时自动生成 `SECRET_KEY` 并写�
 可选：创建项目根目录 `.env`，用于 Docker Compose 编排配置：
 
 ```ini
-FRONTEND_PORT=127.0.0.1:8888
-MOBILE_PORT=127.0.0.1:8889
+FRONTEND_HOST=127.0.0.1
+FRONTEND_PORT=8888
+MOBILE_HOST=127.0.0.1
+MOBILE_PORT=8889
 BACKEND_PORT=127.0.0.1:5000
 DB_PORT=127.0.0.1:5432
 REDIS_PORT=127.0.0.1:6379
@@ -100,6 +102,18 @@ docker compose -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.ghcr.yml up -d
 docker compose -f docker-compose.ghcr.yml ps
 ```
+
+### 宝塔面板 Docker 插件与端口修改
+
+宝塔面板导入 Compose 项目后，容器详情页通常不能可靠地修改由 Compose 管理的端口。不要直接编辑已经创建好的容器端口；修改项目根目录 `.env` 后重新创建对应容器：
+
+```bash
+docker compose -f docker-compose.ghcr.yml up -d --force-recreate frontend mobile backend
+```
+
+`backend` 容器内部监听 `5000` 是应用协议的一部分，保持不变是正常的。`BACKEND_PORT=127.0.0.1:5000` 修改的是宿主机绑定；前端容器通过 Docker 网络访问 `backend:5000`。如需调整用户访问端口，只修改 `FRONTEND_PORT` / `MOBILE_PORT`，然后重新创建容器。
+
+生产环境不要把 `5000`、`5432`、`6379` 直接暴露到公网。宝塔 Nginx/站点反向代理应把公网 `80/443` 转发到宿主机本地的 Web 前端端口（默认 `127.0.0.1:8888`），API 继续由前端容器同源转发。
 
 ### 可选：完整源码部署
 

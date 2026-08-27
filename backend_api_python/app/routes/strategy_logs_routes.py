@@ -6,6 +6,7 @@ from app.routes.strategy_services import get_strategy_service
 from app.utils.auth import login_required
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.strategy_runtime_logs import parse_market_data_log
 
 try:
     from psycopg2.errors import UndefinedTable as PgUndefinedTable
@@ -65,6 +66,13 @@ def get_strategy_logs():
             if msg.startswith('tick price=') or msg.startswith('tick price '):
                 continue
             rr['level'] = normalize_strategy_log_level(rr.get('level'), msg)
+            market_data_error = parse_market_data_log(msg)
+            if market_data_error:
+                rr['event_type'] = 'market_data_unavailable'
+                rr['market_data_error'] = market_data_error
+                rr['message'] = str(
+                    market_data_error.get('message') or 'No usable market data is available.'
+                )
             ts = rr.get('timestamp')
             if ts is not None:
                 from app.utils.timeutil import to_utc_iso

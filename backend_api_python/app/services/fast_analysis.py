@@ -11,6 +11,7 @@ from app.services.llm import LLMService
 from app.services.market_data_collector import get_market_data_collector
 from app.services.fast_analysis_formatters import build_trend_outlook_summary, safe_float_price
 from app.services.fast_analysis_geo import is_major_geopolitical_news_text
+from app.services.fast_analysis_plan import finalize_trading_plan, trading_plan_risk_fields
 from app.services.fast_analysis_scoring import FastAnalysisScoringMixin
 
 logger = get_logger(__name__)
@@ -381,7 +382,7 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
 {lang_instruction}
 
 🎯 CRITICAL DECISION RULES (MUST FOLLOW):
-1. **Market Context**: This market supports BOTH long (BUY) and short (SELL) positions. SELL signals are VALID trading opportunities, not just risk warnings.
+1. **Market Context**: This market supports both long (BUY) and short (SELL) positions. Apply the same evidence and confidence standard to both directions.
 2. **Multi-Factor Analysis** (IMPORTANT - Consider ALL factors):
    - **Technical Indicators** (RSI, MACD, MA trends): Provide baseline direction
    - **Macro Environment** (DXY, VIX, interest rates, geopolitical events): Can override technical signals
@@ -393,19 +394,20 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
    - **Breaking news** (regulatory changes, major partnerships, scandals) > Short-term technical
    - **Technical indicators** > General news sentiment (when no major events)
    - **Fundamental data** > Short-term price movements (for long-term decisions)
-4. **Balance Your Decisions** (IMPORTANT - Give SELL signals when appropriate):
-   - BUY: When technical indicators show oversold (RSI < 40), bullish MACD, uptrend, OR strong macro/fundamental catalyst
-   - SELL: When technical indicators show overbought (RSI > 60), bearish MACD, downtrend, OR major negative macro/news event
-   - HOLD: Only when signals are truly mixed or unclear - DO NOT default to HOLD just because you're uncertain
-   - **Remember**: SELL is a valid trading signal for short positions, not just a warning to avoid buying
+4. **Balanced Directional Evidence**:
+   - BUY: Require bullish trend/momentum confirmation or a strong positive macro/fundamental catalyst. Oversold RSI alone is insufficient.
+   - SELL: Require bearish trend/momentum confirmation or a strong negative macro/news catalyst. Overbought RSI alone is insufficient.
+   - HOLD: Use when evidence is mixed, the setup lacks confirmation, or expected reward does not justify the risk.
+   - Treat BUY and SELL symmetrically; never favor a direction merely to avoid HOLD.
 5. **Confidence Thresholds**:
    - BUY requires confidence >= 60 AND (technical support OR macro/fundamental catalyst)
-   - SELL requires confidence >= 60 AND (technical support OR negative event) - SELL signals are encouraged when indicators suggest downside
-   - HOLD only when confidence < 60 AND signals are truly unclear
+   - SELL requires confidence >= 60 AND (bearish technical confirmation OR a material negative event)
+   - HOLD is valid at any confidence when directional evidence is not confirmed
 6. **Identify Trading Opportunities**:
-   - When RSI > 60, MACD bearish, downtrend: Consider SELL (short position opportunity)
-   - When RSI < 40, MACD bullish, uptrend: Consider BUY (long position opportunity)
-   - Do NOT default to HOLD when clear technical signals exist
+   - When RSI > 60, require bearish MACD, trend damage, volume/price weakness, negative events, or multi-timeframe bearish confirmation before SELL.
+   - When RSI < 40, require bullish MACD, trend recovery, volume/price strength, positive events, or multi-timeframe bullish confirmation before BUY.
+   - In a strong uptrend, overbought means elevated pullback risk, not an automatic short entry.
+   - Counter-trend trades remain allowed when explicit reversal confirmation exists.
 7. **Consider Macro Impact**: 
    - Strong USD (DXY ↑) usually negative for crypto/commodities → Consider SELL
    - High VIX (>30) indicates fear → Consider SELL or HOLD, avoid BUY
@@ -458,14 +460,14 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
    - Consider tail risks from unexpected events
 7. **Clear Recommendation**: BUY/SELL/HOLD with entry, stop loss (near suggested), take profit (near suggested)
    - **BUY**: For long positions when indicators suggest upside
-   - **SELL**: For short positions when indicators suggest downside - this is a VALID trading opportunity
-   - **HOLD**: Only when signals are truly unclear - DO NOT default to HOLD just to be safe
+   - **SELL**: For short positions when confirmed evidence suggests downside
+   - **HOLD**: When directional evidence is mixed or lacks confirmation
    - Your decision should reflect the WEIGHTED importance of ALL factors
    - If macro/news factors strongly contradict technical, explain why you prioritize one over the other
 8. **Trading Opportunity Recognition**:
-   - When you see RSI > 60, bearish MACD, downtrend → Give SELL signal (short opportunity)
-   - When you see RSI < 40, bullish MACD, uptrend → Give BUY signal (long opportunity)
-   - Only choose HOLD when signals are genuinely mixed or unclear
+   - RSI > 60 plus bearish momentum/trend confirmation can support SELL; RSI alone cannot.
+   - RSI < 40 plus bullish momentum/trend confirmation can support BUY; RSI alone cannot.
+   - Counter-trend entries need stronger confirmation than trend-following entries.
 
 Output ONLY valid JSON (do NOT include word counts or format hints in your actual response):
 {{
@@ -738,7 +740,6 @@ IMPORTANT:
             Complete analysis result with actionable recommendations.
         """
         start_time = time.time()
-        
         # Get default model if not specified
         if not model:
             model = self.llm_service.get_default_model()
@@ -1253,6 +1254,7 @@ IMPORTANT:
                     "entry_price": analysis.get("entry_price"),
                     "stop_loss": analysis.get("stop_loss"),
                     "take_profit": analysis.get("take_profit"),
+                    **trading_plan_risk_fields(analysis),
                     "position_size_pct": analysis.get("position_size_pct", 10),
                     "timeframe": analysis.get("timeframe", "medium"),
                     "entryPrice": analysis.get("entry_price"),
@@ -1308,72 +1310,62 @@ IMPORTANT:
         return result
     
     def _build_decision_guidance(self, rsi_value: float, macd_signal: str, ma_trend: str, change_24h: float) -> str:
-        """
-        根据技术指标构建决策指导，帮助AI做出更合理的决策。
-        强调SELL信号是有效的做空机会。
-        """
+        """Build symmetric, confirmation-aware directional guidance."""
         guidance_parts = []
         ma_trend_low = str(ma_trend or "").lower()
-        bearish_guidance_context = bool("downtrend" in ma_trend_low or macd_signal == "bearish")
+        uptrend = "uptrend" in ma_trend_low
+        downtrend = "downtrend" in ma_trend_low
         
         if rsi_value > 70:
-            guidance_parts.append("🔴 RSI > 70 (超买): 强烈建议SELL做空，避免BUY")
+            guidance_parts.append("RSI > 70 (overbought): pullback risk is elevated, but this alone is not a SELL signal.")
         elif rsi_value > 60:
-            guidance_parts.append("🟠 RSI > 60 (偏超买): 建议SELL做空，谨慎BUY")
+            guidance_parts.append("RSI > 60: momentum is extended; require confirmation before a counter-trend SELL.")
         elif rsi_value < 30:
-            guidance_parts.append("🟢 RSI < 30 (超卖): 建议BUY做多，避免SELL")
+            guidance_parts.append("RSI < 30 (oversold): rebound potential is elevated, but this alone is not a BUY signal.")
         elif rsi_value < 40:
-            guidance_parts.append("🟡 RSI < 40 (偏超卖): 可以考虑BUY做多")
+            guidance_parts.append("RSI < 40: downside momentum is extended; require confirmation before a counter-trend BUY.")
         else:
-            guidance_parts.append("⚪ RSI 40-60 (中性): 技术面中性，需要结合其他指标判断")
+            guidance_parts.append("RSI 40-60: neutral; use trend, momentum and catalysts for direction.")
         
         if macd_signal == "bullish":
-            guidance_parts.append("🟢 MACD 看涨: 支持BUY做多")
+            guidance_parts.append("MACD bullish: positive momentum confirmation.")
         elif macd_signal == "bearish":
-            guidance_parts.append("🔴 MACD 看跌: 支持SELL做空，这是有效的做空机会")
+            guidance_parts.append("MACD bearish: negative momentum confirmation.")
         else:
-            guidance_parts.append("⚪ MACD 中性: 无明显方向")
+            guidance_parts.append("MACD neutral: no momentum confirmation.")
         
-        if "uptrend" in ma_trend.lower() or "strong_uptrend" in ma_trend.lower():
+        if uptrend:
             if rsi_value > 60:
-                guidance_parts.append("⚠️ 均线向上但RSI超买: 可能接近顶部，考虑SELL做空")
+                guidance_parts.append(
+                    "Uptrend plus overbought RSI: do not short without trend damage, bearish momentum/volume, a negative catalyst, or multi-timeframe bearish confirmation."
+                )
             else:
-                guidance_parts.append("🟢 均线趋势向上: 支持BUY做多")
-        elif "downtrend" in ma_trend.lower() or "strong_downtrend" in ma_trend.lower():
-            guidance_parts.append("🔴 均线趋势向下: 这是SELL做空的良好机会，避免BUY")
+                guidance_parts.append("MA trend up: trend-following BUY evidence; still validate entry risk.")
+        elif downtrend:
+            if rsi_value < 40:
+                guidance_parts.append(
+                    "Downtrend plus oversold RSI: do not buy without trend recovery, bullish momentum/volume, a positive catalyst, or multi-timeframe bullish confirmation."
+                )
+            else:
+                guidance_parts.append("MA trend down: trend-following SELL evidence; still validate entry risk.")
         else:
-            guidance_parts.append("⚪ 均线横盘: 趋势不明确")
+            guidance_parts.append("MA trend sideways: prefer HOLD unless range boundaries provide a confirmed setup.")
         
         if change_24h > 5:
-            guidance_parts.append("🔴 24h涨幅 > 5%: 可能已过度上涨，建议SELL做空或获利了结")
+            guidance_parts.append("24h rise > 5%: extended move is a risk flag, not an automatic short.")
         elif change_24h < -5:
-            guidance_parts.append("🟢 24h跌幅 > 5%: 可能已过度下跌，可以考虑BUY做多")
-        
-        sell_signals = sum([
-            rsi_value > 60,
-            macd_signal == "bearish",
-            "downtrend" in ma_trend.lower(),
-            change_24h > 5
-        ])
-        buy_signals = sum([
-            (rsi_value < 40 and not bearish_guidance_context),
-            macd_signal == "bullish",
-            "uptrend" in ma_trend_low,
-            (change_24h < -5 and not bearish_guidance_context)
-        ])
-        if bearish_guidance_context and (rsi_value < 40 or change_24h < -5):
-            guidance_parts.append(
-                "Risk context: oversold RSI / sharp drop appears inside a bearish trend; treat it as continuation risk until reversal confirmation."
-            )
-        
-        if sell_signals >= 2:
-            guidance_parts.append(f"📊 综合判断: {sell_signals}个做空信号，建议考虑SELL")
-        elif buy_signals >= 2:
-            guidance_parts.append(f"📊 综合判断: {buy_signals}个做多信号，建议考虑BUY")
+            guidance_parts.append("24h drop > 5%: extended move is a risk flag, not an automatic long.")
+
+        bullish_confirmations = int(macd_signal == "bullish") + int(uptrend)
+        bearish_confirmations = int(macd_signal == "bearish") + int(downtrend)
+        if bullish_confirmations >= 2:
+            guidance_parts.append("Combined view: trend and momentum confirm upside; BUY may be considered.")
+        elif bearish_confirmations >= 2:
+            guidance_parts.append("Combined view: trend and momentum confirm downside; SELL may be considered.")
         else:
-            guidance_parts.append("📊 综合判断: 信号混合，需要结合宏观和新闻判断")
+            guidance_parts.append("Combined view: directional confirmation is incomplete; HOLD is appropriate unless other strong evidence exists.")
         
-        return "\n".join(guidance_parts) if guidance_parts else "技术指标数据不足，请谨慎判断"
+        return "\n".join(guidance_parts) if guidance_parts else "Technical data is insufficient; prefer HOLD."
     
     def _has_major_news(self, news_data: List[Dict]) -> bool:
         """
@@ -1449,84 +1441,7 @@ IMPORTANT:
     def _finalize_trading_plan_for_decision(
         self, analysis: Dict, current_price: float, indicators: Optional[Dict] = None
     ) -> Dict:
-        """
-        After decision is final: force correct stop/take-profit geometry and mirror long levels for shorts.
-        BUY: stop_loss < current < take_profit
-        SELL: take_profit < current < stop_loss (short: stop above, TP below)
-        """
-        if not current_price or current_price <= 0:
-            return analysis
-        indicators = indicators or {}
-        decision = str(analysis.get("decision", "HOLD")).upper()
-        if decision not in ("BUY", "SELL"):
-            return analysis
-
-        min_price = current_price * 0.90
-        max_price = current_price * 1.10
-        eps = max(abs(current_price) * 1e-6, 1e-8)
-
-        tl = indicators.get("trading_levels") or {}
-        sl_long = safe_float_price(tl.get("suggested_stop_loss"))
-        tp_long = safe_float_price(tl.get("suggested_take_profit"))
-        long_ok = (
-            sl_long is not None
-            and tp_long is not None
-            and sl_long < current_price - eps
-            and tp_long > current_price + eps
-        )
-
-        if decision == "SELL":
-            if long_ok:
-                mirrored_sl = round(2 * current_price - sl_long, 6)
-                mirrored_tp = round(2 * current_price - tp_long, 6)
-                mirrored_sl = min(max(mirrored_sl, current_price + eps), max_price)
-                mirrored_tp = max(min(mirrored_tp, current_price - eps), min_price)
-                if mirrored_sl > current_price and mirrored_tp < current_price:
-                    analysis["stop_loss"] = mirrored_sl
-                    analysis["take_profit"] = mirrored_tp
-                else:
-                    analysis["stop_loss"] = round(min(max_price, current_price * 1.05), 6)
-                    analysis["take_profit"] = round(max(min_price, current_price * 0.95), 6)
-            else:
-                sl_f = safe_float_price(analysis.get("stop_loss"))
-                tp_f = safe_float_price(analysis.get("take_profit"))
-                if sl_f is not None and tp_f is not None and tp_f < current_price < sl_f:
-                    analysis["stop_loss"] = round(min(max(sl_f, current_price + eps), max_price), 6)
-                    analysis["take_profit"] = round(max(min(tp_f, current_price - eps), min_price), 6)
-                else:
-                    analysis["stop_loss"] = round(min(max_price, current_price * 1.05), 6)
-                    analysis["take_profit"] = round(max(min_price, current_price * 0.95), 6)
-        else:  # BUY
-            if long_ok:
-                sl = max(min(sl_long, current_price - eps), min_price)
-                tp = min(max(tp_long, current_price + eps), max_price)
-                analysis["stop_loss"] = round(sl, 6)
-                analysis["take_profit"] = round(tp, 6)
-            else:
-                sl_f = safe_float_price(analysis.get("stop_loss"))
-                tp_f = safe_float_price(analysis.get("take_profit"))
-                if sl_f is not None and tp_f is not None and sl_f < current_price < tp_f:
-                    analysis["stop_loss"] = round(max(min(sl_f, current_price - eps), min_price), 6)
-                    analysis["take_profit"] = round(min(max(tp_f, current_price + eps), max_price), 6)
-                else:
-                    analysis["stop_loss"] = round(max(min_price, current_price * 0.95), 6)
-                    analysis["take_profit"] = round(min(max_price, current_price * 1.05), 6)
-
-        # Last-resort: fix inverted or equal levels
-        sl_f = safe_float_price(analysis.get("stop_loss"), current_price)
-        tp_f = safe_float_price(analysis.get("take_profit"), current_price)
-        if sl_f is None or tp_f is None:
-            return analysis
-        if decision == "SELL":
-            if not (tp_f < current_price < sl_f):
-                analysis["stop_loss"] = round(min(max_price, current_price * 1.05), 6)
-                analysis["take_profit"] = round(max(min_price, current_price * 0.95), 6)
-        else:
-            if not (sl_f < current_price < tp_f):
-                analysis["stop_loss"] = round(max(min_price, current_price * 0.95), 6)
-                analysis["take_profit"] = round(min(max_price, current_price * 1.05), 6)
-
-        return analysis
+        return finalize_trading_plan(analysis, current_price, indicators)
 
     def _validate_and_constrain(self, analysis: Dict, current_price: float, indicators: Dict = None,
                                  has_major_news: bool = False, has_macro_event: bool = False) -> Dict:
@@ -1549,36 +1464,6 @@ IMPORTANT:
             analysis["entry_price"] = round(current_price, 6)
         elif entry is not None:
             analysis["entry_price"] = round(entry, 6)
-        
-        # Constrain stop loss / take profit by direction (numeric-safe).
-        # BUY: stop_loss < current < take_profit
-        # SELL: take_profit < current < stop_loss
-        if decision == "SELL":
-            stop_default = round(current_price * 1.05, 6)
-            tp_default = round(current_price * 0.95, 6)
-            stop_loss = safe_float_price(analysis.get("stop_loss"), stop_default)
-            take_profit = safe_float_price(analysis.get("take_profit"), tp_default)
-            if stop_loss is None or stop_loss <= current_price or stop_loss > max_price:
-                analysis["stop_loss"] = stop_default
-            else:
-                analysis["stop_loss"] = round(stop_loss, 6)
-            if take_profit is None or take_profit >= current_price or take_profit < min_price:
-                analysis["take_profit"] = tp_default
-            else:
-                analysis["take_profit"] = round(take_profit, 6)
-        else:
-            stop_default = round(current_price * 0.95, 6)
-            tp_default = round(current_price * 1.05, 6)
-            stop_loss = safe_float_price(analysis.get("stop_loss"), stop_default)
-            take_profit = safe_float_price(analysis.get("take_profit"), tp_default)
-            if stop_loss is None or stop_loss < min_price or stop_loss >= current_price:
-                analysis["stop_loss"] = stop_default
-            else:
-                analysis["stop_loss"] = round(stop_loss, 6)
-            if take_profit is None or take_profit <= current_price or take_profit > max_price:
-                analysis["take_profit"] = tp_default
-            else:
-                analysis["take_profit"] = round(take_profit, 6)
         
         # Constrain confidence
         confidence = analysis.get("confidence", 50)
@@ -1627,6 +1512,46 @@ IMPORTANT:
         rsi_value = rsi_data.get("value", 50)
         macd_signal = macd_data.get("signal", "neutral")
         ma_trend = ma_data.get("trend", "sideways")
+        trend_low = str(ma_trend or "sideways").lower()
+        current_indicator_price = safe_float_price(indicators.get("current_price"))
+        ma20 = safe_float_price(ma_data.get("ma20"))
+        try:
+            price_position = float(indicators.get("price_position", 50) or 50)
+        except Exception:
+            price_position = 50.0
+        try:
+            volume_ratio = float(indicators.get("volume_ratio", 1) or 1)
+        except Exception:
+            volume_ratio = 1.0
+        objective_by_tf = analysis.get("objective_scores_by_timeframe") or {}
+        bearish_tf_count = sum(
+            1
+            for value in objective_by_tf.values()
+            if str((value or {}).get("decision") or "").upper() == "SELL"
+        )
+        bullish_tf_count = sum(
+            1
+            for value in objective_by_tf.values()
+            if str((value or {}).get("decision") or "").upper() == "BUY"
+        )
+        bearish_trend_damage = bool(
+            (current_indicator_price is not None and ma20 is not None and current_indicator_price < ma20)
+            or price_position < 45
+        )
+        bullish_trend_recovery = bool(
+            (current_indicator_price is not None and ma20 is not None and current_indicator_price > ma20)
+            or price_position > 55
+        )
+        bearish_reversal_confirmed = bool(
+            macd_signal == "bearish"
+            or bearish_tf_count >= 2
+            or (bearish_trend_damage and volume_ratio >= 1.1)
+        )
+        bullish_reversal_confirmed = bool(
+            macd_signal == "bullish"
+            or bullish_tf_count >= 2
+            or (bullish_trend_recovery and volume_ratio >= 1.1)
+        )
         
         if confidence < 60:
             if decision != "HOLD":
@@ -1664,10 +1589,20 @@ IMPORTANT:
         
         elif decision == "SELL":
             conflicts = []
-            
-            if rsi_value < 30 and macd_signal == "bullish" and "uptrend" in ma_trend.lower():
+
+            if (
+                "uptrend" in trend_low
+                and rsi_value >= 60
+                and not bearish_reversal_confirmed
+                and not allow_override
+            ):
+                conflicts.append(
+                    "Overbought RSI inside an uptrend without bearish reversal confirmation"
+                )
+                analysis["decision_guard"] = "countertrend_sell_unconfirmed"
+            elif rsi_value < 30 and macd_signal == "bullish" and "uptrend" in trend_low:
                 conflicts.append(f"Strong bullish signals (RSI {rsi_value:.1f} < 30, MACD bullish, uptrend)")
-            elif rsi_value < 30 and "strong_uptrend" in ma_trend.lower():
+            elif rsi_value < 30 and "strong_uptrend" in trend_low:
                 conflicts.append(f"Very strong uptrend with oversold RSI {rsi_value:.1f}")
             
             if conflicts:
@@ -1682,6 +1617,18 @@ IMPORTANT:
                     analysis["confidence"] = max(confidence - 20, 40)
                     original_summary = analysis.get("summary", "")
                     analysis["summary"] = f"{original_summary} [注意：技术指标显示{', '.join(conflicts)}，建议观望]"
+
+        if (
+            decision == "BUY"
+            and "downtrend" in trend_low
+            and rsi_value <= 40
+            and not bullish_reversal_confirmed
+            and not allow_override
+        ):
+            logger.warning("Counter-trend BUY lacks bullish reversal confirmation; forcing HOLD")
+            analysis["decision"] = "HOLD"
+            analysis["decision_guard"] = "countertrend_buy_unconfirmed"
+            analysis["confidence"] = max(confidence - 20, 40)
         
         return analysis
     

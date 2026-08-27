@@ -8,7 +8,11 @@ import time
 from typing import Dict, List, Any, Optional
 
 from app.data_sources.base import BaseDataSource
-from app.data_sources.errors import UnsupportedMarketError
+from app.data_sources.errors import (
+    MarketDataFailure,
+    UnsupportedMarketError,
+    classify_market_data_failure,
+)
 from app.utils.logger import get_logger
 from app.utils.resource_guard import (
     ResourceExhaustedError,
@@ -237,15 +241,53 @@ class DataSourceFactory:
         Returns:
             K线数据列表
         """
+        rows, _failure = cls.get_kline_with_diagnostics(
+            market=market,
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit,
+            before_time=before_time,
+            after_time=after_time,
+            exchange_id=exchange_id,
+            market_type=market_type,
+        )
+        return rows
+
+    @classmethod
+    def get_kline_with_diagnostics(
+        cls,
+        *,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        before_time: Optional[int] = None,
+        after_time: Optional[int] = None,
+        exchange_id: Optional[str] = None,
+        market_type: Optional[str] = None,
+    ) -> tuple[List[Dict[str, Any]], Optional[MarketDataFailure]]:
+        """Fetch K-lines and retain a structured provider failure when rows are empty."""
         m = cls.normalize_market(market or "")
         try:
             assert_fd_available(f"market-data kline {m}:{symbol}")
             source = cls._resolve_source(m, exchange_id=exchange_id, market_type=market_type)
             klines = source.get_kline(symbol, timeframe, limit, before_time, after_time)
-            
+
             klines.sort(key=lambda x: x['time'])
-            
-            return klines
+            failure = None
+            if not klines:
+                get_last_failure = getattr(source, "get_last_failure", None)
+                if callable(get_last_failure):
+                    failure = get_last_failure()
+                if failure is None:
+                    failure = classify_market_data_failure(
+                        "Exchange returned no K-line rows",
+                        exchange_id=exchange_id or getattr(getattr(source, "exchange", None), "id", ""),
+                        market_type=market_type or "",
+                        symbol=symbol,
+                        timeframe=timeframe,
+                    )
+            return klines, failure
         except ResourceExhaustedError as e:
             cls._log_limited(
                 "error",
@@ -255,7 +297,13 @@ class DataSourceFactory:
                 symbol,
                 str(e),
             )
-            return []
+            return [], classify_market_data_failure(
+                e,
+                exchange_id=exchange_id or "",
+                market_type=market_type or "",
+                symbol=symbol,
+                timeframe=timeframe,
+            )
         except Exception as e:
             if is_fd_exhaustion(e):
                 mark_fd_exhausted(e)
@@ -268,7 +316,13 @@ class DataSourceFactory:
                 m,
                 str(e),
             )
-            return []
+            return [], classify_market_data_failure(
+                e,
+                exchange_id=exchange_id or "",
+                market_type=market_type or "",
+                symbol=symbol,
+                timeframe=timeframe,
+            )
     
     @classmethod
     def _resolve_source(

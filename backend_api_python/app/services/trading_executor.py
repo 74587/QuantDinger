@@ -12,6 +12,10 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import pandas as pd
 
 from app.data_sources import DataSourceFactory
+from app.data_sources.errors import (
+    MarketDataUnavailableError,
+    classify_market_data_failure,
+)
 from app.services.script_source import get_script_source_service
 from app.services.strategy_runtime.health import record_runtime_heartbeat
 from app.services.strategy_runtime.identity import ensure_strategy_run, finish_strategy_run
@@ -31,7 +35,7 @@ from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.numeric_precision import format_decimal
-from app.utils.strategy_runtime_logs import append_strategy_log
+from app.utils.strategy_runtime_logs import append_strategy_log, format_market_data_log
 from app.utils.thread_capacity import format_thread_capacity
 
 
@@ -512,6 +516,8 @@ class TradingExecutor:
             next_signal_poll = 0.0
             stale_price_logged = False
             consecutive_errors = 0
+            last_market_data_failure_key = ""
+            last_market_data_log_at = 0.0
             strategy_name = str(strategy.get("strategy_name") or f"strategy_{strategy_id}")
             notification_config = _json_object(strategy.get("notification_config"))
             leverage = max(1.0, float(trading_config.get("leverage") or strategy.get("leverage") or 1))
@@ -761,18 +767,43 @@ class TradingExecutor:
                         self._mark_stopped(strategy_id)
                         break
                     consecutive_errors = 0
+                    if last_market_data_failure_key:
+                        append_strategy_log(strategy_id, "info", "Market data feed recovered")
+                        last_market_data_failure_key = ""
+                        last_market_data_log_at = 0.0
                 except Exception as exc:
-                    if str(exc) == "strategyV2.noMarketData":
+                    if isinstance(exc, MarketDataUnavailableError) or str(exc) == "strategyV2.noMarketData":
                         next_signal_poll = cycle_started + signal_poll
+                        failure = (
+                            exc.failure
+                            if isinstance(exc, MarketDataUnavailableError)
+                            else classify_market_data_failure("No usable market data")
+                        )
+                        failure_key = "|".join((
+                            failure.code,
+                            failure.exchange_id,
+                            failure.market_type,
+                            failure.symbol,
+                            failure.timeframe,
+                            failure.technical_detail,
+                        ))
                         logger.warning(
-                            "Strategy %s temporarily has no usable market data",
+                            "Strategy %s market data unavailable (%s): %s",
                             strategy_id,
+                            failure.code,
+                            failure.technical_detail or failure.message,
                         )
-                        append_strategy_log(
-                            strategy_id,
-                            "warning",
-                            "Runtime cycle skipped because no instrument has usable market data",
-                        )
+                        if (
+                            failure_key != last_market_data_failure_key
+                            or cycle_started - last_market_data_log_at >= 60.0
+                        ):
+                            append_strategy_log(
+                                strategy_id,
+                                "warning",
+                                format_market_data_log(failure),
+                            )
+                            last_market_data_failure_key = failure_key
+                            last_market_data_log_at = cycle_started
                         self._heartbeat(
                             strategy_id,
                             run_id,
@@ -781,7 +812,7 @@ class TradingExecutor:
                             0,
                             loop_latency_ms=int((time.monotonic() - cycle_started) * 1000),
                             status="degraded",
-                            last_error=str(exc),
+                            last_error=f"marketData.{failure.code}",
                         )
                         continue
                     consecutive_errors += 1
@@ -806,7 +837,10 @@ class TradingExecutor:
             exit_reason = str(exc)
             self._last_exit_reason[strategy_id] = exit_reason
             logger.exception("Strategy %s stopped after runtime failure", strategy_id)
-            append_strategy_log(strategy_id, "error", exit_reason)
+            if isinstance(exc, MarketDataUnavailableError):
+                append_strategy_log(strategy_id, "error", format_market_data_log(exc.failure))
+            else:
+                append_strategy_log(strategy_id, "error", exit_reason)
             self._mark_stopped(strategy_id)
         finally:
             if market_price_feed is not None:

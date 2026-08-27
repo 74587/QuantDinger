@@ -2,12 +2,34 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from typing import Any
 
+from app.data_sources.errors import MarketDataFailure
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+MARKET_DATA_LOG_PREFIX = "market-data|"
+
+
+def format_market_data_log(failure: MarketDataFailure) -> str:
+    """Serialize a typed market-data event without changing the log table schema."""
+    return MARKET_DATA_LOG_PREFIX + json.dumps(
+        failure.as_dict(), ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def parse_market_data_log(message: Any) -> dict[str, Any] | None:
+    raw = str(message or "")
+    if not raw.startswith(MARKET_DATA_LOG_PREFIX):
+        return None
+    try:
+        value = json.loads(raw[len(MARKET_DATA_LOG_PREFIX):])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def append_strategy_log(strategy_id: int, level: str, message: str) -> None:

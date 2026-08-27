@@ -33,6 +33,45 @@ def _safe_json_parse(val, default=None):
     return default
 
 
+def _build_regime_performance(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate decision distribution and realized outcome by recorded regime."""
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        raw = _safe_json_parse(row.get("raw_result"), {}) or {}
+        consensus = raw.get("consensus") if isinstance(raw, dict) else {}
+        consensus = consensus if isinstance(consensus, dict) else {}
+        risk_context = consensus.get("risk_context")
+        risk_context = risk_context if isinstance(risk_context, dict) else {}
+        regime = str(risk_context.get("trend") or consensus.get("market_regime") or "unknown").lower()
+        decision = str(row.get("decision") or "HOLD").upper()
+        group = groups.setdefault(regime, {
+            "market_regime": regime,
+            "total": 0,
+            "correct": 0,
+            "returns": [],
+            "decision_distribution": {"buy": 0, "sell": 0, "hold": 0},
+        })
+        group["total"] += 1
+        if row.get("was_correct") is True:
+            group["correct"] += 1
+        if row.get("actual_return_pct") is not None:
+            try:
+                group["returns"].append(float(row.get("actual_return_pct")))
+            except (TypeError, ValueError):
+                pass
+        key = decision.lower() if decision in {"BUY", "SELL", "HOLD"} else "hold"
+        group["decision_distribution"][key] += 1
+
+    output = []
+    for group in groups.values():
+        total = int(group["total"] or 0)
+        returns = group.pop("returns")
+        group["accuracy_pct"] = round(group.pop("correct") / total * 100, 2) if total else 0
+        group["avg_return_pct"] = round(sum(returns) / len(returns), 2) if returns else 0
+        output.append(group)
+    return sorted(output, key=lambda value: (-int(value["total"]), value["market_regime"]))
+
+
 class AnalysisMemory:
     """
     Simple but effective memory system for AI analysis.
@@ -878,6 +917,7 @@ class AnalysisMemory:
                         COUNT(*) as total,
                         SUM(CASE WHEN was_correct = true THEN 1 ELSE 0 END) as correct,
                         AVG(actual_return_pct) as avg_return,
+                        AVG(confidence) as avg_confidence,
                         SUM(CASE WHEN decision = 'BUY' THEN 1 ELSE 0 END) as buy_count,
                         SUM(CASE WHEN decision = 'SELL' THEN 1 ELSE 0 END) as sell_count,
                         SUM(CASE WHEN decision = 'HOLD' THEN 1 ELSE 0 END) as hold_count,
@@ -888,6 +928,12 @@ class AnalysisMemory:
                 """, tuple(params) if params else None)
                 
                 row = cur.fetchone()
+                cur.execute(f"""
+                    SELECT decision, actual_return_pct, was_correct, raw_result
+                    FROM qd_analysis_memory
+                    WHERE {where_sql}
+                """, tuple(params) if params else None)
+                regime_rows = cur.fetchall() or []
                 cur.close()
                 
                 if not row or not row['total']:
@@ -901,10 +947,15 @@ class AnalysisMemory:
                 total = row['total']
                 correct = row['correct'] or 0
                 
+                accuracy_pct = round((correct / total * 100) if total > 0 else 0, 2)
+                avg_return_pct = round(float(row['avg_return'] or 0), 2)
                 return {
                     "total_analyses": total,
-                    "accuracy_pct": round((correct / total * 100) if total > 0 else 0, 2),
-                    "avg_return_pct": round(float(row['avg_return'] or 0), 2),
+                    "accuracy_pct": accuracy_pct,
+                    "accuracy_rate": accuracy_pct,
+                    "avg_return_pct": avg_return_pct,
+                    "avg_return": avg_return_pct,
+                    "avg_confidence": round(float(row['avg_confidence'] or 0), 2),
                     "decision_distribution": {
                         "buy": row['buy_count'] or 0,
                         "sell": row['sell_count'] or 0,
@@ -915,6 +966,7 @@ class AnalysisMemory:
                         if row['feedback_count'] and row['feedback_count'] > 0 else 0, 2
                     ),
                     "period_days": days,
+                    "regime_performance": _build_regime_performance(regime_rows),
                 }
                 
         except Exception as e:
