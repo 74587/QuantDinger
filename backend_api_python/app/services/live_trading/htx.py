@@ -528,6 +528,21 @@ class HtxClient(BaseRestClient):
             self._contract_cache[key] = (now, obj)
         return obj
 
+    def get_spot_symbol_info(self, *, symbol: str) -> Dict[str, Any]:
+        """Return native public spot precision and minimum-order metadata."""
+        native = to_htx_spot_symbol(symbol)
+        raw = self._spot_public_request("GET", "/v1/common/symbols")
+        rows = raw.get("data") if isinstance(raw, dict) else None
+        target = native.replace("-", "").replace("_", "").upper()
+        for item in rows if isinstance(rows, list) else []:
+            if not isinstance(item, dict):
+                continue
+            candidate = str(item.get("symbol") or "")
+            candidate = candidate.replace("-", "").replace("_", "").upper()
+            if candidate == target:
+                return item
+        return {}
+
     def _base_to_contracts(self, *, symbol: str, qty: float) -> int:
         req = self._to_dec(qty)
         if req <= 0:

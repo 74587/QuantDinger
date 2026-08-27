@@ -10,6 +10,10 @@ from app.services.live_trading.symbols import (
     to_okx_spot_inst_id,
     to_okx_swap_inst_id,
 )
+from app.services.instrument_rules import get_instrument_rules_provider
+
+
+_instrument_rules = get_instrument_rules_provider()
 
 
 def exchange_executable_base_quantity(
@@ -25,6 +29,17 @@ def exchange_executable_base_quantity(
     quantity = max(0.0, float(requested or 0.0))
     exchange = str(exchange_id or "").strip().lower()
     market = str(market_type or "spot").strip().lower()
+    try:
+        rules = _instrument_rules.get_rules(
+            symbol,
+            exchange_id=exchange,
+            market_type=market,
+            client=client,
+        )
+        if rules.amount_step > 0 or rules.min_amount > 0:
+            return rules.normalize_amount(quantity)
+    except Exception:
+        pass
     try:
         if exchange == "bitget" and market == "swap" and hasattr(client, "normalize_base_order_size"):
             product_type = str(

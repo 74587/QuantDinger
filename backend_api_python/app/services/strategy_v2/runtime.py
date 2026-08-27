@@ -19,6 +19,11 @@ from app.services.factors import (
     get_factor,
     is_talib_available,
 )
+from app.services.instrument_rules import (
+    InstrumentRules,
+    InstrumentRulesSnapshot,
+    default_rules_for_symbol,
+)
 from .contract import CompiledStrategyV2, StrategyV2ContractError, compile_strategy_v2
 from .data import MultiAssetDataPortal
 from .frequencies import normalize_frequency
@@ -648,11 +653,13 @@ class MultiAssetSimulationBroker:
         leverage: float = 1.0,
         commission: float = 0.0005,
         slippage: float = 0.0005,
+        instrument_rules: InstrumentRulesSnapshot | Mapping[str, InstrumentRules | Mapping[str, Any]] | None = None,
     ) -> None:
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
         self.leverage = max(1.0, float(leverage or 1.0))
         self.commission = max(0.0, float(commission or 0.0))
         self.slippage = max(0.0, float(slippage or 0.0))
+        self.instrument_rules = instrument_rules
         self.executions: list[dict[str, Any]] = []
         self.closed_trades: list[dict[str, Any]] = []
         self._entries: dict[str, dict[str, Any]] = {}
@@ -728,6 +735,9 @@ class MultiAssetSimulationBroker:
                 and abs(target_qty) <= 1e-12
                 and abs(current.amount) > 1e-12
             )
+            reconciles_swap_remainder = (
+                closes_position and self._is_crypto_swap_symbol(order.symbol)
+            )
             if abs(delta) <= 1e-12 or (abs(delta * sizing_price) < 0.01 and not closes_position):
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "target_already_met",
@@ -780,9 +790,17 @@ class MultiAssetSimulationBroker:
                     1.0 + self.slippage if delta > 0 else 1.0 - self.slippage
                 )
             requested_delta = delta
-            lot_size = self._lot_size(order.symbol, bar)
+            rules = self._rules_for(order.symbol)
+            lot_size = self._lot_size(order.symbol, rules)
             delta = self._round_to_lot(delta, lot_size)
-            if abs(delta) < lot_size - 1e-12:
+            exact_close_remainder = False
+            if reconciles_swap_remainder and abs(delta) < lot_size - 1e-12:
+                # A simulated position may contain a sub-lot numerical residue.
+                # A target-zero order reconciles that residue exactly instead of
+                # leaving an uncloseable position or silently writing it off.
+                delta = -current.amount
+                exact_close_remainder = True
+            if abs(delta) < lot_size - 1e-12 and not exact_close_remainder:
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "minimum_trade_unit",
                     requested_quantity=abs(requested_delta),
@@ -791,15 +809,12 @@ class MultiAssetSimulationBroker:
             liquidity_cap = None if forced_liquidation else self._liquidity_cap(bar, lot_size)
             if liquidity_cap is not None and abs(delta) > liquidity_cap:
                 delta = math.copysign(liquidity_cap, delta)
-            # Validate MIN_NOTIONAL: if the order notional is below the exchange minimum, reject
-            min_notional = self._min_notional(bar)
-            if min_notional > 0 and fill_price > 0 and abs(delta * fill_price) < min_notional:
-                batch_event_indexes.append(self._append_order_event(self._order_event(
-                    order_id, order, timestamp, "rejected", "min_notional",
-                    requested_quantity=abs(requested_delta),
-                )))
-                continue
-            if forced_liquidation:
+            if reconciles_swap_remainder and current.amount * delta < 0:
+                residual = current.amount + delta
+                if 0 < abs(residual) < lot_size - 1e-12:
+                    delta = -current.amount
+                    exact_close_remainder = True
+            if forced_liquidation or exact_close_remainder:
                 feasible_delta, constraint_reason = delta, ""
             else:
                 feasible_delta, constraint_reason = self._feasible_delta(
@@ -810,7 +825,7 @@ class MultiAssetSimulationBroker:
                     lot_size=lot_size,
                     position_key=position_key,
                 )
-            if abs(feasible_delta) < lot_size - 1e-12:
+            if abs(feasible_delta) < lot_size - 1e-12 and not exact_close_remainder:
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id,
                     order,
@@ -821,6 +836,35 @@ class MultiAssetSimulationBroker:
                 )))
                 continue
             delta = feasible_delta
+            min_amount = max(0.0, float(rules.min_amount or 0.0))
+            min_notional = max(0.0, float(rules.min_notional or 0.0))
+            pure_reduction = self._is_pure_reduction(current.amount, delta)
+            swap_reduction = (
+                pure_reduction and self._is_crypto_swap_symbol(order.symbol)
+            )
+            if (
+                min_amount > 0
+                and abs(delta) + 1e-12 < min_amount
+                and not forced_liquidation
+                and not swap_reduction
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "minimum_trade_unit",
+                    requested_quantity=abs(requested_delta),
+                )))
+                continue
+            if (
+                min_notional > 0
+                and fill_price > 0
+                and not forced_liquidation
+                and not swap_reduction
+                and abs(delta * fill_price) < min_notional
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "min_notional",
+                    requested_quantity=abs(requested_delta),
+                )))
+                continue
             target_qty = current.amount + delta
             remaining_quantity = max(0.0, abs(requested_delta) - abs(delta))
             has_tradable_remainder = (
@@ -837,10 +881,8 @@ class MultiAssetSimulationBroker:
             current.avg_cost = _next_average_cost(old_amount, current.avg_cost, delta, fill_price)
             current.last_price = fill_price
             self.portfolio.available_cash = projected_cash
-            # Force sub-lot residuals to zero: if position amount is below lot_size, treat as fully closed
-            if abs(current.amount) <= lot_size - 1e-12:
-                current.amount = 0.0
             if abs(current.amount) <= 1e-12:
+                current.amount = 0.0
                 self.portfolio.positions.pop(position_key, None)
                 self._protections.pop(position_key, None)
             else:
@@ -1068,17 +1110,39 @@ class MultiAssetSimulationBroker:
         return self._round_to_lot(feasible, lot_size), reason
 
     @staticmethod
-    def _lot_size(symbol: str, bar: Mapping[str, Any] | None) -> float:
-        explicit = float((bar or {}).get("lot_size") or 0.0)
+    def _lot_size(symbol: str, rules: InstrumentRules) -> float:
+        explicit = float(rules.amount_step or 0.0)
         if explicit > 0:
             return explicit
-        # Fallback for backward compatibility: Crypto perpetuals on Binance use integer coin lots
-        # (stepSize = "1" meaning 1 coin), not 1e-8.
         return 1e-8 if str(symbol).startswith("Crypto:") else 1.0
 
+    def _rules_for(self, symbol: str) -> InstrumentRules:
+        source = self.instrument_rules
+        item: InstrumentRules | Mapping[str, Any] | None = None
+        if isinstance(source, InstrumentRulesSnapshot):
+            item = source.get(symbol)
+        elif isinstance(source, Mapping):
+            item = source.get(symbol)
+        if isinstance(item, InstrumentRules):
+            return item
+        if isinstance(item, Mapping):
+            return InstrumentRules.from_mapping(item)
+        return default_rules_for_symbol(symbol)
+
     @staticmethod
-    def _min_notional(bar: Mapping[str, Any] | None) -> float:
-        return float((bar or {}).get("min_notional") or 0.0)
+    def _is_pure_reduction(current_amount: float, delta: float) -> bool:
+        return (
+            current_amount * delta < 0
+            and abs(delta) <= abs(current_amount) + 1e-12
+        )
+
+    @staticmethod
+    def _is_crypto_swap_symbol(symbol: str) -> bool:
+        text = str(symbol or "").strip().lower()
+        if not text.startswith("crypto:") or "@" not in text:
+            return False
+        binding = text.rsplit("@", 1)[-1]
+        return binding == "swap" or binding.endswith(":swap")
 
     @staticmethod
     def _round_to_lot(value: float, lot_size: float) -> float:
@@ -1531,6 +1595,7 @@ class StrategyV2BacktestRunner:
         commission: float = 0.0005,
         slippage: float = 0.0005,
         universe_resolver=None,
+        instrument_rules: InstrumentRulesSnapshot | Mapping[str, InstrumentRules | Mapping[str, Any]] | None = None,
     ) -> None:
         self.program: CompiledStrategyV2 = compile_strategy_v2(code)
         requested_leverage = max(1.0, float(leverage or 1.0)) if leverage_enabled else 1.0
@@ -1549,7 +1614,9 @@ class StrategyV2BacktestRunner:
             leverage=requested_leverage,
             commission=commission,
             slippage=slippage,
+            instrument_rules=instrument_rules,
         )
+        self.instrument_rules = instrument_rules
         runtime_params = dict(params or {})
         runtime_params.setdefault("commission", self.broker.commission)
         runtime_params.setdefault("slippage", self.broker.slippage)
@@ -1841,8 +1908,14 @@ class StrategyV2BacktestRunner:
             max(1, int(item.get("occurrenceCount") or 1))
             for item in self.broker.order_ledger
         )
+        rules_snapshot = (
+            self.instrument_rules.metadata()
+            if isinstance(self.instrument_rules, InstrumentRulesSnapshot)
+            else None
+        )
         return {
             "initialCapital": initial,
+            "instrumentRulesSnapshot": rules_snapshot,
             "totalReturn": total_return,
             "total_return": total_return,
             "finalEquity": final,

@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.signal_notifier import SignalNotifier
+from app.services.instrument_rules import get_instrument_rules_provider
 from app.services.exchange_execution import load_strategy_configs, resolve_exchange_config, safe_exchange_config_for_log
 from app.services.live_trading.execution import place_order_from_signal
 from app.services.live_trading.factory import create_client
@@ -141,6 +142,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._notifier = SignalNotifier()
+        self._instrument_rules = get_instrument_rules_provider()
 
         # Reclaim stuck orders (e.g. if the worker crashed after claiming an order).
         try:
@@ -1409,37 +1411,24 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
         *,
         symbol: str,
         price: float,
+        exchange_id: str,
+        market_type: str,
         market_order: bool = True,
     ) -> Tuple[float, float]:
-        """Best-effort minQty/minNotional estimate from live client filters."""
+        """Best-effort estimate from the shared exchange-native rule provider."""
+        del market_order
         px = float(price or 0.0)
         if px <= 0 or client is None:
             return 0.0, 0.0
         try:
-            if not hasattr(client, "get_symbol_filters"):
-                return 0.0, 0.0
-            filters = client.get_symbol_filters(symbol=symbol) or {}
-            lot = {}
-            if isinstance(filters.get("MARKET_LOT_SIZE"), dict) and market_order:
-                lot = filters.get("MARKET_LOT_SIZE") or {}
-                try:
-                    if float(lot.get("minQty") or 0) <= 0:
-                        lot = filters.get("LOT_SIZE") or lot
-                except Exception:
-                    pass
-            if not lot and isinstance(filters.get("LOT_SIZE"), dict):
-                lot = filters.get("LOT_SIZE") or {}
-            min_qty = self._as_float((lot or {}).get("minQty"), 0.0)
-
-            min_notional = 0.0
-            notional_filter = filters.get("MIN_NOTIONAL") or filters.get("NOTIONAL") or {}
-            if isinstance(notional_filter, dict):
-                min_notional = self._as_float(
-                    notional_filter.get("notional")
-                    or notional_filter.get("minNotional")
-                    or notional_filter.get("minNotionalValue"),
-                    0.0,
-                )
+            rules = self._instrument_rules.get_rules(
+                symbol,
+                exchange_id=exchange_id,
+                market_type=market_type,
+                client=client,
+            )
+            min_qty = max(0.0, float(rules.min_amount or 0.0))
+            min_notional = max(0.0, float(rules.min_notional or 0.0))
             if min_qty > 0:
                 min_notional = max(min_notional, min_qty * px)
             return max(0.0, min_qty), max(0.0, min_notional)
@@ -1452,6 +1441,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
         *,
         client: Any,
         exchange_id: str,
+        market_type: str = "swap",
         symbol: str,
         signal_type: str,
         amount: float,
@@ -1484,6 +1474,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             client,
             symbol=str(symbol or ""),
             price=px,
+            exchange_id=exchange_id,
+            market_type=market_type,
             market_order=True,
         )
         sizing = payload.get("sizing") if isinstance(payload, dict) else {}
@@ -1529,6 +1521,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
         *,
         strategy_id: int,
         client: Any,
+        exchange_id: str,
+        market_type: str,
         symbol: str,
         signal_type: str,
         reduce_only: bool,
@@ -1545,6 +1539,8 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 client,
                 symbol=str(symbol or ""),
                 price=float(ref_price or 0.0),
+                exchange_id=exchange_id,
+                market_type=market_type,
                 market_order=True,
             )
             sizing = payload.get("sizing") if isinstance(payload, dict) else {}
@@ -1965,16 +1961,14 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                     "Spot size prepare failed: pending_id=%s, err=%s", order_id, e
                 )
                 phases["spot_prepare_error"] = str(e)
-
-        if market_type == "swap" and exchange_id == "bitget":
+        if market_category == "Crypto":
             amount, phases["exchange_quantity_normalization"] = exchange_quantity_snapshot(
                 client, exchange_id=exchange_id, symbol=symbol, market_type=market_type,
-                requested=amount, exchange_config=exchange_config,
-            )
-
+                requested=amount, exchange_config=exchange_config)
         self._log_live_order_sizing(
             strategy_id=strategy_id,
             client=client,
+            exchange_id=exchange_id, market_type=market_type,
             symbol=symbol,
             signal_type=signal_type,
             reduce_only=reduce_only,
@@ -2048,7 +2042,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             friendly_error = self._friendly_order_error(
                 "invalid amount",
                 client=client,
-                exchange_id=exchange_id,
+                exchange_id=exchange_id, market_type=market_type,
                 symbol=symbol,
                 signal_type=signal_type,
                 amount=amount,
@@ -2092,6 +2086,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 )
                 limit_client_oid = make_client_order_id(
                     exchange_id=exchange_id,
+                    market_type=market_type,
                     strategy_id=strategy_id,
                     order_id=order_id,
                     phase="lmt",
@@ -2099,6 +2094,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             adapter = LiveOrderPhaseAdapter(
                 client=client,
                 exchange_id=exchange_id,
+                market_type=market_type,
                 payload=payload,
                 exchange_config=exchange_config,
                 order_mode=order_mode,
@@ -2169,7 +2165,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 friendly_error = self._friendly_order_error(
                     execution_result.error,
                     client=client,
-                    exchange_id=exchange_id,
+                    exchange_id=exchange_id, market_type=market_type,
                     symbol=symbol,
                     signal_type=signal_type,
                     amount=amount,
@@ -2189,7 +2185,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             friendly_error = self._friendly_order_error(
                 e,
                 client=client,
-                exchange_id=exchange_id,
+                exchange_id=exchange_id, market_type=market_type,
                 symbol=symbol,
                 signal_type=signal_type,
                 amount=amount,

@@ -3,6 +3,7 @@ import math
 import pandas as pd
 import pytest
 
+from app.services.instrument_rules import InstrumentRules
 from app.services.strategy_v2 import StrategyV2BacktestRunner, StrategyV2LiveSession
 from app.services.strategy_v2.data import MultiAssetDataPortal
 from app.services.strategy_v2.models import ScheduleSpec
@@ -18,6 +19,23 @@ def _frame(prices):
         "close": prices,
         "volume": [100000] * len(prices),
     }, index=index)
+
+
+def _rules(key: str, *, amount_step: float, min_notional: float = 0.0, min_amount: float = 0.0):
+    market_type = "swap" if key.lower().endswith("@swap") else "spot"
+    return {
+        key: InstrumentRules(
+            key=key,
+            exchange_id="binance",
+            market_type=market_type,
+            symbol=key.split(":", 1)[-1].split("@", 1)[0],
+            amount_step=amount_step,
+            min_amount=min_amount,
+            min_notional=min_notional,
+            price_tick=0.01,
+            captured_at="2026-01-01T00:00:00Z",
+        )
+    }
 
 
 def test_data_portal_caches_timestamps_and_slices_point_in_time_history():
@@ -709,7 +727,6 @@ def test_scheduler_honors_weekday_monthday_and_intraday_time():
 def test_rejected_and_deferred_orders_are_visible_in_audit_ledger():
     frame = _frame([100, 101, 102])
     frame["is_suspended"] = [False, True, False]
-    frame["lot_size"] = [10, 10, 10]
     code = """
 def initialize(context):
     context.set_universe(["USStock:AAPL"])
@@ -1085,8 +1102,6 @@ def test_crypto_integer_lot_size_no_dust_on_close():
         "low": [p * 0.999 for p in prices],
         "close": prices,
         "volume": [0.1] * len(prices),  # Low volume so liquidity cap = 0.1 BTC
-        "lot_size": [0.001] * len(prices),  # BTC perp lot size (0.001 BTC)
-        "min_notional": [5.0] * len(prices),  # Min 5 USDT notional
     }, index=index)
     
     code = """
@@ -1109,6 +1124,9 @@ def handle_data(context, data):
         initial_capital=10_000,
         commission=0.0005,
         slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.001, min_notional=5.0
+        ),
     ).run()
     
     # Should have 2 executions (entry + exit)
@@ -1141,8 +1159,6 @@ def test_crypto_min_notional_rejection():
         "low": prices,
         "close": prices,
         "volume": [10000] * len(prices),
-        "lot_size": [0.01] * len(prices),  # Realistic lot size
-        "min_notional": [100.0] * len(prices),  # Min 100 USDT notional
     }, index=index)
     
     code = """
@@ -1163,6 +1179,9 @@ def handle_data(context, data):
         initial_capital=10_000,
         commission=0.0005,
         slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.01, min_notional=100.0
+        ),
     ).run()
     
     # Order should be rejected due to min_notional
@@ -1170,55 +1189,151 @@ def handle_data(context, data):
     assert "min_notional" in rejected_reasons, f"Expected min_notional rejection, got: {rejected_reasons}"
 
 
-def test_crypto_position_dust_forced_to_zero():
-    """
-    Test that sub-lot position residuals are forced to zero.
-    """
-    prices = [100, 100, 100]
+def test_crypto_min_notional_does_not_block_full_close():
+    prices = [10, 10, 4, 4]
     index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
     frame = pd.DataFrame({
         "open": prices,
         "high": prices,
         "low": prices,
         "close": prices,
-        "volume": [10000] * len(prices),
-        "lot_size": [0.01] * len(prices),  # Lot size = 0.01 units
-        "min_notional": [1.0] * len(prices),
+        "volume": [1000] * len(prices),
     }, index=index)
-    
+
     code = """
 def initialize(context):
-    g.symbol = "Crypto:BTC/USDT@swap"
+    g.symbol = "Crypto:TUT/USDT@swap"
     g.step = 0
     context.set_universe([g.symbol])
     context.subscribe(frequency="1m")
 
 def handle_data(context, data):
     if g.step == 0:
-        order(g.symbol, 0.25, reason="entry")  # 0.25 units, will be rounded to 0.20 (20 lots)
+        order(g.symbol, 1, reason="entry")
     elif g.step == 1:
-        order(g.symbol, -0.25, reason="exit")  # Try to close 0.25, but only 0.20 exist
+        order_target_value(g.symbol, 0, reason="exit")
     g.step += 1
 """
     result = StrategyV2BacktestRunner(
         code=code,
-        frames={"Crypto:BTC/USDT@swap": frame},
-        initial_capital=10_000,
-        commission=0.0005,
-        slippage=0.0005,
+        frames={"Crypto:TUT/USDT@swap": frame},
+        initial_capital=100,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(
+            "Crypto:TUT/USDT@swap", amount_step=1.0, min_notional=5.0
+        ),
     ).run()
-    
-    # Should have 2 executions
+
     assert result["totalExecutions"] == 2
     assert result["totalTrades"] == 1
-    
-    # Position should be fully closed (no 0.05-unit dust remaining)
-    trade = result["closedTrades"][0]
-    assert abs(trade.get("exit_price", 0) - 100) < 1  # Exit at expected price
-    
-    # No minimum_trade_unit rejection
-    rejected_reasons = [item["statusReason"] for item in result["orderLedger"] if item["status"] == "rejected"]
-    assert "minimum_trade_unit" not in rejected_reasons
+    assert not result["positions"]
+    assert result["orderLedger"][-1]["status"] == "filled"
+
+
+def test_crypto_spot_close_still_obeys_min_notional():
+    prices = [10, 10, 4, 4]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": prices,
+        "low": prices,
+        "close": prices,
+        "volume": [1000] * len(prices),
+    }, index=index)
+
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:TUT/USDT@spot"
+    g.step = 0
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if g.step == 0:
+        order(g.symbol, 1, reason="entry")
+    elif g.step == 1:
+        order_target_value(g.symbol, 0, reason="exit")
+    g.step += 1
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:TUT/USDT@spot": frame},
+        initial_capital=100,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(
+            "Crypto:TUT/USDT@spot", amount_step=1.0, min_notional=5.0
+        ),
+    ).run()
+
+    assert result["totalExecutions"] == 1
+    assert result["positions"]
+    assert result["orderLedger"][-1]["statusReason"] == "min_notional"
+
+
+def test_crypto_min_notional_uses_cash_capped_fill_quantity():
+    prices = [10, 10, 10]
+    index = pd.date_range("2026-01-01", periods=len(prices), freq="1min")
+    frame = pd.DataFrame({
+        "open": prices,
+        "high": prices,
+        "low": prices,
+        "close": prices,
+        "volume": [1000] * len(prices),
+    }, index=index)
+
+    code = """
+def initialize(context):
+    g.symbol = "Crypto:TUT/USDT@swap"
+    g.sent = False
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1m")
+
+def handle_data(context, data):
+    if not g.sent:
+        order(g.symbol, 10, reason="entry")
+        g.sent = True
+"""
+    result = StrategyV2BacktestRunner(
+        code=code,
+        frames={"Crypto:TUT/USDT@swap": frame},
+        initial_capital=20,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(
+            "Crypto:TUT/USDT@swap", amount_step=1.0, min_notional=50.0
+        ),
+    ).run()
+
+    assert result["totalExecutions"] == 0
+    assert not result["positions"]
+    assert result["orderLedger"][0]["statusReason"] == "min_notional"
+
+
+def test_crypto_target_zero_reconciles_a_real_sub_lot_residual():
+    symbol = "Crypto:BTC/USDT@swap"
+    frame = _frame([100, 100])
+    portal = MultiAssetDataPortal({symbol: frame})
+    broker = MultiAssetSimulationBroker(
+        initial_capital=10_000,
+        commission=0.0,
+        slippage=0.0,
+        instrument_rules=_rules(symbol, amount_step=0.1, min_notional=1.0),
+    )
+    broker.portfolio.positions[symbol] = Position(
+        symbol=symbol,
+        amount=0.25,
+        avg_cost=100,
+        last_price=100,
+    )
+
+    timestamp = frame.index[0]
+    portal.set_clock(timestamp, include_current=True)
+    broker.execute([OrderIntent(symbol, "target_quantity", 0.0)], portal, timestamp)
+
+    assert broker.executions[-1]["quantity"] == pytest.approx(0.25)
+    assert not broker.portfolio.positions
 
 
 def test_backtest_results_independent_of_initial_capital():
@@ -1235,8 +1350,6 @@ def test_backtest_results_independent_of_initial_capital():
         "low": [p * 0.999 for p in prices],
         "close": prices,
         "volume": [0.2] * len(prices),  # Very low volume -> tight liquidity cap (0.02 BTC per bar)
-        "lot_size": [0.001] * len(prices),  # BTC perp lot size (0.001 BTC)
-        "min_notional": [5.0] * len(prices),
     }, index=index)
     
     code = """
@@ -1260,6 +1373,9 @@ def handle_data(context, data):
         initial_capital=50_000,  # Can only afford ~1 BTC
         commission=0.0005,
         slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.001, min_notional=5.0
+        ),
     ).run()
     
     result_large = StrategyV2BacktestRunner(
@@ -1268,6 +1384,9 @@ def handle_data(context, data):
         initial_capital=500_000,  # Can afford 10 BTC
         commission=0.0005,
         slippage=0.0005,
+        instrument_rules=_rules(
+            "Crypto:BTC/USDT@swap", amount_step=0.001, min_notional=5.0
+        ),
     ).run()
     
     # Both should complete the trade (no dust blocking)

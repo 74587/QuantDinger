@@ -105,6 +105,9 @@ def _prepare_run(payload: dict[str, Any], user_id: int) -> dict[str, Any]:
         "strategy_id": strategy_id,
         "source_id": source_id,
         "strategy_name": strategy_name,
+        "instrument_rules_snapshot_id": str(
+            payload.get("instrumentRulesSnapshotId") or ""
+        ).strip(),
     }
 
 

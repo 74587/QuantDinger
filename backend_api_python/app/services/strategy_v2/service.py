@@ -16,6 +16,7 @@ from app.services.backtest_limits import (
     validate_backtest_range,
 )
 from app.services.fundamental_data import get_fundamental_data_service
+from app.services.instrument_rules import InstrumentRulesProvider, get_instrument_rules_provider
 from app.services.universe import UniverseService, get_universe_service
 
 from .contract import StrategyV2ContractError, compile_strategy_v2
@@ -38,6 +39,7 @@ class StrategyV2BacktestService:
         data_kind: str = "market",
         data_source: str = "system_market_data_router",
         snapshot_store: MarketDataSnapshotStore | None = None,
+        instrument_rules_provider: InstrumentRulesProvider | None = None,
     ) -> None:
         self.repository = repository or StrategyBacktestRepository()
         self.universe_service = universe_service or get_universe_service()
@@ -46,6 +48,7 @@ class StrategyV2BacktestService:
         self.data_kind = str(data_kind or "market")
         self.data_source = str(data_source or "system_market_data_router")
         self.snapshot_store = snapshot_store or MarketDataSnapshotStore()
+        self.instrument_rules_provider = instrument_rules_provider or get_instrument_rules_provider()
 
     def compile(self, code: str) -> dict[str, Any]:
         return compile_strategy_v2(code).manifest.metadata()
@@ -137,6 +140,7 @@ class StrategyV2BacktestService:
         strategy_id: int | None = None,
         source_id: int | None = None,
         strategy_name: str = "",
+        instrument_rules_snapshot_id: str = "",
     ) -> tuple[int | None, dict[str, Any]]:
         program = compile_strategy_v2(code)
         manifest = program.manifest
@@ -191,6 +195,15 @@ class StrategyV2BacktestService:
             members = self.universe_service.resolve_members(user_id, universe_id, as_of=timestamp.date())
             return [_member_key(item) for item in members]
 
+        rules_snapshot = None
+        if any(str(item.get("market") or "") == "Crypto" for item in candidates):
+            rules_snapshot = self.instrument_rules_provider.historical_snapshot(
+                candidates,
+                snapshot_id=instrument_rules_snapshot_id,
+                as_of=end_date,
+                persist=self.data_kind == "market" and persist,
+            )
+
         runner = StrategyV2BacktestRunner(
             code=code,
             frames=frames,
@@ -202,6 +215,7 @@ class StrategyV2BacktestService:
             commission=commission,
             slippage=slippage,
             universe_resolver=resolve_universe,
+            instrument_rules=rules_snapshot,
         )
         result = runner.run(start_date=start_date, end_date=end_date)
         benchmark_spec = _benchmark_for_manifest(manifest)

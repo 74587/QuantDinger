@@ -26,6 +26,7 @@ _backtest = StrategyV2BacktestService()
 _BACKTEST_FIELDS = {
     "code", "startDate", "endDate", "initialCapital", "commission", "slippage",
     "leverageEnabled", "leverage", "params",
+    "instrumentRulesSnapshotId",
 }
 
 
@@ -164,6 +165,9 @@ def _run_backtest(payload: dict, on_progress=None) -> Any:
         commission=commission,
         slippage=slippage,
         params=params if isinstance(params, dict) else {},
+        instrument_rules_snapshot_id=str(
+            payload.get("instrumentRulesSnapshotId") or ""
+        ).strip(),
         persist=False,
     )
     if on_progress:

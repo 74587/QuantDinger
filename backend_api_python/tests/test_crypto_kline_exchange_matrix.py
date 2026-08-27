@@ -61,6 +61,32 @@ def test_swap_symbol_uses_settlement_suffix():
     assert source._symbol_for_scoped_market("BTC/USDT") == "BTC/USDT:USDT"
 
 
+def test_crypto_kline_is_pure_ohlcv_and_preserves_price_precision():
+    now_s = int(datetime.now(timezone.utc).timestamp())
+    source = object.__new__(CryptoDataSource)
+    source._allow_public_fallback = False
+    source._preferred_public_exchange_id = ""
+    source._scoped_market_type = "swap"
+    source.exchange = SimpleNamespace(id="binanceusdm", timeframes={"1m": "1m"})
+    source._markets_loaded = False
+    source._markets_cache = None
+    source._fetch_ohlcv = lambda *_args, **_kwargs: [
+        [now_s * 1000, "0.01038", "0.010381", "0.010379", "0.01038", "12.3456"],
+    ]
+    source.log_result = lambda *_args, **_kwargs: None
+
+    rows = source.get_kline("TUT/USDT", "1m", 1)
+
+    assert rows == [{
+        "time": now_s,
+        "open": 0.01038,
+        "high": 0.010381,
+        "low": 0.010379,
+        "close": 0.01038,
+        "volume": 12.35,
+    }]
+
+
 def test_gate_long_range_fetch_is_clamped_to_recent_candle_limit():
     now_s = int(datetime.now(timezone.utc).timestamp())
     requested_since_s = now_s - 30 * 24 * 60 * 60

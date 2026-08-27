@@ -152,6 +152,11 @@ class _GateBase(BaseRestClient):
 
 
 class GateSpotClient(_GateBase):
+    def get_currency_pair(self, *, symbol: str) -> Dict[str, Any]:
+        """Return native public spot amount/price precision and minimums."""
+        pair = to_gate_currency_pair(symbol)
+        return self._public_request("GET", f"/api/v4/spot/currency_pairs/{pair}")
+
     def ping(self) -> bool:
         try:
             _ = self._public_request("GET", "/api/v4/spot/time")
