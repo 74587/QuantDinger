@@ -25,6 +25,16 @@ from app.services.ai_generation_contracts import (
     INDICATOR_GENERATION_CONTRACT,
     INDICATOR_REPAIR_REQUIREMENTS,
 )
+from app.services.ai_copilot_context import fit_messages_to_budget
+from app.services.indicator_ai_workspace import (
+    begin_turn as begin_indicator_ai_turn,
+    classify_indicator_ai_intent,
+    clear_workspace as clear_indicator_ai_workspace,
+    complete_discussion_turn as complete_indicator_ai_discussion_turn,
+    complete_turn as complete_indicator_ai_turn,
+    get_workspace as get_indicator_ai_workspace,
+    set_change_status as set_indicator_ai_change_status,
+)
 from app.services.indicator_workspace import is_indicator_ide_listable
 from app.services.indicator_versions import (
     get_version as get_indicator_code_version,
@@ -154,7 +164,17 @@ def _indicator_ai_text(key: str, lang: str = "zh-CN") -> str:
     texts = {
         "prompt_required": "Prompt cannot be empty",
         "insufficient_credits": "Insufficient credits. Please top up and try again.",
+        "candidate_ready": "A candidate version is ready and has passed automatic code checks. Preview it before applying it to the editor.",
+        "candidate_needs_review": "A candidate is ready, but automatic checks found issues. Review the validation result before applying it.",
     }
+    if _is_zh_lang(lang):
+        zh_texts = {
+            "prompt_required": "请输入指标修改需求",
+            "insufficient_credits": "积分不足，请充值后重试。",
+            "candidate_ready": "候选版本已生成并通过自动代码检查。请先预览，再决定是否应用到编辑器。",
+            "candidate_needs_review": "候选版本已生成，但自动检查发现问题。请先查看检查结果，不要直接应用。",
+        }
+        return zh_texts.get(key, texts.get(key, key))
     return texts.get(key, key)
 
 
@@ -682,6 +702,57 @@ def preview_indicator_chart():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
+@indicator_blp.route("/aiWorkspace/<int:indicator_id>", methods=["GET"])
+@login_required
+def indicator_ai_workspace(indicator_id: int):
+    """Load the bounded AI authoring workspace for one owned indicator."""
+    try:
+        data = get_indicator_ai_workspace(g.user_id, indicator_id)
+        return jsonify({"code": 1, "msg": "success", "data": data})
+    except LookupError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 403
+    except Exception as exc:
+        logger.error("indicator_ai_workspace failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@indicator_blp.route("/aiWorkspace/<int:indicator_id>", methods=["DELETE"])
+@login_required
+def delete_indicator_ai_workspace(indicator_id: int):
+    """Clear conversation and pending candidates without touching saved code."""
+    try:
+        data = clear_indicator_ai_workspace(g.user_id, indicator_id)
+        return jsonify({"code": 1, "msg": "success", "data": data})
+    except LookupError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 403
+    except Exception as exc:
+        logger.error("delete_indicator_ai_workspace failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@indicator_blp.route("/aiWorkspace/changes/<int:change_id>/status", methods=["POST"])
+@login_required
+def update_indicator_ai_change_status(change_id: int):
+    """Mark a generated candidate as applied or discarded."""
+    try:
+        status = str((request.get_json() or {}).get("status") or "").strip().lower()
+        data = set_indicator_ai_change_status(g.user_id, change_id, status)
+        return jsonify({"code": 1, "msg": "success", "data": data})
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except LookupError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 404
+    except PermissionError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 403
+    except Exception as exc:
+        logger.error("update_indicator_ai_change_status failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
 @indicator_blp.route("/aiGenerate", methods=["POST"])
 @login_required
 def ai_generate():
@@ -700,6 +771,15 @@ def ai_generate():
     prompt = (data.get("prompt") or "").strip()
     existing = (data.get("existingCode") or "").strip()
     context = data.get("context") if isinstance(data.get("context"), dict) else {}
+    source = str(data.get("source") or context.get("source") or "").strip()
+    indicator_id = context.get("indicatorId")
+    requested_interaction_mode = str(data.get("interactionMode") or "auto").strip().lower()
+    resolved_interaction_mode = (
+        classify_indicator_ai_intent(prompt, requested_interaction_mode)
+        if source == "indicator_ide"
+        else "modify"
+    )
+    workspace_context: Dict[str, Any] | None = None
 
     if not prompt:
         # Keep SSE contract (match PHP behavior) so frontend doesn't look "stuck".
@@ -864,6 +944,88 @@ Do not use `# @strategy` in indicator code. Strategy defaults belong in Strategy
 Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **no** explanation before or after the code. First non-empty line should be `my_indicator_name` or `# @param` immediately followed by `my_indicator_name`.
 """ + "\n\n" + INDICATOR_GENERATION_CONTRACT
 
+    def _discussion_fallback() -> str:
+        indicator_name = str(context.get("indicatorName") or "").strip() or "this indicator"
+        param_names = re.findall(r"^\s*#\s*@param\s+([A-Za-z_]\w*)", existing, flags=re.MULTILINE)
+        output_parts: List[str] = []
+        if re.search(r"['\"]plots['\"]\s*:", existing):
+            output_parts.append("plots")
+        if re.search(r"['\"]signals['\"]\s*:", existing):
+            output_parts.append("signals")
+        if re.search(r"['\"]layers['\"]\s*:", existing):
+            output_parts.append("layers")
+        if _is_zh_lang(lang):
+            params_text = "、".join(param_names[:8]) if param_names else "未声明可调参数"
+            outputs_text = "、".join(output_parts) if output_parts else "尚未识别到标准输出结构"
+            return (
+                f"当前指标是「{indicator_name}」。代码声明的参数包括：{params_text}；"
+                f"输出结构包括：{outputs_text}。你可以继续问具体变量、信号条件或图表含义。"
+                "这次仅回答问题，没有生成或修改代码。"
+            )
+        params_text = ", ".join(param_names[:8]) if param_names else "no declared tunable parameters"
+        outputs_text = ", ".join(output_parts) if output_parts else "no recognized standard output structure"
+        return (
+            f"The current indicator is {indicator_name}. Declared parameters: {params_text}. "
+            f"Recognized outputs: {outputs_text}. You can ask about a variable, signal condition, or chart element. "
+            "This answer did not generate or modify code."
+        )
+
+    def _generate_discussion_via_llm() -> str:
+        """Answer a code question without returning replacement source."""
+        from app.services.llm import LLMService
+
+        llm = LLMService()
+        if not llm.get_api_key():
+            return _discussion_fallback()
+
+        discussion_system = """You are QuantDinger's indicator-code reviewer.
+Answer the user's question about the currently open indicator. Use the same language as the user.
+Explain concrete logic, parameters, plots, visual signals, edge cases, and limitations from the supplied source.
+Never claim that code was changed. Do not return a full replacement script and do not create a code candidate.
+When useful, cite short variable or function names from the source, but keep the answer concise and readable.
+Lead with the conclusion. By default use 4-8 short points and stay under 700 Chinese characters or 350 English words; only go deeper when the user explicitly asks for a detailed walkthrough.
+If the question actually requests a code modification, explain what should change and ask the user to state the desired change explicitly; do not write the replacement code in this discussion response."""
+        messages: List[Dict[str, str]] = [{"role": "system", "content": discussion_system}]
+        if workspace_context:
+            summary_text = json.dumps(workspace_context.get("summary") or {}, ensure_ascii=False, default=str)
+            messages.append({
+                "role": "system",
+                "content": "# Bounded indicator conversation memory\n" + summary_text[:4000],
+            })
+            for item in workspace_context.get("recent_messages") or []:
+                role = str(item.get("role") or "")
+                content_text = str(item.get("content") or "").strip()
+                if role in {"user", "assistant"} and content_text:
+                    messages.append({"role": role, "content": content_text[:2000]})
+
+        chart_context = {
+            "market": context.get("market"),
+            "symbol": context.get("symbol"),
+            "timeframe": context.get("timeframe"),
+            "indicator_name": context.get("indicatorName"),
+            "indicator_description": context.get("indicatorDescription"),
+        }
+        messages.append({
+            "role": "user",
+            "content": (
+                "# Current chart context\n"
+                + json.dumps(chart_context, ensure_ascii=False, default=str)
+                + "\n\n# Current indicator source (source of truth)\n```python\n"
+                + existing[:36000]
+                + "\n```\n\n# User question\n"
+                + prompt
+            ),
+        })
+        messages, budget_debug = fit_messages_to_budget(messages, max_tokens=32000)
+        logger.info("indicator discussion context budget=%s", _sse_json(budget_debug))
+        answer = llm.call_llm_api(
+            messages=messages,
+            model=llm.get_default_model(),
+            temperature=0.25,
+            use_json_mode=False,
+        )
+        return str(answer or "").strip() or _discussion_fallback()
+
     def _template_code() -> str:
         from app.services.indicator_default_template import build_default_indicator_template
 
@@ -946,11 +1108,30 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
         
         # Call LLM using the unified API (auto-selects provider based on LLM_PROVIDER env)
         # use_json_mode=False because we want raw Python code output
+        messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if workspace_context:
+            summary_text = json.dumps(workspace_context.get("summary") or {}, ensure_ascii=False, default=str)
+            messages.append({
+                "role": "system",
+                "content": (
+                    "# Indicator authoring memory\n"
+                    "Use this bounded memory only to preserve the user's intent and prior constraints. "
+                    "The current code below is always the source of truth.\n" + summary_text[:5000]
+                ),
+            })
+            for item in workspace_context.get("recent_messages") or []:
+                role = str(item.get("role") or "")
+                if role not in {"user", "assistant"}:
+                    continue
+                content_text = str(item.get("content") or "").strip()
+                if content_text:
+                    messages.append({"role": role, "content": content_text[:2400]})
+        messages.append({"role": "user", "content": user_prompt})
+        messages, budget_debug = fit_messages_to_budget(messages, max_tokens=48000)
+        logger.info("indicator ai context budget=%s", _sse_json(budget_debug))
+
         content = llm.call_llm_api(
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             model=current_model,
             temperature=temperature,
             use_json_mode=False  # Code generation doesn't need JSON mode
@@ -1151,12 +1332,14 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
     # Capture user_id before generator runs (generator executes outside request context)
     user_id = g.user_id
     def stream():
+        nonlocal workspace_context
         from app.services.billing_service import get_billing_service
         billing = get_billing_service()
+        billing_feature = "ai_copilot_chat" if resolved_interaction_mode == "discussion" else "ai_code_gen"
         ok, msg = billing.check_and_consume(
             user_id=user_id,
-            feature='ai_code_gen',
-            reference_id=f"ai_code_gen_{user_id}_{int(time.time())}"
+            feature=billing_feature,
+            reference_id=f"{billing_feature}_{user_id}_{int(time.time())}"
         )
         if not ok:
             error_msg = f"Insufficient credits: {msg}" if msg else _indicator_ai_text("insufficient_credits", lang)
@@ -1164,7 +1347,67 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             yield "data: [DONE]\n\n"
             return
 
+        if source == "indicator_ide" and indicator_id not in (None, ""):
+            try:
+                workspace_context = begin_indicator_ai_turn(
+                    user_id,
+                    int(indicator_id),
+                    prompt,
+                    intent=resolved_interaction_mode,
+                )
+            except (LookupError, PermissionError, ValueError) as exc:
+                yield "data: " + _sse_json({"error": str(exc)}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            except Exception as exc:
+                logger.error("begin indicator AI turn failed: %s", exc, exc_info=True)
+                yield "data: " + _sse_json({"error": "indicator_ai_workspace_unavailable"}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        if workspace_context and resolved_interaction_mode == "discussion":
+            try:
+                discussion_text = _generate_discussion_via_llm()
+                workspace_result = complete_indicator_ai_discussion_turn(
+                    user_id=user_id,
+                    workspace=workspace_context,
+                    answer=discussion_text,
+                )
+                yield "data: " + _sse_json({"workspace": workspace_result}) + "\n\n"
+                chunk_size = 240
+                for i in range(0, len(discussion_text), chunk_size):
+                    yield "data: " + _sse_json({"content": discussion_text[i : i + chunk_size]}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            except Exception as exc:
+                logger.error("indicator AI discussion failed: %s", exc, exc_info=True)
+                yield "data: " + _sse_json({"error": "indicator_ai_discussion_failed"}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
         code_text, debug_info = _generate_final_code()
+
+        if workspace_context:
+            validation = _validate_indicator_code_internal(code_text)
+            assistant_text = _indicator_ai_text("candidate_ready", lang)
+            if not validation.get("success"):
+                assistant_text = _indicator_ai_text("candidate_needs_review", lang)
+            try:
+                workspace_result = complete_indicator_ai_turn(
+                    user_id=user_id,
+                    workspace=workspace_context,
+                    prompt=prompt,
+                    base_code=existing,
+                    candidate_code=code_text,
+                    validation=validation,
+                    assistant_text=assistant_text,
+                )
+                yield "data: " + _sse_json({"workspace": workspace_result}) + "\n\n"
+            except Exception as exc:
+                logger.error("complete indicator AI turn failed: %s", exc, exc_info=True)
+                yield "data: " + _sse_json({"error": "indicator_ai_workspace_save_failed"}) + "\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
         yield "data: " + _sse_json({"debug": debug_info}) + "\n\n"
 
