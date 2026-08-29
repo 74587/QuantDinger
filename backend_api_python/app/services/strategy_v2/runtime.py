@@ -689,7 +689,12 @@ class MultiAssetSimulationBroker:
         batch_orders = list(orders)
         if not batch_orders:
             return deferred
-        equity_before = self.mark_to_market(portal, timestamp)
+        execution_price_overrides = dict(price_overrides or {})
+        equity_before = self.mark_to_market_before_fill(
+            portal,
+            timestamp,
+            price_overrides=execution_price_overrides,
+        )
         cash_before = float(self.portfolio.available_cash)
         target_weights: dict[str, float] = {}
         batch_event_indexes: list[int] = []
@@ -713,7 +718,11 @@ class MultiAssetSimulationBroker:
                 order.symbol,
                 position_side=_normalize_position_side(order.position_side),
             )
-            equity = self.mark_to_market(portal, timestamp)
+            # Every target in one execution batch is sized from the same
+            # pre-fill snapshot. The snapshot contains only prices observable
+            # at the declared fill instant, never the current bar's later
+            # close/high/low values.
+            equity = equity_before
             is_limit_order = order.order_type == "limit" or order.execution_algo == "limit"
             sizing_price = (
                 float(order.limit_price)
@@ -880,6 +889,7 @@ class MultiAssetSimulationBroker:
             current.amount = target_qty
             current.avg_cost = _next_average_cost(old_amount, current.avg_cost, delta, fill_price)
             current.last_price = fill_price
+            execution_price_overrides[order.symbol] = fill_price
             self.portfolio.available_cash = projected_cash
             if abs(current.amount) <= 1e-12:
                 current.amount = 0.0
@@ -998,6 +1008,7 @@ class MultiAssetSimulationBroker:
             cash_before=cash_before,
             target_weights=target_weights,
             event_indexes=batch_event_indexes,
+            price_overrides=execution_price_overrides,
         )
         return deferred
 
@@ -1259,8 +1270,13 @@ class MultiAssetSimulationBroker:
         cash_before: float,
         target_weights: Mapping[str, float],
         event_indexes: list[int],
+        price_overrides: Mapping[str, float] | None = None,
     ) -> None:
-        equity_after = self.mark_to_market(portal, timestamp)
+        equity_after = self.mark_to_market_before_fill(
+            portal,
+            timestamp,
+            price_overrides=price_overrides,
+        )
         actual_weights = {
             symbol: position.market_value / equity_after if equity_after else 0.0
             for symbol, position in self.portfolio.positions.items()
@@ -1342,6 +1358,40 @@ class MultiAssetSimulationBroker:
             price = portal.close_at(symbol, timestamp)
             if price is None:
                 price = portal.current(symbol, "close", position.last_price)
+            position.last_price = float(price or position.last_price or position.avg_cost)
+            total += position.market_value
+        self.portfolio.total_value = total
+        return total
+
+    def mark_to_market_before_fill(
+        self,
+        portal: MultiAssetDataPortal,
+        timestamp: Any,
+        *,
+        price_overrides: Mapping[str, float] | None = None,
+    ) -> float:
+        """Value positions using only information available at the fill instant.
+
+        Market orders execute at the current bar open, so a position with a
+        bar at ``timestamp`` is marked at that open. Sparse instruments fall
+        back to their last completed close through the portal's point-in-time
+        visibility gate. Explicit execution prices cover intrabar protection
+        fills and forced liquidations without exposing the bar close.
+        """
+        total = float(self.portfolio.available_cash)
+        overrides = price_overrides or {}
+        for position_key, position in self.portfolio.positions.items():
+            raw_price = overrides.get(position_key)
+            if raw_price is None:
+                raw_price = overrides.get(position.symbol)
+            try:
+                price = float(raw_price) if raw_price is not None else None
+            except (TypeError, ValueError):
+                price = None
+            if price is None or not math.isfinite(price) or price <= 0:
+                price = portal.open_at(position.symbol, timestamp)
+            if price is None or not math.isfinite(float(price)) or float(price) <= 0:
+                price = portal.current(position.symbol, "close", position.last_price)
             position.last_price = float(price or position.last_price or position.avg_cost)
             total += position.market_value
         self.portfolio.total_value = total
@@ -1581,6 +1631,7 @@ class MultiAssetSimulationBroker:
 
 class StrategyV2BacktestRunner:
     VERSION = "quantdinger-strategy-api-v2"
+    PREFILL_VALUATION_POLICY = "explicit_fill_or_current_open_then_last_completed_close-v1"
 
     def __init__(
         self,
@@ -1988,7 +2039,10 @@ class StrategyV2BacktestRunner:
             "attribution": attribution,
             "logs": list(self.logs),
             "manifest": self.program.manifest.metadata(),
-            "engine": {"version": self.VERSION},
+            "engine": {
+                "version": self.VERSION,
+                "preFillValuationPolicy": self.PREFILL_VALUATION_POLICY,
+            },
             "audit": self._reconcile(),
         }
 

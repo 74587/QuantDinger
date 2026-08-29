@@ -9,6 +9,7 @@ from app.services.strategy_v2 import (
     StrategyBacktestRepository,
     canonical_source_metadata,
     compile_strategy_v2,
+    strategy_source_code_hash,
 )
 from app.utils.auth import login_required
 from app.utils.logger import get_logger
@@ -66,13 +67,42 @@ def _mask_hidden_version(item: dict | None, *, hidden: bool) -> dict | None:
     return out
 
 
-def _has_successful_script_backtest(user_id: int, source_id: int) -> bool:
-    rows = StrategyBacktestRepository().list_runs(
+def _has_successful_script_backtest(user_id: int, source_id: int, code: str) -> bool:
+    code_hash = strategy_source_code_hash(code)
+    return StrategyBacktestRepository().has_successful_run(
         user_id=int(user_id),
         source_id=int(source_id),
-        limit=1,
+        code_hash=code_hash,
     )
-    return bool(rows)
+
+
+@strategy_blp.route("/strategies/script-sources/publish-readiness", methods=["GET"])
+@login_required
+def get_script_source_publish_readiness():
+    try:
+        source_id = int(request.args.get("id") or 0)
+        if not source_id:
+            return jsonify({"code": 0, "msg": "source id is required", "data": None}), 400
+        source = get_script_source_service().get_source(source_id, user_id=g.user_id)
+        if not source:
+            return jsonify({"code": 0, "msg": "script source not found", "data": None}), 404
+        ready = _has_successful_script_backtest(
+            int(g.user_id),
+            source_id,
+            str(source.get("code") or ""),
+        )
+        return jsonify({
+            "code": 1,
+            "msg": "success",
+            "data": {
+                "source_id": source_id,
+                "ready": ready,
+                "requires_backtest": not ready,
+            },
+        })
+    except Exception as exc:
+        logger.exception("get_script_source_publish_readiness failed")
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
 @strategy_blp.route("/strategies/script-templates", methods=["GET"])
@@ -280,11 +310,19 @@ def publish_script_source():
 
         compile_strategy_v2(str(source.get("code") or ""))
 
-        if not _has_successful_script_backtest(g.user_id, source_id):
+        if not _has_successful_script_backtest(
+            g.user_id,
+            source_id,
+            str(source.get("code") or ""),
+        ):
             return jsonify({
                 "code": 0,
                 "msg": "This script strategy must have at least one successful backtest before publishing.",
-                "data": {"source_id": source_id, "requires_backtest": True},
+                "data": {
+                    "source_id": source_id,
+                    "requires_backtest": True,
+                    "error_type": "BACKTEST_REQUIRED",
+                },
             }), 400
 
         user_role = getattr(g, "user_role", "user")
@@ -303,6 +341,7 @@ def publish_script_source():
             is_admin=is_admin,
             existing_indicator_id=int(payload.get("indicatorId") or 0),
             source_id=source_id,
+            param_schema=source.get("param_schema") if isinstance(source.get("param_schema"), dict) else {},
         )
         if data is not None:
             data["source_id"] = source_id

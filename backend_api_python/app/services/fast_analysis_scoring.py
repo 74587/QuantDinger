@@ -352,7 +352,34 @@ class FastAnalysisScoringMixin:
     def _calculate_fundamental_score(self, fundamental: Dict, market: str) -> float:
         """Calculate the fundamental score on a -100 to +100 scale."""
         if market not in ("USStock", "CNStock", "HKStock") or not fundamental:
-            return 50.0
+            return 0.0
+
+        statements = fundamental.get("financial_statements") or {}
+        latest_quarter = statements.get("latest_quarter") or {}
+        quarter_derived = latest_quarter.get("derived") or {}
+        ttm_derived = (statements.get("ttm") or {}).get("derived") or {}
+
+        # Current operating health comes from the latest reported quarter;
+        # TTM remains the fallback for profitability durability.
+        roe = quarter_derived.get("roe")
+        if roe is None:
+            roe = ttm_derived.get("roe")
+        if roe is None:
+            roe = fundamental.get("roe")
+        revenue_growth = quarter_derived.get("revenue_growth")
+        if revenue_growth is None:
+            revenue_growth = fundamental.get("revenue_growth")
+        profit_margin = quarter_derived.get("profit_margin")
+        if profit_margin is None:
+            profit_margin = ttm_derived.get("profit_margin")
+        if profit_margin is None:
+            profit_margin = fundamental.get("profit_margin")
+        debt_to_equity = quarter_derived.get("debt_to_equity")
+        if debt_to_equity is None:
+            debt_to_equity = fundamental.get("debt_to_equity")
+        current_ratio = quarter_derived.get("current_ratio")
+        if current_ratio is None:
+            current_ratio = fundamental.get("current_ratio")
 
         score = 0.0
         factors = 0
@@ -372,8 +399,7 @@ class FastAnalysisScoringMixin:
             score += pe_score
             factors += 1
 
-        roe = fundamental.get("roe")
-        if roe:
+        if roe is not None:
             if roe > 20:
                 roe_score = +20
             elif roe > 15:
@@ -387,8 +413,7 @@ class FastAnalysisScoringMixin:
             score += roe_score
             factors += 1
 
-        revenue_growth = fundamental.get("revenue_growth")
-        if revenue_growth:
+        if revenue_growth is not None:
             if revenue_growth > 20:
                 growth_score = +20
             elif revenue_growth > 10:
@@ -402,8 +427,7 @@ class FastAnalysisScoringMixin:
             score += growth_score
             factors += 1
 
-        profit_margin = fundamental.get("profit_margin")
-        if profit_margin:
+        if profit_margin is not None:
             if profit_margin > 20:
                 margin_score = +15
             elif profit_margin > 10:
@@ -417,8 +441,7 @@ class FastAnalysisScoringMixin:
             score += margin_score
             factors += 1
 
-        debt_to_equity = fundamental.get("debt_to_equity")
-        if debt_to_equity:
+        if debt_to_equity is not None:
             if debt_to_equity < 0.5:
                 debt_score = +10
             elif debt_to_equity > 2.0:
@@ -428,10 +451,18 @@ class FastAnalysisScoringMixin:
             score += debt_score
             factors += 1
 
-        if factors > 0:
-            score = score / factors * 100 / 4
-        else:
-            return 50.0
+        if current_ratio is not None:
+            if current_ratio >= 1.5:
+                liquidity_score = +10
+            elif current_ratio < 1.0:
+                liquidity_score = -10
+            else:
+                liquidity_score = 0
+            score += liquidity_score
+            factors += 1
+
+        if factors <= 0:
+            return 0.0
 
         return max(-100, min(100, score))
 

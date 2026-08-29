@@ -48,6 +48,16 @@ class StrategyV2ContractError(ValueError):
         self.code = code
 
 
+def strategy_source_code_hash(code: str) -> str:
+    """Return the canonical fingerprint used for a Strategy V2 source version.
+
+    Compilation ignores surrounding whitespace, so persistence and readiness
+    checks must do the same or an unchanged saved source can appear untested.
+    """
+    normalized = str(code or "").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 class StateNamespace(SimpleNamespace):
     """Per-run user state for Strategy API V2 code."""
 
@@ -290,7 +300,7 @@ def compile_strategy_v2(code: str) -> CompiledStrategyV2:
     direction_mode = normalize_direction_mode(direction_mode)
     manifest = StrategyManifest(
         api_version=2,
-        code_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        code_hash=strategy_source_code_hash(raw),
         strategy_type=strategy_type,
         universe=UniverseSpec(
             kind="dynamic" if context.universe_reference else "static",

@@ -8,6 +8,7 @@ from .contract import (
     canonical_source_metadata,
     compile_strategy_v2,
     is_strategy_v2_code,
+    strategy_source_code_hash,
 )
 from .instruments import InstrumentParseError, infer_market, normalize_frequency, parse_instrument
 from .models import InstrumentSpec, ScheduleSpec, StrategyManifest, SubscriptionSpec, UniverseSpec
@@ -45,6 +46,7 @@ __all__ = [
     "SubscriptionSpec",
     "UniverseSpec",
     "compile_strategy_v2",
+    "strategy_source_code_hash",
     "canonical_source_metadata",
     "infer_market",
     "is_strategy_v2_code",

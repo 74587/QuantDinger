@@ -174,6 +174,55 @@ def handle_data(context, data):
     assert result["rawTrades"][0]["price"] == 110
 
 
+def test_target_percent_open_sizing_ignores_same_bar_future_ohlc_values():
+    code = """
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    bars = get_history(10, "1d", "close", "USStock:AAPL")
+    if len(bars) == 1:
+        order_target_percent("USStock:AAPL", 1.0, reason="initial_target")
+    elif len(bars) == 2:
+        order_target_percent("USStock:AAPL", 0.5, reason="rebalance_target")
+"""
+    index = pd.date_range("2026-01-01", periods=3, freq="D")
+
+    def run(close: float, high: float, low: float):
+        frame = pd.DataFrame({
+            "open": [100.0, 100.0, 100.0],
+            "high": [101.0, 101.0, high],
+            "low": [99.0, 99.0, low],
+            "close": [100.0, 100.0, close],
+            "volume": [1_000_000.0] * 3,
+        }, index=index)
+        return StrategyV2BacktestRunner(
+            code=code,
+            frames={"USStock:AAPL": frame},
+            initial_capital=10_000,
+            commission=0,
+            slippage=0,
+        ).run()
+
+    low_close = run(80.0, 150.0, 50.0)
+    high_close = run(120.0, 150.0, 50.0)
+    changed_range = run(80.0, 500.0, 1.0)
+
+    for result in (low_close, high_close, changed_range):
+        rebalance = result["executions"][1]
+        assert result["engine"]["preFillValuationPolicy"] == (
+            "explicit_fill_or_current_open_then_last_completed_close-v1"
+        )
+        assert rebalance["price"] == pytest.approx(100.0)
+        assert rebalance["side"] == "sell"
+        assert rebalance["quantity"] == pytest.approx(50.0)
+        assert result["rebalanceRecords"][1]["equityBefore"] == pytest.approx(10_000.0)
+
+    assert low_close["orderLedger"] == high_close["orderLedger"] == changed_range["orderLedger"]
+    assert low_close["rebalanceRecords"] == high_close["rebalanceRecords"] == changed_range["rebalanceRecords"]
+
+
 def test_buy_limit_remains_resting_and_uses_favorable_gap_open():
     code = """
 def initialize(context):

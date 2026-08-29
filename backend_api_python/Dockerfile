@@ -42,6 +42,8 @@ RUN set -eux; \
       python3-dev \
       libffi-dev \
       libssl-dev \
+      fonts-noto-core \
+      fonts-noto-cjk \
       gosu \
     && rm -rf /var/lib/apt/lists/*
 

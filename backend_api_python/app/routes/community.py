@@ -66,6 +66,12 @@ def get_market_indicators():
             min_price, max_price = max_price, min_price
         sort_by = request.args.get('sort_by', 'score').strip()
         asset_type = request.args.get('asset_type', '').strip() or None
+        market = request.args.get('market', '').strip() or None
+        market_type = request.args.get('market_type', '').strip().lower() or None
+        binding_mode = request.args.get('binding_mode', '').strip().lower() or None
+        strategy_type = request.args.get('strategy_type', '').strip().lower() or None
+        direction_mode = request.args.get('direction_mode', '').strip().lower() or None
+        leverage = request.args.get('leverage', '').strip().lower() or None
         
         page_size = min(max(page_size, 1), 50)
         
@@ -89,6 +95,12 @@ def get_market_indicators():
             user_id=g.user_id,
             accept_language=accept_lang,
             asset_type=asset_type,
+            market=market,
+            market_type=market_type,
+            binding_mode=binding_mode,
+            strategy_type=strategy_type,
+            direction_mode=direction_mode,
+            leverage=leverage,
         )
         
         return jsonify({'code': 1, 'msg': 'success', 'data': result})
@@ -123,6 +135,30 @@ def get_indicator_detail(indicator_id: int):
     except Exception as e:
         logger.error(f"get_indicator_detail failed: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@community_blp.route("/indicators/<int:indicator_id>/compatibility", methods=["GET"])
+@login_required
+def check_strategy_compatibility(indicator_id: int):
+    result = get_community_service().check_strategy_compatibility(
+        indicator_id,
+        target_instrument=request.args.get('target_instrument', '').strip(),
+    )
+    if result is None:
+        return jsonify({'code': 0, 'msg': 'indicator_not_found', 'data': None}), 404
+    return jsonify({'code': 1, 'msg': 'success', 'data': result})
+
+
+@community_blp.route("/indicators/<int:indicator_id>/adapt", methods=["POST"])
+@login_required
+def adapt_marketplace_strategy(indicator_id: int):
+    payload = request.get_json(silent=True) or {}
+    ok, msg, data = get_community_service().adapt_marketplace_strategy(
+        int(g.user_id),
+        indicator_id,
+        target_instrument=str(payload.get('target_instrument') or payload.get('targetInstrument') or '').strip(),
+    )
+    return jsonify({'code': 1 if ok else 0, 'msg': msg, 'data': data}), (200 if ok else 400)
 
 
 # ==========================================

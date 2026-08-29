@@ -208,7 +208,12 @@ def verify_strategy():
         return _error("strategyV2.codeRequired")
     try:
         program = compile_strategy_v2(code)
-        return _ok({"valid": True, "manifest": program.manifest.metadata()})
+        from app.services.strategy_marketplace_contract import derive_strategy_contract
+        return _ok({
+            "valid": True,
+            "manifest": program.manifest.metadata(),
+            "marketplace_contract": derive_strategy_contract(code, source="draft_verification"),
+        })
     except Exception as exc:
         return _error("strategyV2.contractInvalid", data={"valid": False, "error": str(exc)})
 

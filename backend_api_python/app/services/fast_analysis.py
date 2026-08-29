@@ -10,6 +10,7 @@ from app.utils.logger import get_logger
 from app.services.llm import LLMService
 from app.services.market_data_collector import get_market_data_collector
 from app.services.fast_analysis_formatters import build_trend_outlook_summary, safe_float_price
+from app.services.fast_analysis_fundamentals import build_score_payload, format_financial_statements, format_fundamental_metric, fundamental_provenance
 from app.services.fast_analysis_geo import is_major_geopolitical_news_text
 from app.services.fast_analysis_plan import finalize_trading_plan, trading_plan_risk_fields
 from app.services.fast_analysis_scoring import FastAnalysisScoringMixin
@@ -43,6 +44,7 @@ class FastAnalysisService(FastAnalysisScoringMixin):
         include_macro: bool = True,
         include_news: bool = True,
         timeout: int = 45,
+        recovery_target: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         使用统一的数据采集器收集市场数据
@@ -53,7 +55,7 @@ class FastAnalysisService(FastAnalysisScoringMixin):
         3. 宏观数据: DXY、VIX、TNX、黄金等
         4. 情绪数据: 新闻、市场情绪
         """
-        return self.data_collector.collect_all(
+        collected = self.data_collector.collect_all(
             market=market,
             symbol=symbol,
             timeframe=timeframe,
@@ -61,6 +63,34 @@ class FastAnalysisService(FastAnalysisScoringMixin):
             include_news=include_news,
             timeout=timeout,  # 增加超时时间，确保数据收集完成
         )
+        if recovery_target is not None:
+            self._backfill_primary_enrichment(recovery_target, collected)
+        return collected
+
+    @staticmethod
+    def _backfill_primary_enrichment(
+        primary_data: Dict[str, Any], candidate_data: Dict[str, Any]
+    ) -> None:
+        """Recover slow, timeframe-independent enrichment from later fetches.
+
+        Quotes and K-lines are timeframe-specific; company/fundamental data are
+        not.  If a cold primary request reaches its deadline but a subsequent
+        timeframe fetch succeeds, retain that result for the final report.
+        """
+        if not isinstance(primary_data, dict) or not isinstance(candidate_data, dict):
+            return
+        meta = primary_data.setdefault("_meta", {})
+        success_items = meta.setdefault("success_items", [])
+        failed_items = meta.setdefault("failed_items", [])
+        for key in ("fundamental", "company"):
+            if primary_data.get(key) or not candidate_data.get(key):
+                continue
+            primary_data[key] = candidate_data[key]
+            if key not in success_items:
+                success_items.append(key)
+            while key in failed_items:
+                failed_items.remove(key)
+            logger.info("Recovered primary %s from a later timeframe fetch", key)
     
     def _calculate_indicators(self, kline_data: List[Dict]) -> Dict[str, Any]:
         """
@@ -97,13 +127,25 @@ class FastAnalysisService(FastAnalysisScoringMixin):
             macd = raw_indicators.get("MACD", 0)
             macd_signal_line = raw_indicators.get("MACD_Signal", 0)
             macd_hist = raw_indicators.get("MACD_Hist", 0)
+            previous_macd = previous_signal = None
+            if len(kline_data) > 34:
+                previous_raw = self.tools.calculate_technical_indicators(kline_data[:-1])
+                previous_macd = previous_raw.get("MACD")
+                previous_signal = previous_raw.get("MACD_Signal")
+
+            cross_event = None
+            if previous_macd is not None and previous_signal is not None:
+                if previous_macd <= previous_signal and macd > macd_signal_line:
+                    cross_event = "golden_cross"
+                elif previous_macd >= previous_signal and macd < macd_signal_line:
+                    cross_event = "death_cross"
             
             if macd > macd_signal_line and macd_hist > 0:
                 macd_signal = "bullish"
-                macd_trend = "golden_cross" if macd_hist > 0 and len(kline_data) > 1 else "bullish"
+                macd_trend = cross_event or "bullish_alignment"
             elif macd < macd_signal_line and macd_hist < 0:
                 macd_signal = "bearish"
-                macd_trend = "death_cross" if macd_hist < 0 and len(kline_data) > 1 else "bearish"
+                macd_trend = cross_event or "bearish_alignment"
             else:
                 macd_signal = "neutral"
                 macd_trend = "consolidating"
@@ -314,6 +356,10 @@ class FastAnalysisService(FastAnalysisScoringMixin):
         indicators = data.get("indicators") or {}
         fundamental = data.get("fundamental") or {}
         company = data.get("company") or {}
+        fundamental_identity = fundamental.get("identity") or {}
+        fundamental_quality = fundamental.get("data_quality") or {}
+        company_name = company.get("name") or fundamental_identity.get("company_name") or data.get("symbol")
+        company_industry = company.get("industry") or fundamental_identity.get("industry") or fundamental_identity.get("sector") or "N/A"
         crypto_factors = data.get("crypto_factors") or {}
         is_crypto = str(data.get("market") or "").strip().lower() == "crypto"
         news_summary = self._format_news_summary(data.get("news") or [])
@@ -417,8 +463,8 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
 
 {decision_guidance}
 
-📐 TECHNICAL LEVELS (Pre-calculated from chart data):
-- Support: ${support} | Resistance: ${resistance} | Pivot: ${pivot}
+📐 TECHNICAL LEVELS (Pre-calculated estimates from chart data):
+- Estimated Support: ${support} | Estimated Resistance: ${resistance} | Pivot: ${pivot}
 - ATR (14-day): ${atr:.4f} ({volatility.get('pct', 0)}% volatility)
 - Suggested Stop Loss: ${suggested_stop_loss:.4f} (based on 2x ATR below support)
 - Suggested Take Profit: ${suggested_take_profit:.4f} (based on 3x ATR above resistance)
@@ -453,7 +499,7 @@ You are CONSERVATIVE and OBJECTIVE. Your analysis must be based on DATA, not spe
    - If prediction markets show high probability for bullish events (e.g., "BTC reaches $100k"), consider this as a positive signal
    - If prediction markets show high probability for bearish events, consider this as a risk factor
    - Use prediction market probabilities as a sentiment indicator alongside technical analysis
-5. **Fundamental Analysis**: For Crypto, focus on market structure / flow / derivatives factors instead of stock-style valuation. For equities, evaluate valuation, growth, competitive position if data available.
+5. **Fundamental Analysis**: For Crypto, focus on market structure / flow / derivatives factors instead of stock-style valuation. For equities, use the latest reported quarter for current operating health, TTM for earnings power and cash generation, and the annual report only for structural context. Never mix periods as if they were one report.
 6. **Risk Assessment**: 
    - Explain why the stop loss level is appropriate
    - List ALL significant risks (technical, macro, news, fundamental)
@@ -524,8 +570,8 @@ When the score is neutral (-20 to +20), you can use your judgment, but still con
 📊 REAL-TIME DATA:
 - Current Price: ${current_price}
 - 24h Change: {change_24h}%
-- Support: ${support}
-- Resistance: ${resistance}
+- Estimated Support: ${support}
+- Estimated Resistance: ${resistance}
 
 📈 TECHNICAL INDICATORS:
 - RSI(14): {rsi_data.get('value', 'N/A')} ({rsi_data.get('signal', 'N/A')})
@@ -543,20 +589,23 @@ When the score is neutral (-20 to +20), you can use your judgment, but still con
 {news_summary}
 
 💼 FUNDAMENTALS / MARKET STRUCTURE:
-- Company: {company.get('name', data['symbol'])}
-- Industry: {company.get('industry', 'N/A')}
-- P/E Ratio: {fundamental.get('pe_ratio', 'N/A')}
-- P/B Ratio: {fundamental.get('pb_ratio', 'N/A')}
-- Market Cap: {fundamental.get('market_cap', 'N/A')}
+- Company: {company_name}
+- Industry: {company_industry}
+- Data Source: {fundamental.get('source', 'N/A')}
+- Preferred Statement Basis: {fundamental_quality.get('preferred_basis', 'provider_latest')}
+- Symbol Identity Verified: {fundamental_identity.get('verified', 'N/A')} (reported={fundamental_identity.get('reported_symbol', 'N/A')}, exchange={fundamental_identity.get('exchange', 'N/A')})
+- P/E Ratio: {format_fundamental_metric(fundamental, 'pe_ratio')}
+- P/B Ratio: {format_fundamental_metric(fundamental, 'pb_ratio')}
+- Market Cap: {format_fundamental_metric(fundamental, 'market_cap')}
 - 52W High/Low: {fundamental.get('52w_high', 'N/A')} / {fundamental.get('52w_low', 'N/A')}
-- ROE: {fundamental.get('roe', 'N/A')}
-- Revenue Growth: {fundamental.get('revenue_growth', 'N/A')}
-- Profit Margin: {fundamental.get('profit_margin', 'N/A')}
-- Debt to Equity: {fundamental.get('debt_to_equity', 'N/A')}
-- Current Ratio: {fundamental.get('current_ratio', 'N/A')}
-- Free Cash Flow: {fundamental.get('free_cash_flow', 'N/A')}
+- ROE: {format_fundamental_metric(fundamental, 'roe')}
+- Revenue Growth: {format_fundamental_metric(fundamental, 'revenue_growth')}
+- Profit Margin: {format_fundamental_metric(fundamental, 'profit_margin')}
+- Debt to Equity: {format_fundamental_metric(fundamental, 'debt_to_equity')}
+- Current Ratio: {format_fundamental_metric(fundamental, 'current_ratio')}
+- Free Cash Flow: {format_fundamental_metric(fundamental, 'free_cash_flow')}
 
-📊 FINANCIAL STATEMENTS (Latest Quarter):
+📊 MULTI-PERIOD FINANCIAL EVIDENCE:
 {self._format_financial_statements(fundamental.get('financial_statements', {}))}
 
 📈 EARNINGS DATA:
@@ -569,59 +618,14 @@ IMPORTANT:
 1. **CRITICAL**: Check for GEOPOLITICAL EVENTS (wars, conflicts, military actions) in the news section. These events have HIGHEST PRIORITY and can override all technical indicators.
 2. Consider the macro environment (especially DXY, VIX, rates, geopolitical events) when making your recommendation.
 3. Pay attention to BREAKING NEWS and international events that could cause sudden market moves. Geopolitical tensions (e.g., US-Iran conflict) can cause severe market volatility.
-4. For Crypto, explicitly explain whether derivatives + capital flow data confirm or contradict price action. For US stocks, analyze financial statements and earnings trends to assess company health.
+4. For Crypto, explicitly explain whether derivatives + capital flow data confirm or contradict price action. For US stocks, prioritize the latest reported quarter, compare it with prior periods when available, use TTM for profitability/cash-flow durability, and use the annual report only as background.
 5. If you see news about wars, conflicts, or major geopolitical events, you MUST mention them in your analysis and adjust your recommendation accordingly.
 6. Provide your analysis now. Remember: all prices must be within 10% of ${current_price}."""
 
         return system_prompt, user_prompt
     
     def _format_financial_statements(self, statements: Dict[str, Any]) -> str:
-        """格式化财务报表数据用于提示词"""
-        if not statements:
-            return "财务报表数据暂不可用"
-        
-        lines = []
-        
-        if 'balance_sheet' in statements:
-            bs = statements['balance_sheet']
-            lines.append("资产负债表 (Balance Sheet):")
-            if bs.get('total_assets'):
-                lines.append(f"  - 总资产: ${bs['total_assets']:,.0f}")
-            if bs.get('total_liabilities'):
-                lines.append(f"  - 总负债: ${bs['total_liabilities']:,.0f}")
-            if bs.get('total_equity'):
-                lines.append(f"  - 股东权益: ${bs['total_equity']:,.0f}")
-            if bs.get('cash'):
-                lines.append(f"  - 现金: ${bs['cash']:,.0f}")
-            if bs.get('debt'):
-                lines.append(f"  - 总债务: ${bs['debt']:,.0f}")
-            if bs.get('current_assets') and bs.get('current_liabilities'):
-                current_ratio = bs['current_assets'] / bs['current_liabilities'] if bs['current_liabilities'] > 0 else 0
-                lines.append(f"  - 流动比率: {current_ratio:.2f}")
-        
-        if 'income_statement' in statements:
-            is_stmt = statements['income_statement']
-            lines.append("利润表 (Income Statement):")
-            if is_stmt.get('total_revenue'):
-                lines.append(f"  - 总收入: ${is_stmt['total_revenue']:,.0f}")
-            if is_stmt.get('gross_profit'):
-                lines.append(f"  - 毛利润: ${is_stmt['gross_profit']:,.0f}")
-            if is_stmt.get('operating_income'):
-                lines.append(f"  - 营业利润: ${is_stmt['operating_income']:,.0f}")
-            if is_stmt.get('net_income'):
-                lines.append(f"  - 净利润: ${is_stmt['net_income']:,.0f}")
-            if is_stmt.get('eps'):
-                lines.append(f"  - 每股收益: ${is_stmt['eps']:.2f}")
-        
-        if 'cash_flow' in statements:
-            cf = statements['cash_flow']
-            lines.append("现金流量表 (Cash Flow):")
-            if cf.get('operating_cash_flow'):
-                lines.append(f"  - 经营现金流: ${cf['operating_cash_flow']:,.0f}")
-            if cf.get('free_cash_flow'):
-                lines.append(f"  - 自由现金流: ${cf['free_cash_flow']:,.0f}")
-        
-        return "\n".join(lines) if lines else "财务报表数据暂不可用"
+        return format_financial_statements(statements)
     
     def _format_earnings_data(self, earnings: Dict[str, Any]) -> str:
         """格式化盈利数据用于提示词"""
@@ -842,7 +846,7 @@ IMPORTANT:
                         tf_norm,
                         include_macro=False,
                         include_news=False,
-                        timeout=25,
+                        timeout=25, recovery_target=primary_data,
                     )
 
                 current_price_tf = _extract_current_price(d_tf) or 0.0
@@ -887,7 +891,7 @@ IMPORTANT:
                         "1W",
                         include_macro=False,
                         include_news=False,
-                        timeout=25,
+                        timeout=25, recovery_target=primary_data,
                     )
                     cp_1w = _extract_current_price(d_1w) or 0.0
                     obj_1w = self._calculate_objective_score(d_1w, cp_1w)
@@ -910,7 +914,7 @@ IMPORTANT:
                         "1H",
                         include_macro=False,
                         include_news=False,
-                        timeout=18,
+                        timeout=18, recovery_target=primary_data,
                     )
                     cp_1h = _extract_current_price(d_1h) or 0.0
                     obj_1h = self._calculate_objective_score(d_1h, cp_1h)
@@ -1238,6 +1242,9 @@ IMPORTANT:
                 detailed_analysis = {"technical": detailed_analysis, "fundamental": "", "sentiment": ""}
             if market == "Crypto" and not detailed_analysis.get("fundamental"):
                 detailed_analysis["fundamental"] = crypto_factor_summary or (data.get("crypto_factors") or {}).get("summary", "")
+
+            score_payload = build_score_payload(objective_score, analysis, self._calculate_overall_score(analysis))
+            provenance_payload = fundamental_provenance(data.get("fundamental") or {})
             
             result.update({
                 "decision": analysis.get("decision", "HOLD"),
@@ -1267,12 +1274,7 @@ IMPORTANT:
                 },
                 "reasons": analysis.get("key_reasons", []),
                 "risks": analysis.get("risks", []),
-                "scores": {
-                    "technical": analysis.get("technical_score", 50),
-                    "fundamental": analysis.get("fundamental_score", 50),
-                    "sentiment": analysis.get("sentiment_score", 50),
-                    "overall": self._calculate_overall_score(analysis),
-                },
+                **score_payload,
                 "objective_score": analysis.get("objective_score", {}),
                 "crypto_factors": data.get("crypto_factors", {}),
                 "crypto_factor_score": crypto_factor_score,
@@ -1285,6 +1287,7 @@ IMPORTANT:
                     "support": data["indicators"].get("levels", {}).get("support"),
                     "resistance": data["indicators"].get("levels", {}).get("resistance"),
                 },
+                **provenance_payload,
                 "indicators": data.get("indicators", {}),
                 "consensus": analysis.get("consensus", {}),
                 "trend_outlook": trend_outlook,

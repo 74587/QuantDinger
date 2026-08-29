@@ -2,15 +2,39 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from app.utils.db import get_db_connection
 
+from .contract import strategy_source_code_hash
+
 
 class StrategyBacktestRepository:
+    def has_successful_run(
+        self,
+        *,
+        user_id: int,
+        source_id: int,
+        code_hash: str = "",
+    ) -> bool:
+        where = ["user_id = ?", "source_id = ?", "status = 'success'"]
+        params: list[Any] = [int(user_id), int(source_id)]
+        normalized_hash = str(code_hash or "").strip()
+        if normalized_hash:
+            where.append("code_hash = ?")
+            params.append(normalized_hash)
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"SELECT id FROM qd_backtest_runs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT 1",
+                tuple(params),
+            )
+            found = cur.fetchone() is not None
+            cur.close()
+        return found
+
     def persist_run(
         self,
         *,
@@ -70,7 +94,7 @@ class StrategyBacktestRepository:
                     json.dumps(params, ensure_ascii=False),
                     json.dumps(manifest, ensure_ascii=False),
                     str((result.get("engine") or {}).get("version") or "strategy-api-v2"),
-                    hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                    strategy_source_code_hash(code),
                     json.dumps(result, ensure_ascii=False),
                 ),
             )
@@ -467,7 +491,7 @@ class FactorResearchRepository:
                     int(groups), int(holding_period), float(commission), float(slippage),
                     bool(neutralize_industry), int(result.get("symbolsUsed") or 0),
                     json.dumps(manifest, ensure_ascii=False),
-                    hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                    strategy_source_code_hash(code),
                     json.dumps(result, ensure_ascii=False),
                 ),
             )

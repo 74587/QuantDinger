@@ -2,6 +2,7 @@ from datetime import datetime
 
 import pandas as pd
 import pytest
+import app.services.strategy_v2.service as strategy_v2_service
 
 from app.services.strategy_v2 import (
     StrategyV2BacktestRunner,
@@ -254,6 +255,118 @@ def test_loader_drops_instruments_with_an_incomplete_timeframe_bundle():
             "reason": "strategyV2.noMarketData",
         }
     ]
+
+
+def test_data_portal_compacts_only_value_equivalent_duplicate_bars():
+    timestamp = pd.Timestamp("2026-01-01")
+    frame = pd.DataFrame({
+        "open": [100.0, 100.0, 101.0],
+        "high": [101.0, 101.0, 102.0],
+        "low": [99.0, 99.0, 100.0],
+        "close": [100.0, 100.0, 101.0],
+        "volume": [1_000.0, 1_000.0, 1_100.0],
+    }, index=pd.DatetimeIndex([timestamp, timestamp, "2026-01-02"]))
+
+    portal = MultiAssetDataPortal({SYMBOL: frame})
+
+    assert len(portal.frames[SYMBOL]) == 2
+    assert portal.frames[SYMBOL].iloc[0]["close"] == pytest.approx(100.0)
+
+
+def test_data_portal_rejects_conflicting_duplicates_independent_of_arrival_order():
+    timestamp = pd.Timestamp("2026-01-01")
+    frame = pd.DataFrame({
+        "open": [100.0, 100.0, 101.0],
+        "high": [101.0, 1_000.0, 102.0],
+        "low": [99.0, 1.0, 100.0],
+        "close": [100.0, 999.0, 101.0],
+        "volume": [1_000.0, 1_000.0, 1_100.0],
+    }, index=pd.DatetimeIndex([timestamp, timestamp, "2026-01-02"]))
+
+    messages = []
+    for candidate in (frame, frame.iloc[[1, 0, 2]].copy()):
+        with pytest.raises(StrategyDataError) as exc_info:
+            MultiAssetDataPortal({SYMBOL: candidate})
+        messages.append(str(exc_info.value))
+
+    assert messages[0] == messages[1]
+    assert messages[0].startswith(
+        f"strategyV2.conflictingDuplicateBar:{SYMBOL}:2026-01-01T00:00:00"
+    )
+
+
+def test_multi_asset_mapping_order_is_canonical_for_strategy_iteration():
+    code = '''\
+def initialize(context):
+    context.set_universe(["USStock:AAPL", "USStock:MSFT"])
+    context.subscribe(frequency="1d")
+    g.sent = False
+
+def handle_data(context, data):
+    panels = get_history(10, "1d", "close")
+    if not g.sent:
+        order_target(next(iter(panels)), 1.0, reason="first_mapping_member")
+        g.sent = True
+'''
+    index = pd.date_range("2026-01-01", periods=3, freq="D")
+    aapl = _frame(index, 100.0)
+    msft = _frame(index, 200.0)
+
+    forward = StrategyV2BacktestRunner(
+        code=code,
+        frames={"USStock:AAPL": aapl, "USStock:MSFT": msft},
+        initial_capital=10_000,
+        commission=0,
+        slippage=0,
+    ).run()
+    reverse = StrategyV2BacktestRunner(
+        code=code,
+        frames={"USStock:MSFT": msft, "USStock:AAPL": aapl},
+        initial_capital=10_000,
+        commission=0,
+        slippage=0,
+    ).run()
+
+    assert forward["executions"][0]["symbol"] == "USStock:AAPL"
+    assert reverse["executions"][0]["symbol"] == "USStock:AAPL"
+
+
+def test_frequency_loader_sorts_symbols_after_concurrent_completion(monkeypatch):
+    index = pd.date_range("2026-01-01", periods=3, freq="1h")
+    candidates = [
+        {
+            "key": "USStock:AAPL",
+            "market": "USStock",
+            "symbol": "AAPL",
+            "market_type": "spot",
+            "exchange_id": "",
+        },
+        {
+            "key": "USStock:MSFT",
+            "market": "USStock",
+            "symbol": "MSFT",
+            "market_type": "spot",
+            "exchange_id": "",
+        },
+    ]
+    service = StrategyV2BacktestService(
+        frame_fetcher=lambda *_args, **_kwargs: _frame(index)
+    )
+    monkeypatch.setattr(
+        strategy_v2_service,
+        "as_completed",
+        lambda futures: reversed(list(futures)),
+    )
+
+    bundles, skipped = service.fetch_frequency_frames(
+        candidates,
+        ("1h",),
+        {"1h": datetime(2026, 1, 1)},
+        datetime(2026, 1, 2),
+    )
+
+    assert list(bundles["1h"]) == ["USStock:AAPL", "USStock:MSFT"]
+    assert skipped == []
 
 
 def test_contract_rejects_unsupported_monthly_subscription():

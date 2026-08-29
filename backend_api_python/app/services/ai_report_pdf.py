@@ -27,28 +27,56 @@ def _has_cjk_text(value: Any) -> bool:
     return bool(re.search(r"[\u2e80-\u9fff\uac00-\ud7af\u3040-\u30ff]", text))
 
 
-def _register_report_pdf_font(prefer_cjk: bool = False) -> str:
+def _register_report_pdf_font(language: str = "", prefer_cjk: bool = False) -> str:
     from pathlib import Path
 
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
 
-    candidates = [
+    language_key = _language_key(language)
+    universal_candidates = [
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
+    cjk_candidates = [
         ("C:/Windows/Fonts/msyh.ttc", True),
         ("C:/Windows/Fonts/msyh.ttf", True),
         ("C:/Windows/Fonts/simsun.ttc", True),
+        ("/System/Library/Fonts/Hiragino Sans GB.ttc", True),
         ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", True),
         ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", True),
         ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", True),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False),
     ]
+    script_candidates = {
+        "ar": [
+            ("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf", False),
+            ("/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf", False),
+            ("/System/Library/Fonts/GeezaPro.ttc", False),
+        ],
+        "th": [
+            ("/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf", False),
+            ("/System/Library/Fonts/ThonburiUI.ttc", False),
+            ("/System/Library/Fonts/Supplemental/Thonburi.ttc", False),
+        ],
+    }
+    candidates = (
+        [(path, language_key in {"zh-CN", "zh-TW", "ja", "ko"}) for path in universal_candidates]
+        + script_candidates.get(language_key, [])
+        + (cjk_candidates if prefer_cjk else [])
+        + [
+            ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", False),
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False),
+            ("C:/Windows/Fonts/arial.ttf", False),
+        ]
+    )
+    font_name = f"QuantDingerSans_{re.sub(r'[^A-Za-z0-9]', '_', language_key)}"
     for path, is_cjk in candidates:
-        if prefer_cjk and not is_cjk:
+        if prefer_cjk and not is_cjk and path not in universal_candidates:
             continue
         try:
             if Path(path).exists():
-                pdfmetrics.registerFont(TTFont("QuantDingerSans", path))
-                return "QuantDingerSans"
+                pdfmetrics.registerFont(TTFont(font_name, path))
+                return font_name
         except Exception as e:
             logger.debug(f"Failed to register PDF font {path}: {e}")
     if prefer_cjk:
@@ -153,21 +181,222 @@ def _report_pdf_labels(language: str = "") -> dict[str, str]:
             "rr_warning_text": "潛在收益低於計畫風險；系統不會透過拉遠止盈來隱藏此警告。",
             "disclaimer": "本報告由 AI 生成，僅供研究參考，不構成投資建議。",
         },
-        "ja": {"decision": "見通し"},
-        "ko": {"decision": "전망"},
-        "de": {"decision": "Ausblick"},
-        "fr": {"decision": "Perspective"},
-        "ru": {"decision": "Прогноз"},
-        "ar": {"decision": "التوقعات"},
-        "th": {"decision": "มุมมอง"},
-        "vi": {"decision": "Nhận định"},
+        "ja": {
+            "title": "QuantDinger AI リサーチレポート",
+            "subtitle": "AI による市場分析（調査目的のみ）",
+            "target": "対象",
+            "generated": "作成日時",
+            "decision": "見通し",
+            "confidence": "信頼度",
+            "summary": "要約",
+            "plan": "取引計画",
+            "scores": "モデル評価",
+            "trend": "トレンド見通し",
+            "crypto": "暗号資産の市場構造",
+            "details": "詳細分析",
+            "reasons": "主な根拠",
+            "risks": "リスク注意事項",
+            "indicators": "テクニカル指標",
+            "rr_warning": "リスクリワード警告",
+            "rr_warning_text": "期待利益が計画損失を下回っています。この警告を隠すために利確目標を遠ざけることはありません。",
+            "disclaimer": "本レポートは AI が調査目的で作成したもので、投資助言ではありません。",
+        },
+        "ko": {
+            "title": "QuantDinger AI 리서치 보고서",
+            "subtitle": "연구 목적의 AI 기반 시장 분석",
+            "target": "분석 대상",
+            "generated": "생성 시각",
+            "decision": "전망",
+            "confidence": "신뢰도",
+            "summary": "핵심 요약",
+            "plan": "거래 계획",
+            "scores": "모델 점수",
+            "trend": "추세 전망",
+            "crypto": "암호화폐 시장 구조",
+            "details": "상세 분석",
+            "reasons": "주요 근거",
+            "risks": "위험 참고사항",
+            "indicators": "기술적 지표",
+            "rr_warning": "손익비 경고",
+            "rr_warning_text": "예상 수익이 계획된 위험보다 낮습니다. 이 경고를 감추기 위해 목표가를 임의로 늘리지 않습니다.",
+            "disclaimer": "이 보고서는 AI가 연구 목적으로 생성했으며 투자 조언이 아닙니다.",
+        },
+        "de": {
+            "title": "QuantDinger KI-Researchbericht",
+            "subtitle": "KI-gestützte Marktanalyse nur zu Forschungszwecken",
+            "target": "Instrument",
+            "generated": "Erstellt",
+            "decision": "Ausblick",
+            "confidence": "Konfidenz",
+            "summary": "Zusammenfassung",
+            "plan": "Handelsplan",
+            "scores": "Modellbewertungen",
+            "trend": "Trendausblick",
+            "crypto": "Kryptomarktstruktur",
+            "details": "Detailanalyse",
+            "reasons": "Hauptgründe",
+            "risks": "Risikohinweise",
+            "indicators": "Technische Indikatoren",
+            "rr_warning": "Risiko-Rendite-Warnung",
+            "rr_warning_text": "Die mögliche Rendite liegt unter dem geplanten Risiko. Das Kursziel wurde nicht künstlich erweitert, um diese Warnung zu verdecken.",
+            "disclaimer": "Dieser Bericht wurde von KI zu Forschungszwecken erstellt und ist keine Anlageberatung.",
+        },
+        "fr": {
+            "title": "Rapport de recherche IA QuantDinger",
+            "subtitle": "Analyse de marché assistée par IA, à des fins de recherche uniquement",
+            "target": "Actif analysé",
+            "generated": "Généré le",
+            "decision": "Perspective",
+            "confidence": "Confiance",
+            "summary": "Synthèse",
+            "plan": "Plan de trading",
+            "scores": "Scores du modèle",
+            "trend": "Perspectives de tendance",
+            "crypto": "Structure du marché crypto",
+            "details": "Analyse détaillée",
+            "reasons": "Principaux arguments",
+            "risks": "Risques",
+            "indicators": "Indicateurs techniques",
+            "rr_warning": "Avertissement risque/rendement",
+            "rr_warning_text": "Le gain potentiel est inférieur au risque prévu. L’objectif n’a pas été artificiellement éloigné pour masquer cet avertissement.",
+            "disclaimer": "Ce rapport est généré par IA à des fins de recherche et ne constitue pas un conseil en investissement.",
+        },
+        "ru": {
+            "title": "Аналитический отчёт QuantDinger AI",
+            "subtitle": "Анализ рынка с помощью ИИ только для исследовательских целей",
+            "target": "Инструмент",
+            "generated": "Создан",
+            "decision": "Прогноз",
+            "confidence": "Уверенность",
+            "summary": "Краткое резюме",
+            "plan": "Торговый план",
+            "scores": "Оценки модели",
+            "trend": "Прогноз тренда",
+            "crypto": "Структура крипторынка",
+            "details": "Подробный анализ",
+            "reasons": "Ключевые причины",
+            "risks": "Риски",
+            "indicators": "Технические индикаторы",
+            "rr_warning": "Предупреждение о риске/доходности",
+            "rr_warning_text": "Потенциальная доходность ниже планового риска. Цель не была искусственно отдалена, чтобы скрыть это предупреждение.",
+            "disclaimer": "Этот отчёт создан ИИ только для исследований и не является инвестиционной рекомендацией.",
+        },
+        "ar": {
+            "title": "تقرير أبحاث QuantDinger بالذكاء الاصطناعي",
+            "subtitle": "تحليل للسوق بمساعدة الذكاء الاصطناعي لأغراض البحث فقط",
+            "target": "الأصل محل التحليل",
+            "generated": "تاريخ الإنشاء",
+            "decision": "التوقعات",
+            "confidence": "درجة الثقة",
+            "summary": "الملخص التنفيذي",
+            "plan": "خطة التداول",
+            "scores": "درجات النموذج",
+            "trend": "توقعات الاتجاه",
+            "crypto": "هيكل سوق العملات الرقمية",
+            "details": "التحليل التفصيلي",
+            "reasons": "الأسباب الرئيسية",
+            "risks": "ملاحظات المخاطر",
+            "indicators": "المؤشرات الفنية",
+            "rr_warning": "تحذير نسبة المخاطرة إلى العائد",
+            "rr_warning_text": "العائد المحتمل أقل من المخاطرة المخطط لها. لم يتم إبعاد هدف الربح بشكل مصطنع لإخفاء هذا التحذير.",
+            "disclaimer": "أُنشئ هذا التقرير بالذكاء الاصطناعي لأغراض البحث فقط ولا يُعد نصيحة استثمارية.",
+        },
+        "th": {
+            "title": "รายงานวิจัย QuantDinger AI",
+            "subtitle": "การวิเคราะห์ตลาดด้วย AI เพื่อการวิจัยเท่านั้น",
+            "target": "สินทรัพย์ที่วิเคราะห์",
+            "generated": "สร้างเมื่อ",
+            "decision": "มุมมอง",
+            "confidence": "ความเชื่อมั่น",
+            "summary": "บทสรุป",
+            "plan": "แผนการเทรด",
+            "scores": "คะแนนโมเดล",
+            "trend": "แนวโน้มตลาด",
+            "crypto": "โครงสร้างตลาดคริปโท",
+            "details": "การวิเคราะห์โดยละเอียด",
+            "reasons": "เหตุผลสำคัญ",
+            "risks": "ข้อควรระวังด้านความเสี่ยง",
+            "indicators": "ตัวชี้วัดทางเทคนิค",
+            "rr_warning": "คำเตือนอัตราความเสี่ยงต่อผลตอบแทน",
+            "rr_warning_text": "ผลตอบแทนที่เป็นไปได้ต่ำกว่าความเสี่ยงตามแผน ระบบไม่ได้ขยายเป้าหมายกำไรเพื่อซ่อนคำเตือนนี้",
+            "disclaimer": "รายงานนี้สร้างโดย AI เพื่อการวิจัยเท่านั้น ไม่ใช่คำแนะนำการลงทุน",
+        },
+        "vi": {
+            "title": "Báo cáo nghiên cứu QuantDinger AI",
+            "subtitle": "Phân tích thị trường có hỗ trợ của AI, chỉ dành cho mục đích nghiên cứu",
+            "target": "Tài sản phân tích",
+            "generated": "Thời gian tạo",
+            "decision": "Nhận định",
+            "confidence": "Độ tin cậy",
+            "summary": "Tóm tắt chính",
+            "plan": "Kế hoạch giao dịch",
+            "scores": "Điểm mô hình",
+            "trend": "Triển vọng xu hướng",
+            "crypto": "Cấu trúc thị trường tiền mã hóa",
+            "details": "Phân tích chi tiết",
+            "reasons": "Lý do chính",
+            "risks": "Lưu ý rủi ro",
+            "indicators": "Chỉ báo kỹ thuật",
+            "rr_warning": "Cảnh báo tỷ lệ rủi ro/lợi nhuận",
+            "rr_warning_text": "Lợi nhuận tiềm năng thấp hơn rủi ro dự kiến. Mục tiêu chốt lời không bị kéo xa một cách giả tạo để che giấu cảnh báo này.",
+            "disclaimer": "Báo cáo này do AI tạo cho mục đích nghiên cứu và không phải là lời khuyên đầu tư.",
+        },
     }
     labels.update(overrides.get(_language_key(language), {}))
+    labels["field_trend"] = {
+        "en": "Trend", "zh-CN": "趋势", "zh-TW": "趨勢", "ja": "トレンド", "ko": "추세",
+        "de": "Trend", "fr": "Tendance", "ru": "Тренд", "ar": "الاتجاه", "th": "แนวโน้ม", "vi": "Xu hướng",
+    }.get(_language_key(language), "Trend")
+    labels["field_direction"] = {
+        "en": "Direction", "zh-CN": "方向", "zh-TW": "方向", "ja": "方向", "ko": "방향",
+        "de": "Richtung", "fr": "Direction", "ru": "Направление", "ar": "الاتجاه", "th": "ทิศทาง", "vi": "Hướng",
+    }.get(_language_key(language), "Direction")
+    labels["field_score"] = {
+        "en": "Score", "zh-CN": "评分", "zh-TW": "評分", "ja": "スコア", "ko": "점수",
+        "de": "Bewertung", "fr": "Score", "ru": "Оценка", "ar": "الدرجة", "th": "คะแนน", "vi": "Điểm",
+    }.get(_language_key(language), "Score")
+    labels["field_strength"] = {
+        "en": "Strength", "zh-CN": "强度", "zh-TW": "強度", "ja": "強さ", "ko": "강도",
+        "de": "Stärke", "fr": "Force", "ru": "Сила", "ar": "القوة", "th": "ความแข็งแกร่ง", "vi": "Độ mạnh",
+    }.get(_language_key(language), "Strength")
+    labels["field_summary"] = labels["summary"]
+    labels["field_value"] = {
+        "en": "Value", "zh-CN": "数值", "zh-TW": "數值", "ja": "値", "ko": "값",
+        "de": "Wert", "fr": "Valeur", "ru": "Значение", "ar": "القيمة", "th": "ค่า", "vi": "Giá trị",
+    }.get(_language_key(language), "Value")
+    labels["field_signal"] = {
+        "en": "Signal", "zh-CN": "信号", "zh-TW": "訊號", "ja": "シグナル", "ko": "신호",
+        "de": "Signal", "fr": "Signal", "ru": "Сигнал", "ar": "الإشارة", "th": "สัญญาณ", "vi": "Tín hiệu",
+    }.get(_language_key(language), "Signal")
+    extra_labels = {
+        "en": ["Current Price", "24h Change", "Entry", "Stop Loss", "Take Profit", "Risk/Reward", "Horizon", "Outlook"],
+        "zh-CN": ["当前价格", "24 小时涨跌", "入场价", "止损价", "止盈价", "风险收益比", "周期", "预测"],
+        "zh-TW": ["目前價格", "24 小時漲跌", "進場價", "停損價", "停利價", "風險收益比", "週期", "預測"],
+        "ja": ["現在価格", "24時間変動", "エントリー", "損切り", "利確", "リスクリワード", "期間", "見通し"],
+        "ko": ["현재 가격", "24시간 변동", "진입가", "손절가", "목표가", "손익비", "기간", "전망"],
+        "de": ["Aktueller Kurs", "24h-Änderung", "Einstieg", "Stop-Loss", "Kursziel", "Risiko/Rendite", "Zeitraum", "Ausblick"],
+        "fr": ["Cours actuel", "Variation sur 24 h", "Entrée", "Stop", "Objectif", "Risque/rendement", "Horizon", "Perspective"],
+        "ru": ["Текущая цена", "Изменение за 24 ч", "Вход", "Стоп-лосс", "Цель", "Риск/доходность", "Период", "Прогноз"],
+        "ar": ["السعر الحالي", "التغير خلال 24 ساعة", "الدخول", "وقف الخسارة", "جني الأرباح", "المخاطرة/العائد", "الفترة", "التوقعات"],
+        "th": ["ราคาปัจจุบัน", "การเปลี่ยนแปลง 24 ชม.", "ราคาเข้า", "จุดตัดขาดทุน", "เป้าหมายกำไร", "ความเสี่ยง/ผลตอบแทน", "กรอบเวลา", "มุมมอง"],
+        "vi": ["Giá hiện tại", "Thay đổi 24 giờ", "Điểm vào", "Cắt lỗ", "Chốt lời", "Rủi ro/lợi nhuận", "Khung thời gian", "Nhận định"],
+    }.get(_language_key(language))
+    (
+        labels["current_price"],
+        labels["change_24h"],
+        labels["entry"],
+        labels["stop_loss"],
+        labels["take_profit"],
+        labels["risk_reward"],
+        labels["horizon"],
+        labels["outlook"],
+    ) = extra_labels
     return labels
 
 
 def build_ai_report_pdf(report: dict, target: dict | None = None, language: str = "en-US") -> bytes:
     from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT, TA_RIGHT
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
@@ -181,9 +410,10 @@ def build_ai_report_pdf(report: dict, target: dict | None = None, language: str 
     )
 
     target = target or {}
-    zh = str(language or "").lower().startswith("zh")
-    prefer_cjk = zh or _has_cjk_text(report) or _has_cjk_text(target)
-    font_name = _register_report_pdf_font(prefer_cjk=prefer_cjk)
+    language_key = _language_key(language)
+    prefer_cjk = language_key in {"zh-CN", "zh-TW", "ja", "ko"} or _has_cjk_text(report) or _has_cjk_text(target)
+    font_name = _register_report_pdf_font(language=language, prefer_cjk=prefer_cjk)
+    is_rtl = language_key == "ar"
     width, height = A4
     buf = BytesIO()
     labels = _report_pdf_labels(language)
@@ -207,6 +437,8 @@ def build_ai_report_pdf(report: dict, target: dict | None = None, language: str 
         leading=15,
         textColor=colors.HexColor("#273449"),
         spaceAfter=4,
+        shaping=is_rtl,
+        alignment=TA_RIGHT if is_rtl else TA_LEFT,
     )
     small_style = ParagraphStyle(
         "ReportSmall",
@@ -261,7 +493,8 @@ def build_ai_report_pdf(report: dict, target: dict | None = None, language: str 
             for key in keys[:4]:
                 item = value.get(key)
                 if item not in (None, "", [], {}):
-                    parts.append(f"{str(key).replace('_', ' ').title()}: {value_text(item)}")
+                    field_label = labels.get(f"field_{key}", str(key).replace("_", " ").title())
+                    parts.append(f"{field_label}: {value_text(item)}")
             return "; ".join(parts) or "-"
         if isinstance(value, (list, tuple)):
             return "; ".join(value_text(item) for item in value[:5] if item not in (None, "", [], {})) or "-"
@@ -327,8 +560,18 @@ def build_ai_report_pdf(report: dict, target: dict | None = None, language: str 
         canvas_obj.saveState()
         canvas_obj.setFillColor(colors.HexColor("#8a94a6"))
         canvas_obj.setFont(font_name, 7.5)
-        canvas_obj.drawString(doc.leftMargin, 9 * mm, labels["disclaimer"])
-        canvas_obj.drawRightString(width - doc.rightMargin, 9 * mm, f"QuantDinger Research · {document.page}")
+        if is_rtl:
+            canvas_obj.drawRightString(
+                width - doc.rightMargin,
+                9 * mm,
+                labels["disclaimer"],
+                direction="RTL",
+                shaping=True,
+            )
+            canvas_obj.drawString(doc.leftMargin, 9 * mm, f"QuantDinger Research · {document.page}")
+        else:
+            canvas_obj.drawString(doc.leftMargin, 9 * mm, labels["disclaimer"])
+            canvas_obj.drawRightString(width - doc.rightMargin, 9 * mm, f"QuantDinger Research · {document.page}")
         canvas_obj.restoreState()
 
     symbol = report.get("symbol") or target.get("symbol") or ""
@@ -374,12 +617,12 @@ def build_ai_report_pdf(report: dict, target: dict | None = None, language: str 
     if rr_value is None:
         rr_value = plan.get("riskRewardRatio")
     plan_items = [
-        ("Current Price", market_data.get("current_price")),
-        ("24h Change", market_data.get("change_24h")),
-        ("Entry", plan.get("entry_price") or plan.get("entryPrice")),
-        ("Stop Loss", plan.get("stop_loss") or plan.get("stopLoss")),
-        ("Take Profit", plan.get("take_profit") or plan.get("takeProfit")),
-        ("Risk/Reward", rr_value),
+        (labels["current_price"], market_data.get("current_price")),
+        (labels["change_24h"], market_data.get("change_24h")),
+        (labels["entry"], plan.get("entry_price") or plan.get("entryPrice")),
+        (labels["stop_loss"], plan.get("stop_loss") or plan.get("stopLoss")),
+        (labels["take_profit"], plan.get("take_profit") or plan.get("takeProfit")),
+        (labels["risk_reward"], rr_value),
     ]
     if any(v not in (None, "") for _, v in plan_items):
         story.extend(section(labels["plan"]))
@@ -416,7 +659,7 @@ def build_ai_report_pdf(report: dict, target: dict | None = None, language: str 
             story.append(p(trend_summary))
         if isinstance(trend, dict):
             story.append(simple_table(
-                ["Horizon", "Outlook"] if not zh else ["周期", "预测"],
+                [labels["horizon"], labels["outlook"]],
                 [[str(k), v] for k, v in trend.items()],
             ))
 

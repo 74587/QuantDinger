@@ -1,6 +1,6 @@
 import unittest
 
-from app.services.community_service import _strategy_contract_payload
+from app.services.community_service import _marketplace_contract_payload
 
 
 class MarketplaceStrategyContractTests(unittest.TestCase):
@@ -41,9 +41,10 @@ class MarketplaceStrategyContractTests(unittest.TestCase):
             }],
         }
 
-        contract = _strategy_contract_payload(manifest, schema, source="published_code")
+        contract = _marketplace_contract_payload(manifest, schema, source="published_code")
 
-        self.assertEqual(contract["primary_frequency"], "4h")
+        self.assertEqual(contract["execution_frequency"], "4h")
+        self.assertEqual(contract["confirmation_frequencies"], [])
         self.assertEqual(contract["instruments"][0]["symbol"], "BTC/USDT")
         self.assertEqual(contract["factor_dependencies"], ["MACD", "STOCH"])
         self.assertEqual(contract["data_fields"], ["open", "high", "low", "close", "volume"])
@@ -51,7 +52,7 @@ class MarketplaceStrategyContractTests(unittest.TestCase):
         self.assertFalse(contract["leverage_allowed"])
 
     def test_missing_manifest_does_not_publish_an_empty_contract(self):
-        self.assertIsNone(_strategy_contract_payload({}, {}, source="published_code"))
+        self.assertIsNone(_marketplace_contract_payload({}, {}, source="published_code"))
 
 
 if __name__ == "__main__":

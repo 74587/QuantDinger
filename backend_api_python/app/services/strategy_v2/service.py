@@ -298,6 +298,7 @@ class StrategyV2BacktestService:
         result["executionAssumptions"] = {
             "engineVersion": StrategyV2BacktestRunner.VERSION,
             "fillRule": "scheduled_current_open_or_signal_next_open",
+            "preFillValuationRule": StrategyV2BacktestRunner.PREFILL_VALUATION_POLICY,
             "protectionRule": "gap_open_then_intrabar_trigger",
             "intrabarMode": "conservative",
             "barClosePolicy": "closed_bars_only",
@@ -478,7 +479,9 @@ class StrategyV2BacktestService:
         ) if bundles else set()
         for frequency, frames in bundles.items():
             bundles[frequency] = {
-                key: frame for key, frame in frames.items() if key in complete_symbols
+                key: frames[key]
+                for key in sorted(frames)
+                if key in complete_symbols
             }
         return bundles, skipped
 

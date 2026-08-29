@@ -44,12 +44,18 @@ class MultiAssetDataPortal:
         for raw_frequency, raw_frames in bundles.items():
             frequency = normalize_frequency(raw_frequency)
             normalized_frames: dict[str, pd.DataFrame] = {}
-            for raw_key, raw_frame in raw_frames.items():
-                instrument = parse_instrument(raw_key)
+            parsed_frames = [
+                (parse_instrument(raw_key), str(raw_key), raw_frame)
+                for raw_key, raw_frame in raw_frames.items()
+            ]
+            for instrument, raw_key, raw_frame in sorted(
+                parsed_frames,
+                key=lambda item: (item[0].key, item[1]),
+            ):
                 frame = self._normalize_frame(raw_frame, instrument.key)
                 normalized_frames[instrument.key] = frame
                 self.aliases[instrument.symbol] = instrument.key
-                self.aliases[str(raw_key)] = instrument.key
+                self.aliases[raw_key] = instrument.key
             if normalized_frames:
                 self.frames_by_frequency[frequency] = normalized_frames
         if self.driving_frequency not in self.frames_by_frequency:
@@ -246,14 +252,22 @@ class MultiAssetDataPortal:
             frame.index = pd.to_datetime(frame.pop(time_column), errors="coerce")
         else:
             frame.index = pd.to_datetime(frame.index, errors="coerce")
-        frame = frame[~frame.index.isna()].sort_index()
-        frame = frame[~frame.index.duplicated(keep="last")]
         frame.columns = [str(column).strip().lower() for column in frame.columns]
+        frame = frame[~frame.index.isna()].sort_index(kind="stable")
         missing = [column for column in cls.REQUIRED_COLUMNS if column not in frame.columns]
         if missing:
             raise StrategyDataError(f"strategyV2.ohlcRequired:{key}:{','.join(missing)}")
         if "volume" not in frame.columns:
             frame["volume"] = 0.0
+        duplicate_rows = frame[frame.index.duplicated(keep=False)]
+        for timestamp, rows in duplicate_rows.groupby(level=0, sort=True):
+            baseline = rows.iloc[0]
+            if any(not baseline.equals(rows.iloc[index]) for index in range(1, len(rows))):
+                raise StrategyDataError(
+                    "strategyV2.conflictingDuplicateBar:"
+                    f"{key}:{pd.Timestamp(timestamp).isoformat()}"
+                )
+        frame = frame[~frame.index.duplicated(keep="last")]
         return frame
 
 

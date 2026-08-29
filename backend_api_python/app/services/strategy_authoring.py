@@ -17,7 +17,8 @@ Trades a long-only SPY regime from completed daily bars with bounded exposure.
 
 
 def initialize(context):
-    context.set_universe(["USStock:SPY"])
+    g.symbol = "USStock:SPY"
+    context.set_universe([g.symbol])
     context.subscribe(frequency="1d", fields=["close"])
     context.set_warmup(22)
     context.set_metadata(direction_mode="long_only", strategy_family="trend")
@@ -26,12 +27,12 @@ def initialize(context):
 def handle_data(context, data):
     period = int(context.params.get("period", 20))
     target_pct = float(context.params.get("target_pct", 0.5))
-    bars = get_history(period + 1, "1d", "close", "USStock:SPY")
+    bars = get_history(period + 1, "1d", "close", g.symbol)
     if len(bars) < period:
         return
     close = float(bars["close"].iloc[-1])
     average = float(bars["close"].tail(period).mean())
-    order_target_percent("USStock:SPY", target_pct if close > average else 0.0)
+    order_target_percent(g.symbol, target_pct if close > average else 0.0)
 '''
 
 _MULTI_TIMEFRAME_TEMPLATE = '''"""

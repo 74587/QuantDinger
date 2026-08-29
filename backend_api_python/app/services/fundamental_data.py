@@ -179,18 +179,23 @@ class FundamentalDataService:
 
         raw = MarketDataCollector()._get_fundamental(normalized_market, normalized_symbol) or {}
         statements = raw.get("financial_statements") if isinstance(raw.get("financial_statements"), dict) else {}
-        income = statements.get("income_statement") if isinstance(statements.get("income_statement"), dict) else {}
-        balance = statements.get("balance_sheet") if isinstance(statements.get("balance_sheet"), dict) else {}
-        cashflow = statements.get("cash_flow") if isinstance(statements.get("cash_flow"), dict) else {}
+        latest_quarter = statements.get("latest_quarter") if isinstance(statements.get("latest_quarter"), dict) else {}
+        income = latest_quarter.get("income_statement") if isinstance(latest_quarter.get("income_statement"), dict) else {}
+        balance = latest_quarter.get("balance_sheet") if isinstance(latest_quarter.get("balance_sheet"), dict) else {}
+        cashflow = latest_quarter.get("cash_flow") if isinstance(latest_quarter.get("cash_flow"), dict) else {}
+        if not any((income, balance, cashflow)):
+            income = statements.get("income_statement") if isinstance(statements.get("income_statement"), dict) else {}
+            balance = statements.get("balance_sheet") if isinstance(statements.get("balance_sheet"), dict) else {}
+            cashflow = statements.get("cash_flow") if isinstance(statements.get("cash_flow"), dict) else {}
         today = date.today()
-        period_end = income.get("latest_date") or balance.get("latest_date") or cashflow.get("latest_date") or today
+        period_end = latest_quarter.get("period_end") or income.get("latest_date") or balance.get("latest_date") or cashflow.get("latest_date") or today
         values = {
-            "revenue": raw.get("revenue") or income.get("total_revenue"),
-            "net_income": raw.get("net_income") or income.get("net_income"),
+            "revenue": income.get("total_revenue") if income.get("total_revenue") is not None else raw.get("revenue"),
+            "net_income": income.get("net_income") if income.get("net_income") is not None else raw.get("net_income"),
             "book_value": raw.get("book_value"),
             "shareholder_equity": raw.get("shareholder_equity") or balance.get("total_equity"),
             "total_debt": raw.get("total_debt") or raw.get("debt") or balance.get("debt"),
-            "free_cash_flow": raw.get("free_cash_flow") or cashflow.get("free_cash_flow"),
+            "free_cash_flow": cashflow.get("free_cash_flow") if cashflow.get("free_cash_flow") is not None else raw.get("free_cash_flow"),
             "shares_outstanding": raw.get("shares_outstanding"),
             "market_cap": raw.get("market_cap"),
             "pe_ratio": raw.get("pe_ratio"),
@@ -207,10 +212,17 @@ class FundamentalDataService:
             "symbol": normalized_symbol,
             "period_end": pd.Timestamp(period_end).date(),
             "available_at": today,
-            "frequency": "snapshot",
+            "frequency": "quarterly" if latest_quarter else "snapshot",
+            "currency": latest_quarter.get("currency") or (statements.get("_meta") or {}).get("currency") or "",
             "source": str(raw.get("source") or "market_data_collector"),
             "source_version": today.isoformat(),
-            "metadata": {"pointInTime": True, "collectedAt": pd.Timestamp.now(tz="UTC").isoformat()},
+            "metadata": {
+                "pointInTime": True,
+                "collectedAt": pd.Timestamp.now(tz="UTC").isoformat(),
+                "periodBasis": "latest_reported_quarter" if latest_quarter else "provider_latest",
+                "dataQuality": raw.get("data_quality") or {},
+                "identity": raw.get("identity") or {},
+            },
             **usable,
         }
         self.upsert(payload)

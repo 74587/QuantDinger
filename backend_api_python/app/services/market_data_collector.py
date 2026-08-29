@@ -14,6 +14,10 @@
 - 基本面: Finnhub (美股) / 固定描述 (加密)
 """
 
+import copy
+import os
+import tempfile
+import threading
 import time
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
@@ -58,7 +62,31 @@ class MarketDataCollector:
         self._finnhub_client = None
         self._ak = None
         self._crypto_metric_cache: Dict[str, Dict[str, Any]] = {}
+        self._fundamental_cache: Dict[str, Dict[str, Any]] = {}
+        self._fundamental_cache_lock = threading.RLock()
+        self._configure_yfinance_cache()
         self._init_clients()
+
+    @staticmethod
+    def _configure_yfinance_cache() -> None:
+        """Point yfinance at a writable cache directory inside containers.
+
+        yfinance caches cookies and timezone metadata.  Its platform default may
+        resolve to a read-only home directory for the unprivileged API user,
+        which turns every analysis into a cold request and can push financial
+        statements past the collection deadline.
+        """
+        cache_dir = os.getenv("YFINANCE_CACHE_DIR") or os.path.join(
+            tempfile.gettempdir(), "quantdinger-yfinance"
+        )
+        try:
+            os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+            os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+            set_tz_cache_location = getattr(yf, "set_tz_cache_location", None)
+            if callable(set_tz_cache_location):
+                set_tz_cache_location(cache_dir)
+        except Exception as exc:
+            logger.debug("Unable to configure yfinance cache at %s: %s", cache_dir, exc)
     
     def _init_clients(self):
         """初始化外部API客户端"""
@@ -136,21 +164,60 @@ class MarketDataCollector:
             elif market == 'Crypto':
                 core_futures[executor.submit(self._get_crypto_info, symbol)] = "fundamental"
             
-            try:
-                for future in as_completed(core_futures, timeout=15):
-                    key = core_futures[future]
-                    try:
-                        result = future.result(timeout=3)
-                        if result:
-                            data[key] = result
+            completed_futures = set()
+
+            def record_core_result(future) -> None:
+                key = core_futures[future]
+                completed_futures.add(future)
+                try:
+                    result = future.result()
+                    if result:
+                        data[key] = result
+                        if key not in data["_meta"]["success_items"]:
                             data["_meta"]["success_items"].append(key)
-                        else:
-                            data["_meta"]["failed_items"].append(key)
-                    except Exception as e:
-                        logger.warning(f"Core data fetch failed ({key}): {e}")
+                    elif key not in data["_meta"]["failed_items"]:
                         data["_meta"]["failed_items"].append(key)
+                except Exception as e:
+                    logger.warning(f"Core data fetch failed ({key}): {e}")
+                    if key not in data["_meta"]["failed_items"]:
+                        data["_meta"]["failed_items"].append(key)
+
+            try:
+                requested_timeout = float(timeout)
+            except (TypeError, ValueError):
+                requested_timeout = 30.0
+            # Fundamental statements are slower than quotes/K-lines on a cold
+            # cache. Honour the caller's deadline instead of truncating every
+            # core collection to the previous hard-coded 15 seconds.
+            core_timeout = max(15.0, min(45.0, requested_timeout))
+
+            try:
+                for future in as_completed(core_futures, timeout=core_timeout):
+                    record_core_result(future)
             except TimeoutError:
-                logger.warning(f"Core data fetch timed out for {market}:{symbol}")
+                pending_keys = [
+                    key for future, key in core_futures.items()
+                    if future not in completed_futures and not future.done()
+                ]
+                logger.warning(
+                    "Core data fetch timed out for %s:%s after %.1fs; pending=%s",
+                    market,
+                    symbol,
+                    core_timeout,
+                    pending_keys,
+                )
+            finally:
+                # Capture futures that completed on the timeout boundary, and
+                # explicitly mark truly unfinished items for quality reporting.
+                for future, key in core_futures.items():
+                    if future in completed_futures:
+                        continue
+                    if future.done():
+                        record_core_result(future)
+                    else:
+                        future.cancel()
+                        if key not in data["_meta"]["failed_items"]:
+                            data["_meta"]["failed_items"].append(key)
         
         if data.get("kline"):
             data["indicators"] = self._calculate_indicators(data["kline"])
@@ -283,7 +350,44 @@ class MarketDataCollector:
     
     
     def _get_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
-        """获取基本面数据"""
+        """Get fundamentals with a short-lived per-process cache.
+
+        Fundamentals do not change by chart timeframe.  Fast analysis requests
+        several timeframes for the same symbol, so fetching the same statements
+        repeatedly only adds latency and increases provider failure risk.
+        """
+        cache = getattr(self, "_fundamental_cache", None)
+        if cache is None:
+            cache = {}
+            self._fundamental_cache = cache
+        lock = getattr(self, "_fundamental_cache_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._fundamental_cache_lock = lock
+
+        normalized_symbol = str(symbol or "").strip().upper()
+        cache_key = f"{market}:{normalized_symbol}"
+        now = time.time()
+        with lock:
+            cached = cache.get(cache_key)
+            if cached and float(cached.get("expires_at") or 0) > now:
+                return copy.deepcopy(cached.get("value"))
+
+        result = self._fetch_fundamental_uncached(market, normalized_symbol)
+        if result:
+            try:
+                ttl_seconds = max(60, int(os.getenv("AI_FUNDAMENTAL_CACHE_TTL_SEC", "1800")))
+            except (TypeError, ValueError):
+                ttl_seconds = 1800
+            with lock:
+                cache[cache_key] = {
+                    "expires_at": now + ttl_seconds,
+                    "value": copy.deepcopy(result),
+                }
+        return result
+
+    def _fetch_fundamental_uncached(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch fundamentals from providers without consulting the cache."""
         try:
             if market == 'USStock':
                 return self._get_us_fundamental(symbol)
@@ -498,149 +602,358 @@ class MarketDataCollector:
         return earnings if earnings else {}
 
     def _get_us_fundamental(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Collect US equity fundamentals with explicit units and reporting periods.
+
+        Canonical units used by the analysis layer:
+        - market cap / statement values: absolute reporting-currency amounts
+        - ROE, margins, growth and dividend yield: percentage points
+        - debt-to-equity and liquidity ratios: ratio multiples
         """
-        美股基本面 - Finnhub + yfinance
-        包括：基础财务指标 + 财报数据（资产负债表、利润表、现金流量表）
-        """
-        result = {}
-        
+        result: Dict[str, Any] = {
+            "source": "",
+            "field_metadata": {},
+        }
+
+        def set_metric(
+            key: str,
+            value: Any,
+            *,
+            source: str,
+            unit: str,
+            period_type: str,
+            transform=None,
+            replace: bool = False,
+        ) -> None:
+            if value is None or value == "" or (not replace and result.get(key) is not None):
+                return
+            try:
+                clean = transform(value) if transform else float(value)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if pd.isna(clean):
+                return
+            result[key] = clean
+            result["field_metadata"][key] = {
+                "source": source,
+                "unit": unit,
+                "period_type": period_type,
+            }
+
+        source_parts: List[str] = []
         if self._finnhub_client:
             try:
                 metrics = self._finnhub_client.company_basic_financials(symbol, 'all')
                 if metrics and metrics.get('metric'):
                     m = metrics['metric']
-                    result.update({
-                        'pe_ratio': m.get('peBasicExclExtraTTM'),
-                        'pb_ratio': m.get('pbQuarterly'),
-                        'ps_ratio': m.get('psTTM'),
-                        'market_cap': m.get('marketCapitalization'),
-                        'dividend_yield': m.get('dividendYieldIndicatedAnnual'),
-                        'beta': m.get('beta'),
-                        '52w_high': m.get('52WeekHigh'),
-                        '52w_low': m.get('52WeekLow'),
-                        'roe': m.get('roeTTM'),
-                        'eps': m.get('epsBasicExclExtraItemsTTM'),
-                        'revenue_growth': m.get('revenueGrowthTTMYoy'),
-                        'profit_margin': m.get('netProfitMarginTTM'),
-                        'debt_to_equity': m.get('totalDebtToEquityQuarterly'),
-                        'current_ratio': m.get('currentRatioQuarterly'),
-                        'quick_ratio': m.get('quickRatioQuarterly'),
-                    })
+                    source_parts.append("finnhub")
+                    set_metric('pe_ratio', m.get('peBasicExclExtraTTM'), source="finnhub", unit="multiple", period_type="ttm")
+                    set_metric('pb_ratio', m.get('pbQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter")
+                    set_metric('ps_ratio', m.get('psTTM'), source="finnhub", unit="multiple", period_type="ttm")
+                    # Finnhub documents marketCapitalization in millions.
+                    set_metric('market_cap', m.get('marketCapitalization'), source="finnhub", unit="currency", period_type="current", transform=lambda v: float(v) * 1_000_000)
+                    set_metric('dividend_yield', m.get('dividendYieldIndicatedAnnual'), source="finnhub", unit="percent", period_type="annualized")
+                    set_metric('beta', m.get('beta'), source="finnhub", unit="multiple", period_type="current")
+                    set_metric('52w_high', m.get('52WeekHigh'), source="finnhub", unit="currency_per_share", period_type="52_week")
+                    set_metric('52w_low', m.get('52WeekLow'), source="finnhub", unit="currency_per_share", period_type="52_week")
+                    set_metric('roe', m.get('roeTTM'), source="finnhub", unit="percent", period_type="ttm")
+                    set_metric('eps', m.get('epsBasicExclExtraItemsTTM'), source="finnhub", unit="currency_per_share", period_type="ttm")
+                    set_metric('revenue_growth', m.get('revenueGrowthTTMYoy'), source="finnhub", unit="percent", period_type="ttm_yoy")
+                    set_metric('profit_margin', m.get('netProfitMarginTTM'), source="finnhub", unit="percent", period_type="ttm")
+                    set_metric('debt_to_equity', m.get('totalDebtToEquityQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter", transform=lambda v: float(v) / 100.0)
+                    set_metric('current_ratio', m.get('currentRatioQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter")
+                    set_metric('quick_ratio', m.get('quickRatioQuarterly'), source="finnhub", unit="multiple", period_type="latest_quarter")
             except Exception as e:
                 logger.debug(f"Finnhub fundamental failed for {symbol}: {e}")
-        
+
+        ticker = None
+        info: Dict[str, Any] = {}
+        identity_rejected = False
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info or {}
-            
-            if not result.get('pe_ratio'):
-                result['pe_ratio'] = info.get('trailingPE') or info.get('forwardPE')
-            if not result.get('pb_ratio'):
-                result['pb_ratio'] = info.get('priceToBook')
-            if not result.get('market_cap'):
-                result['market_cap'] = info.get('marketCap')
-            if not result.get('dividend_yield'):
-                result['dividend_yield'] = info.get('dividendYield')
-            if not result.get('beta'):
-                result['beta'] = info.get('beta')
-            if not result.get('52w_high'):
-                result['52w_high'] = info.get('fiftyTwoWeekHigh')
-            if not result.get('52w_low'):
-                result['52w_low'] = info.get('fiftyTwoWeekLow')
-            if not result.get('roe'):
-                result['roe'] = info.get('returnOnEquity')
-            if not result.get('eps'):
-                result['eps'] = info.get('trailingEps')
-            
-            result.update({
-                'revenue': info.get('totalRevenue'),
-                'gross_profit': info.get('grossProfits'),
-                'operating_margin': info.get('operatingMargins'),
-                'profit_margin': result.get('profit_margin') or info.get('profitMargins'),
-                'ebitda': info.get('ebitda'),
-                'debt': info.get('totalDebt'),
-                'cash': info.get('totalCash'),
-                'free_cash_flow': info.get('freeCashflow'),
-                'operating_cash_flow': info.get('operatingCashflow'),
-                'book_value': info.get('bookValue'),
-                'enterprise_value': info.get('enterpriseValue'),
-            })
+
+            reported_symbol = str(info.get("symbol") or "").strip().upper()
+            expected_symbol = str(symbol or "").strip().upper()
+            identity_match = not reported_symbol or reported_symbol == expected_symbol
+            result["identity"] = {
+                "requested_symbol": expected_symbol,
+                "reported_symbol": reported_symbol or None,
+                "company_name": info.get("longName") or info.get("shortName"),
+                "industry": info.get("industry"),
+                "sector": info.get("sector"),
+                "country": info.get("country"),
+                "exchange": info.get("exchange") or info.get("fullExchangeName"),
+                "quote_type": info.get("quoteType"),
+                "verified": bool(identity_match and reported_symbol),
+            }
+            if not identity_match:
+                logger.warning("Rejected mismatched yfinance fundamentals requested=%s reported=%s", expected_symbol, reported_symbol)
+                identity_rejected = True
+                ticker = None
+                info = {}
+            else:
+                source_parts.append("yfinance")
+                set_metric('pe_ratio', info.get('trailingPE') or info.get('forwardPE'), source="yfinance", unit="multiple", period_type="ttm")
+                set_metric('pb_ratio', info.get('priceToBook'), source="yfinance", unit="multiple", period_type="current")
+                set_metric('market_cap', info.get('marketCap'), source="yfinance", unit="currency", period_type="current")
+                set_metric('dividend_yield', info.get('dividendYield'), source="yfinance", unit="percent", period_type="annualized", transform=lambda v: float(v) * 100.0)
+                set_metric('beta', info.get('beta'), source="yfinance", unit="multiple", period_type="current")
+                set_metric('52w_high', info.get('fiftyTwoWeekHigh'), source="yfinance", unit="currency_per_share", period_type="52_week")
+                set_metric('52w_low', info.get('fiftyTwoWeekLow'), source="yfinance", unit="currency_per_share", period_type="52_week")
+                set_metric('roe', info.get('returnOnEquity'), source="yfinance", unit="percent", period_type="ttm", transform=lambda v: float(v) * 100.0)
+                set_metric('eps', info.get('trailingEps'), source="yfinance", unit="currency_per_share", period_type="ttm")
+                set_metric('revenue_growth', info.get('revenueGrowth'), source="yfinance", unit="percent", period_type="ttm_yoy", transform=lambda v: float(v) * 100.0)
+                set_metric('operating_margin', info.get('operatingMargins'), source="yfinance", unit="percent", period_type="ttm", transform=lambda v: float(v) * 100.0)
+                set_metric('profit_margin', info.get('profitMargins'), source="yfinance", unit="percent", period_type="ttm", transform=lambda v: float(v) * 100.0)
+                set_metric('debt_to_equity', info.get('debtToEquity'), source="yfinance", unit="multiple", period_type="latest_quarter", transform=lambda v: float(v) / 100.0)
+                set_metric('current_ratio', info.get('currentRatio'), source="yfinance", unit="multiple", period_type="latest_quarter")
+                set_metric('quick_ratio', info.get('quickRatio'), source="yfinance", unit="multiple", period_type="latest_quarter")
+                for key, value, unit, period_type in (
+                    ('revenue', info.get('totalRevenue'), 'currency', 'ttm'),
+                    ('gross_profit', info.get('grossProfits'), 'currency', 'ttm'),
+                    ('ebitda', info.get('ebitda'), 'currency', 'ttm'),
+                    ('debt', info.get('totalDebt'), 'currency', 'latest_quarter'),
+                    ('cash', info.get('totalCash'), 'currency', 'latest_quarter'),
+                    ('free_cash_flow', info.get('freeCashflow'), 'currency', 'ttm'),
+                    ('operating_cash_flow', info.get('operatingCashflow'), 'currency', 'ttm'),
+                    ('book_value', info.get('bookValue'), 'currency_per_share', 'latest_quarter'),
+                    ('enterprise_value', info.get('enterpriseValue'), 'currency', 'current'),
+                    ('shares_outstanding', info.get('sharesOutstanding'), 'shares', 'current'),
+                ):
+                    set_metric(key, value, source="yfinance", unit=unit, period_type=period_type)
         except Exception as e:
             logger.debug(f"yfinance fundamental failed for {symbol}: {e}")
-        
-        financial_statements = self._get_financial_statements(symbol)
+
+        financial_statements = None if identity_rejected else self._get_financial_statements(
+            symbol,
+            ticker=ticker,
+            currency=info.get("financialCurrency") or info.get("currency") or "USD",
+        )
         if financial_statements:
             result['financial_statements'] = financial_statements
-        
-        earnings_data = self._get_earnings_data(symbol)
+            source_parts.append("yfinance_statements")
+            latest_q = financial_statements.get("latest_quarter") or {}
+            derived = latest_q.get("derived") or {}
+            for key, unit in (
+                ("revenue_growth", "percent"),
+                ("profit_margin", "percent"),
+                ("current_ratio", "multiple"),
+                ("debt_to_equity", "multiple"),
+                ("roe", "percent"),
+            ):
+                set_metric(
+                    key,
+                    derived.get(key),
+                    source="yfinance_statements",
+                    unit=unit,
+                    period_type="latest_quarter",
+                )
+
+        earnings_data = None if identity_rejected else self._get_earnings_data(symbol, ticker=ticker)
         if earnings_data:
             result['earnings'] = earnings_data
-        
-        return result if result else None
+        result["source"] = "+".join(dict.fromkeys(source_parts))
+        result["data_quality"] = {
+            "preferred_basis": "latest_reported_quarter",
+            "valuation_basis": "current_or_ttm",
+            "statement_source": "yfinance",
+            "periods_separated": bool(financial_statements),
+            "identity_verified": bool((result.get("identity") or {}).get("verified")),
+        }
+        usable_keys = [key for key in result if key not in {"source", "field_metadata", "data_quality", "identity"}]
+        return result if usable_keys else None
     
-    def _get_financial_statements(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def _get_financial_statements(
+        self,
+        symbol: str,
+        *,
+        ticker=None,
+        currency: str = "USD",
+    ) -> Optional[Dict[str, Any]]:
         """
         获取财务报表数据（资产负债表、利润表、现金流量表）
         
-        使用 yfinance 获取，包含最近几个季度的数据
+        使用 yfinance 获取，明确区分最新季报、TTM 与最新年报。
         """
+        def pick(frame: pd.DataFrame, names: tuple, column) -> Optional[float]:
+            if frame is None or frame.empty or column is None:
+                return None
+            for name in names:
+                if name not in frame.index:
+                    continue
+                try:
+                    value = float(frame.loc[name, column])
+                except (TypeError, ValueError):
+                    continue
+                if not pd.isna(value):
+                    return value
+            return None
+
+        def columns(frame: pd.DataFrame) -> List[Any]:
+            if frame is None or frame.empty:
+                return []
+            return sorted(list(frame.columns), key=lambda value: pd.Timestamp(value), reverse=True)
+
+        def statement(frame: pd.DataFrame, field_map: Dict[str, tuple], period_type: str) -> Dict[str, Any]:
+            cols = columns(frame)
+            if not cols:
+                return {}
+            col = cols[0]
+            payload: Dict[str, Any] = {
+                "latest_date": str(pd.Timestamp(col).date()),
+                "period_end": str(pd.Timestamp(col).date()),
+                "period_type": period_type,
+                "currency": currency,
+                "source": "yfinance",
+            }
+            for field, names in field_map.items():
+                payload[field] = pick(frame, names, col)
+            return payload
+
+        def sum_latest(frame: pd.DataFrame, names: tuple, count: int = 4) -> Optional[float]:
+            cols = columns(frame)[:count]
+            values = [pick(frame, names, col) for col in cols]
+            clean = [value for value in values if value is not None]
+            return sum(clean) if len(clean) == count else None
+
+        balance_fields = {
+            "total_assets": ("Total Assets",),
+            "total_liabilities": ("Total Liabilities Net Minority Interest", "Total Liab"),
+            "total_equity": ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"),
+            "cash": ("Cash Cash Equivalents And Short Term Investments", "Cash And Cash Equivalents", "Cash"),
+            "debt": ("Total Debt",),
+            "current_assets": ("Current Assets", "Total Current Assets"),
+            "current_liabilities": ("Current Liabilities", "Total Current Liabilities"),
+        }
+        income_fields = {
+            "total_revenue": ("Total Revenue", "Revenue", "Net Sales"),
+            "gross_profit": ("Gross Profit",),
+            "operating_income": ("Operating Income",),
+            "net_income": ("Net Income", "Net Income Common Stockholders", "Net Income Continuous Operations"),
+            "eps": ("Diluted EPS", "Basic EPS"),
+        }
+        cash_flow_fields = {
+            "operating_cash_flow": ("Operating Cash Flow", "Total Cash From Operating Activities"),
+            "capital_expenditure": ("Capital Expenditure", "Capital Expenditures"),
+            "financing_cash_flow": ("Financing Cash Flow", "Total Cash From Financing Activities"),
+            "free_cash_flow": ("Free Cash Flow",),
+        }
+
         try:
-            ticker = yf.Ticker(symbol)
-            statements = {}
-            
-            try:
-                balance_sheet = ticker.balance_sheet
-                if balance_sheet is not None and not balance_sheet.empty:
-                    latest_quarters = balance_sheet.columns[:4] if len(balance_sheet.columns) >= 4 else balance_sheet.columns
-                    statements['balance_sheet'] = {
-                        'latest_date': str(latest_quarters[0]) if len(latest_quarters) > 0 else None,
-                        'total_assets': float(balance_sheet.loc['Total Assets', latest_quarters[0]]) if 'Total Assets' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'total_liabilities': float(balance_sheet.loc['Total Liab', latest_quarters[0]]) if 'Total Liab' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'total_equity': float(balance_sheet.loc['Stockholders Equity', latest_quarters[0]]) if 'Stockholders Equity' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'cash': float(balance_sheet.loc['Cash', latest_quarters[0]]) if 'Cash' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'debt': float(balance_sheet.loc['Total Debt', latest_quarters[0]]) if 'Total Debt' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'current_assets': float(balance_sheet.loc['Current Assets', latest_quarters[0]]) if 'Current Assets' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                        'current_liabilities': float(balance_sheet.loc['Current Liabilities', latest_quarters[0]]) if 'Current Liabilities' in balance_sheet.index and len(latest_quarters) > 0 else None,
-                    }
-            except Exception as e:
-                logger.debug(f"Balance sheet fetch failed for {symbol}: {e}")
-            
-            try:
-                income_stmt = ticker.financials
-                if income_stmt is not None and not income_stmt.empty:
-                    latest_quarters = income_stmt.columns[:4] if len(income_stmt.columns) >= 4 else income_stmt.columns
-                    statements['income_statement'] = {
-                        'latest_date': str(latest_quarters[0]) if len(latest_quarters) > 0 else None,
-                        'total_revenue': float(income_stmt.loc['Total Revenue', latest_quarters[0]]) if 'Total Revenue' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'gross_profit': float(income_stmt.loc['Gross Profit', latest_quarters[0]]) if 'Gross Profit' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'operating_income': float(income_stmt.loc['Operating Income', latest_quarters[0]]) if 'Operating Income' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'net_income': float(income_stmt.loc['Net Income', latest_quarters[0]]) if 'Net Income' in income_stmt.index and len(latest_quarters) > 0 else None,
-                        'eps': float(income_stmt.loc['Basic EPS', latest_quarters[0]]) if 'Basic EPS' in income_stmt.index and len(latest_quarters) > 0 else None,
-                    }
-            except Exception as e:
-                logger.debug(f"Income statement fetch failed for {symbol}: {e}")
-            
-            try:
-                cashflow = ticker.cashflow
-                if cashflow is not None and not cashflow.empty:
-                    latest_quarters = cashflow.columns[:4] if len(cashflow.columns) >= 4 else cashflow.columns
-                    statements['cash_flow'] = {
-                        'latest_date': str(latest_quarters[0]) if len(latest_quarters) > 0 else None,
-                        'operating_cash_flow': float(cashflow.loc['Operating Cash Flow', latest_quarters[0]]) if 'Operating Cash Flow' in cashflow.index and len(latest_quarters) > 0 else None,
-                        'investing_cash_flow': float(cashflow.loc['Capital Expenditure', latest_quarters[0]]) if 'Capital Expenditure' in cashflow.index and len(latest_quarters) > 0 else None,
-                        'financing_cash_flow': float(cashflow.loc['Financing Cash Flow', latest_quarters[0]]) if 'Financing Cash Flow' in cashflow.index and len(latest_quarters) > 0 else None,
-                        'free_cash_flow': float(cashflow.loc['Free Cash Flow', latest_quarters[0]]) if 'Free Cash Flow' in cashflow.index and len(latest_quarters) > 0 else None,
-                    }
-            except Exception as e:
-                logger.debug(f"Cash flow statement fetch failed for {symbol}: {e}")
-            
-            return statements if statements else None
+            ticker = ticker or yf.Ticker(symbol)
+            q_bs = getattr(ticker, "quarterly_balance_sheet", pd.DataFrame())
+            q_inc = getattr(ticker, "quarterly_income_stmt", pd.DataFrame())
+            q_cf = getattr(ticker, "quarterly_cash_flow", pd.DataFrame())
+            a_bs = getattr(ticker, "balance_sheet", pd.DataFrame())
+            a_inc = getattr(ticker, "financials", pd.DataFrame())
+            a_cf = getattr(ticker, "cashflow", pd.DataFrame())
+
+            latest_q_bs = statement(q_bs, balance_fields, "quarterly")
+            latest_q_inc = statement(q_inc, income_fields, "quarterly")
+            latest_q_cf = statement(q_cf, cash_flow_fields, "quarterly")
+            quarter_dates = [
+                payload.get("period_end")
+                for payload in (latest_q_bs, latest_q_inc, latest_q_cf)
+                if payload.get("period_end")
+            ]
+            latest_quarter: Dict[str, Any] = {
+                "period_end": max(quarter_dates) if quarter_dates else None,
+                "period_type": "quarterly",
+                "currency": currency,
+                "source": "yfinance",
+                "balance_sheet": latest_q_bs,
+                "income_statement": latest_q_inc,
+                "cash_flow": latest_q_cf,
+            }
+
+            q_inc_cols = columns(q_inc)
+            derived: Dict[str, Any] = {}
+            if len(q_inc_cols) >= 5:
+                latest_revenue = pick(q_inc, income_fields["total_revenue"], q_inc_cols[0])
+                prior_year_revenue = pick(q_inc, income_fields["total_revenue"], q_inc_cols[4])
+                if latest_revenue is not None and prior_year_revenue not in (None, 0):
+                    derived["revenue_growth"] = (latest_revenue / prior_year_revenue - 1.0) * 100.0
+                    derived["revenue_growth_basis"] = "latest_quarter_yoy"
+            q_revenue = latest_q_inc.get("total_revenue")
+            q_net_income = latest_q_inc.get("net_income")
+            if q_revenue not in (None, 0) and q_net_income is not None:
+                derived["profit_margin"] = q_net_income / q_revenue * 100.0
+            equity = latest_q_bs.get("total_equity")
+            debt = latest_q_bs.get("debt")
+            if equity not in (None, 0) and debt is not None:
+                derived["debt_to_equity"] = debt / equity
+            current_assets = latest_q_bs.get("current_assets")
+            current_liabilities = latest_q_bs.get("current_liabilities")
+            if current_assets is not None and current_liabilities not in (None, 0):
+                derived["current_ratio"] = current_assets / current_liabilities
+            latest_quarter["derived"] = derived
+
+            ttm_income = {
+                "total_revenue": sum_latest(q_inc, income_fields["total_revenue"]),
+                "gross_profit": sum_latest(q_inc, income_fields["gross_profit"]),
+                "operating_income": sum_latest(q_inc, income_fields["operating_income"]),
+                "net_income": sum_latest(q_inc, income_fields["net_income"]),
+            }
+            ttm_cash = {
+                "operating_cash_flow": sum_latest(q_cf, cash_flow_fields["operating_cash_flow"]),
+                "capital_expenditure": sum_latest(q_cf, cash_flow_fields["capital_expenditure"]),
+                "financing_cash_flow": sum_latest(q_cf, cash_flow_fields["financing_cash_flow"]),
+                "free_cash_flow": sum_latest(q_cf, cash_flow_fields["free_cash_flow"]),
+            }
+            ttm_derived: Dict[str, Any] = {}
+            if ttm_income.get("total_revenue") not in (None, 0) and ttm_income.get("net_income") is not None:
+                ttm_derived["profit_margin"] = ttm_income["net_income"] / ttm_income["total_revenue"] * 100.0
+            if equity not in (None, 0) and ttm_income.get("net_income") is not None:
+                ttm_derived["roe"] = ttm_income["net_income"] / equity * 100.0
+            ttm = {
+                "period_end": latest_quarter.get("period_end"),
+                "period_type": "ttm",
+                "currency": currency,
+                "source": "yfinance_derived_from_quarters",
+                "income_statement": ttm_income,
+                "cash_flow": ttm_cash,
+                "derived": ttm_derived,
+                "complete_quarters": min(len(columns(q_inc)), len(columns(q_cf)), 4),
+            }
+
+            annual_bs = statement(a_bs, balance_fields, "annual")
+            annual_inc = statement(a_inc, income_fields, "annual")
+            annual_cf = statement(a_cf, cash_flow_fields, "annual")
+            annual_dates = [payload.get("period_end") for payload in (annual_bs, annual_inc, annual_cf) if payload.get("period_end")]
+            latest_annual = {
+                "period_end": max(annual_dates) if annual_dates else None,
+                "period_type": "annual",
+                "currency": currency,
+                "source": "yfinance",
+                "balance_sheet": annual_bs,
+                "income_statement": annual_inc,
+                "cash_flow": annual_cf,
+            }
+
+            if not quarter_dates and not annual_dates:
+                return None
+
+            # Compatibility aliases now intentionally point to the latest reported quarter.
+            return {
+                "latest_quarter": latest_quarter,
+                "ttm": ttm,
+                "latest_annual": latest_annual,
+                "balance_sheet": latest_q_bs or annual_bs,
+                "income_statement": latest_q_inc or annual_inc,
+                "cash_flow": latest_q_cf or annual_cf,
+                "_meta": {
+                    "preferred_basis": "latest_reported_quarter",
+                    "periods_separated": True,
+                    "source": "yfinance",
+                    "currency": currency,
+                },
+            }
             
         except Exception as e:
             logger.debug(f"Financial statements fetch failed for {symbol}: {e}")
             return None
     
-    def _get_earnings_data(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def _get_earnings_data(self, symbol: str, *, ticker=None) -> Optional[Dict[str, Any]]:
         """
         获取盈利报告数据（Earnings）
 
@@ -660,7 +973,7 @@ class MarketDataCollector:
             return None
 
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = ticker or yf.Ticker(symbol)
             earnings_data: Dict[str, Any] = {}
 
             try:

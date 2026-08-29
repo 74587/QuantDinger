@@ -23,6 +23,14 @@ class StrategyV2DeploymentService:
             raise StrategyV2ContractError("strategyV2.sourceNotFound")
         program = compile_strategy_v2(str(source.get("code") or ""))
         manifest = program.manifest
+        source_metadata = self._object(source.get("metadata"))
+        adaptation = self._object(source_metadata.get("marketplace_adaptation"))
+        if adaptation.get("requires_backtest") and not self._has_current_version_backtest(
+            user_id=int(user_id),
+            source_id=source_id,
+            code_hash=str(manifest.code_hash or ""),
+        ):
+            raise StrategyV2ContractError("strategyV2.backtestRequiredForAdaptedStrategy")
         name = str(payload.get("name") or source.get("name") or "").strip()
         if not name:
             raise StrategyV2ContractError("strategyV2.nameRequired")
@@ -75,7 +83,6 @@ class StrategyV2DeploymentService:
             "channels": list(payload.get("notificationChannels") or []),
             "targets": payload.get("notificationTargets") or {},
         }
-        source_metadata = self._object(source.get("metadata"))
         source_runtime = self._object(source_metadata.get("last_run_config"))
         generated_runtime = payload.get("strategyRuntimeConfig") or payload.get("strategy_runtime_config") or {}
         if not isinstance(generated_runtime, dict):
@@ -244,6 +251,24 @@ class StrategyV2DeploymentService:
             row = cur.fetchone() or {}
             cur.close()
         return str(row.get("exchange_id") or "").strip().lower()
+
+    @staticmethod
+    def _has_current_version_backtest(*, user_id: int, source_id: int, code_hash: str) -> bool:
+        if not source_id or not code_hash:
+            return False
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id FROM qd_backtest_runs
+                WHERE user_id = ? AND source_id = ? AND code_hash = ? AND status = 'success'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (int(user_id), int(source_id), str(code_hash)),
+            )
+            found = cur.fetchone() is not None
+            cur.close()
+        return found
 
     @staticmethod
     def _validate_execution_account(markets: tuple[str, ...], exchange_id: str, execution_mode: str) -> None:

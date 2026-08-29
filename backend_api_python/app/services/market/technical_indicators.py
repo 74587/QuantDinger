@@ -35,12 +35,20 @@ def calculate_indicators(klines: List[Dict[str, Any]]) -> Dict[str, Any]:
         macd_val = macd_raw.get("MACD", 0)
         macd_sig = macd_raw.get("MACD_signal", 0)
         macd_hist = macd_raw.get("MACD_histogram", 0)
+        prev_macd = macd_raw.get("previous_MACD")
+        prev_sig = macd_raw.get("previous_MACD_signal")
+        cross_event = None
+        if prev_macd is not None and prev_sig is not None:
+            if prev_macd <= prev_sig and macd_val > macd_sig:
+                cross_event = "golden_cross"
+            elif prev_macd >= prev_sig and macd_val < macd_sig:
+                cross_event = "death_cross"
         if macd_val > macd_sig and macd_hist > 0:
             macd_signal = "bullish"
-            macd_trend = "golden_cross"
+            macd_trend = cross_event or "bullish_alignment"
         elif macd_val < macd_sig and macd_hist < 0:
             macd_signal = "bearish"
-            macd_trend = "death_cross"
+            macd_trend = cross_event or "bearish_alignment"
         else:
             macd_signal = "neutral"
             macd_trend = "consolidating"
@@ -50,6 +58,7 @@ def calculate_indicators(klines: List[Dict[str, Any]]) -> Dict[str, Any]:
             "histogram": round(macd_hist, 6),
             "signal": macd_signal,
             "trend": macd_trend,
+            "cross_event": cross_event,
         }
 
     ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else current_price
@@ -105,6 +114,8 @@ def calculate_indicators(klines: List[Dict[str, Any]]) -> Dict[str, Any]:
         "swing_high": round(swing_high, 6),
         "swing_low": round(swing_low, 6),
         "method": "pivot_swing_bb_avg",
+        "kind": "heuristic_estimate",
+        "is_estimate": True,
     }
 
     atr = calc_atr_wilder(klines, period=14) if len(klines) >= 14 else 0.0
@@ -142,9 +153,15 @@ def calculate_indicators(klines: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     if bb_for_levels:
         indicators["bollinger"] = bb_for_levels
-    if len(volumes) >= 20:
-        avg_vol = sum(volumes[-20:]) / 20
+    if len(volumes) >= 21:
+        # Compare the analyzed bar with the *previous* 20 bars. Including the
+        # numerator in its own baseline systematically compresses the ratio.
+        avg_vol = sum(volumes[-21:-1]) / 20
         indicators["volume_ratio"] = round(volumes[-1] / avg_vol, 2) if avg_vol > 0 else 1.0
+        indicators["volume_ratio_meta"] = {
+            "baseline": "previous_20_bars",
+            "baseline_bars": 20,
+        }
     if len(closes) >= 20:
         high_20 = max(highs[-20:])
         low_20 = min(lows[-20:])
@@ -189,7 +206,7 @@ def ema_series_sma_seed(data: List[float], period: int) -> List[Optional[float]]
     return output
 
 
-def calc_macd(closes: List[float]) -> Dict[str, float]:
+def calc_macd(closes: List[float]) -> Dict[str, Any]:
     """Calculate MACD(12, 26, 9)."""
     ema12 = ema_series_sma_seed(closes, 12)
     ema26 = ema_series_sma_seed(closes, 26)
@@ -202,11 +219,20 @@ def calc_macd(closes: List[float]) -> Dict[str, float]:
     sig_series = ema_series_sma_seed(macd_sub, 9)
     last_macd = macd_sub[-1]
     last_sig = sig_series[-1] if sig_series[-1] is not None else last_macd
-    return {
+    result: Dict[str, Any] = {
         "MACD": round(last_macd, 6),
         "MACD_signal": round(last_sig, 6),
         "MACD_histogram": round(last_macd - last_sig, 6),
     }
+    if len(macd_sub) >= 2 and len(sig_series) >= 2 and sig_series[-2] is not None:
+        previous_macd = macd_sub[-2]
+        previous_signal = sig_series[-2]
+        result.update({
+            "previous_MACD": round(previous_macd, 6),
+            "previous_MACD_signal": round(previous_signal, 6),
+            "previous_MACD_histogram": round(previous_macd - previous_signal, 6),
+        })
+    return result
 
 
 def true_ranges(klines: List[Dict[str, Any]]) -> List[float]:

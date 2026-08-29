@@ -1,36 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-import sys
-import types
 
 import pytest
-
-
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def _namespace(name, path):
-    if name in sys.modules:
-        return
-    module = types.ModuleType(name)
-    module.__path__ = [str(path)]
-    sys.modules[name] = module
-
-
-_namespace("app", ROOT / "app")
-_namespace("app.services", ROOT / "app" / "services")
-_namespace("app.services.live_trading", ROOT / "app" / "services" / "live_trading")
-_namespace("app.utils", ROOT / "app" / "utils")
-
-resource_guard = types.ModuleType("app.utils.resource_guard")
-resource_guard.ResourceExhaustedError = RuntimeError
-resource_guard.assert_fd_available = lambda _label: None
-resource_guard.is_fd_exhaustion = lambda _exc: False
-resource_guard.mark_fd_exhausted = lambda _exc: None
-resource_guard.record_exception = lambda _exc, **_kwargs: None
-sys.modules.setdefault("app.utils.resource_guard", resource_guard)
 
 from app.services.live_trading.base import LiveOrderResult
 from app.services.live_trading.contracts import FillSnapshot, OrderIntent, PositionSnapshot

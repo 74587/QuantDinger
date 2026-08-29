@@ -7,6 +7,8 @@ from app.data_sources import DataSourceFactory
 from app.utils.cache import CacheManager
 from app.utils.logger import get_logger
 from app.config import CacheConfig
+from app.config.data_sources import CCXTConfig
+from app.data_providers.gate_public_market import get_gate_spot_klines
 
 logger = get_logger(__name__)
 
@@ -45,6 +47,7 @@ class KlineService:
         """
         normalized_market = DataSourceFactory.normalize_market(market or "")
         ex_key = (exchange_id or "").strip().lower()
+        effective_ex_key = ex_key or str(CCXTConfig.DEFAULT_EXCHANGE or "").strip().lower()
         mt_key = (market_type or "").strip().lower()
         if not before_time:
             cache_key = f"kline:{normalized_market}:{ex_key}:{mt_key}:{symbol}:{timeframe}:{limit}"
@@ -52,15 +55,33 @@ class KlineService:
             if cached:
                 return cached
         
-        klines = DataSourceFactory.get_kline(
-            market=normalized_market,
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=limit,
-            before_time=before_time,
-            exchange_id=exchange_id,
-            market_type=market_type,
-        )
+        klines = None
+        if (
+            normalized_market == "Crypto"
+            and effective_ex_key == "gate"
+            and mt_key in {"", "spot"}
+            and not before_time
+        ):
+            try:
+                klines = get_gate_spot_klines(symbol, timeframe, limit)
+            except Exception as exc:
+                logger.warning(
+                    "Native Gate spot candles unavailable for %s %s; falling back to standard provider: %s",
+                    symbol,
+                    timeframe,
+                    exc,
+                )
+
+        if not klines:
+            klines = DataSourceFactory.get_kline(
+                market=normalized_market,
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit,
+                before_time=before_time,
+                exchange_id=exchange_id,
+                market_type=market_type,
+            )
         
         if klines and not before_time:
             ttl = self.cache_ttl.get(timeframe, 300)
@@ -203,4 +224,3 @@ class KlineService:
             logger.error(f"All price sources failed for {market}:{symbol}: {e}")
         
         return result
-
