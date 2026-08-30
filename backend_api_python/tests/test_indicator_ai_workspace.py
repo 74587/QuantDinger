@@ -6,6 +6,7 @@ from app.services.indicator_ai_workspace import (
     WORKSPACE_MESSAGE_LIMIT,
     classify_indicator_ai_intent,
     code_hash,
+    _owned_indicator,
 )
 
 
@@ -74,3 +75,25 @@ def test_indicator_ai_workspace_migration_has_all_separate_tables():
     ):
         assert f"CREATE TABLE IF NOT EXISTS {table}" in sql
     assert "qd_indicator_code_versions" not in sql
+
+
+def test_hidden_purchased_indicator_is_rejected_before_ai_workspace_access():
+    class Cursor:
+        def execute(self, *_args, **_kwargs):
+            return None
+
+        def fetchone(self):
+            return {
+                "id": 91,
+                "user_id": 7,
+                "name": "Protected indicator",
+                "description": "",
+                "code": "secret",
+                "is_buy": 1,
+                "is_encrypted": 1,
+            }
+
+    import pytest
+
+    with pytest.raises(PermissionError, match="indicator_source_hidden"):
+        _owned_indicator(Cursor(), 7, 91)

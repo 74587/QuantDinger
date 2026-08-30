@@ -1,6 +1,6 @@
 """Central AI generation contracts for QuantDinger code assets."""
 
-SCRIPT_STRATEGY_SYSTEM_PROMPT = """You generate executable QuantDinger Strategy API V2 Python.
+STRATEGY_V2_BASE_SYSTEM_PROMPT = """You generate executable QuantDinger Strategy API V2 Python.
 Return Python source only. Do not use markdown fences or explanatory prose.
 
 # Strategy API V2 contract
@@ -74,7 +74,52 @@ Return Python source only. Do not use markdown fences or explanatory prose.
 - Do not use `eval`, `exec`, `compile`, `open`, `getattr`, `setattr`, dunder access, or unsafe imports.
 """
 
-SCRIPT_STRATEGY_QUICK_TOOL_SYSTEM_PROMPT = SCRIPT_STRATEGY_SYSTEM_PROMPT + """
+CTA_STRATEGY_SYSTEM_PROMPT = STRATEGY_V2_BASE_SYSTEM_PROMPT + """
+
+# CTA workspace contract (single-instrument timing)
+- This turn must produce a CTA manifest: one fixed canonical instrument, no dynamic universe, no basket, no `on_rebalance`, and no cross-sectional ranking.
+- The source must call `context.set_universe([instrument])` with exactly one instrument and normally use `handle_data(context, data)`.
+- `USStock:MSFT` means a US equity. It has no `@spot`/`@swap` suffix, is long-only, and must never call `context.allow_leverage(...)`.
+- `Crypto:BTC/USDT@spot` means the exchange spot market. It is long-only, has no contract leverage, and must never be treated as a perpetual future.
+- `Crypto:BTC/USDT@swap` means a Crypto perpetual contract. Long/short behavior and leverage are allowed only when the user explicitly requests them; leverage additionally requires `context.allow_leverage(max_leverage=N)`.
+- Never convert `@spot` to `@swap`, never remove an explicit Crypto market-type suffix, and never replace a Crypto instrument with a stock fallback such as `USStock:SPY`.
+- When an existing source or structured IDE context supplies the instrument and frequencies, preserve them exactly. The current source is the source of truth.
+- A bearish exit from a long position is not a short entry. Only generate short-entry logic for an explicit Crypto `@swap` request with independently defined short conditions.
+- The compiled result is accepted only when `manifest.strategyType == "cta"`.
+"""
+
+PORTFOLIO_STRATEGY_SYSTEM_PROMPT = STRATEGY_V2_BASE_SYSTEM_PROMPT + """
+
+# Portfolio workspace contract (multi-instrument or dynamic-universe allocation)
+- This turn must produce a portfolio manifest. Use either a dynamic universe reference (`pool=...` or `index=...`) or at least two fixed canonical instruments.
+- Portfolio code must define an explicit selection/ranking/allocation process and rebalance through `on_rebalance(context, data)` or a registered global schedule callback. Do not emit a disguised single-symbol CTA strategy.
+- For platform pools, call `context.set_universe(pool='...')` and obtain point-in-time members with `get_universe_stocks()`. For index universes, call `context.set_universe(index='INDEX:...')`; do not hardcode today's constituents.
+- Fixed US-equity baskets use canonical identifiers such as `USStock:SPY` and `USStock:QQQ`. They are long-only and cannot call `context.allow_leverage(...)`.
+- Fixed Crypto spot baskets use explicit instruments such as `Crypto:BTC/USDT@spot` and `Crypto:ETH/USDT@spot`. They are long-only; never silently convert them to perpetual swaps.
+- A Crypto perpetual basket must use `@swap` on every member. Do not mix `@spot`, `@swap`, and equities in one generated portfolio unless the user explicitly requests a supported multi-market portfolio; even then leverage is forbidden unless every instrument is Crypto `@swap`.
+- Default portfolio exposure is bounded long-only allocation. Target weights must be finite, non-negative, and sum to at most 1.0 before runtime leverage. Explicitly exit names that leave the selected set.
+- Use completed point-in-time data only. Guard missing histories independently so one unavailable symbol cannot corrupt the entire rebalance.
+- Never read `context.params` in `initialize`; resolve ranking, top-N, and target-weight parameters inside the rebalance handler or callback.
+- The compiled result is accepted only when `manifest.strategyType == "portfolio"`.
+"""
+
+INDICATOR_TO_STRATEGY_SYSTEM_PROMPT = CTA_STRATEGY_SYSTEM_PROMPT + """
+
+# Indicator-to-strategy conversion contract
+- The supplied chart indicator is visual evidence, not executable strategy source. Translate its confirmed visual events into Strategy API V2 conditions; do not copy `output`, plot, layer, color, or marker-layout code.
+- Preserve the structured source instrument and source timeframe exactly. They are mandatory conversion constraints, not examples.
+- `type='sell'` in a chart marker controls marker orientation and does not by itself mean short entry. Classify each marker as long entry, long exit, short entry, short exit, warning/wait, or visual-only before translating it.
+- Preserve composite edge logic exactly and make order intent idempotent. Confirm on completed bars; the runtime performs next-bar execution.
+- Remove visual-only parameters. Keep only signal, sizing, exit, and bounded risk parameters whose defaults match `context.params.get(...)` fallbacks.
+- Default to long-only. Short logic is permitted only when the conversion request explicitly asks for it and the preserved instrument is Crypto `@swap`.
+- The compiled result must remain a CTA manifest and must retain the required source instrument and source timeframe.
+"""
+
+# Backwards-compatible name for legacy callers. New code should select the
+# workspace-specific contract explicitly.
+SCRIPT_STRATEGY_SYSTEM_PROMPT = CTA_STRATEGY_SYSTEM_PROMPT
+
+SCRIPT_STRATEGY_QUICK_TOOL_SYSTEM_PROMPT = CTA_STRATEGY_SYSTEM_PROMPT + """
 
 # Homepage quick-tool entry
 - Generate a complete Strategy API V2 draft immediately.
