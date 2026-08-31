@@ -16,6 +16,7 @@ Configuration:
     DATABASE_URL=postgresql://user:password@host:port/dbname
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -108,6 +109,136 @@ def _resolve_strategy_templates_sql_path() -> Path:
     return Path(__file__).resolve().parent.parent.parent / 'migrations' / 'strategy_v2_templates.sql'
 
 
+_BOOTSTRAP_LEDGER_SQL = """
+CREATE TABLE IF NOT EXISTS qd_bootstrap_migrations (
+    name VARCHAR(120) PRIMARY KEY,
+    checksum VARCHAR(64) NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+
+
+def _migration_timeout_seconds(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _migration_checksum(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _migration_progress(message: str) -> None:
+    # Deployment panels normally show container stdout but the application
+    # logger may be configured to write to /app/logs.  Keep migration progress
+    # visible so an operator can tell schema work from a lock wait.
+    print(f"[migration] {message}", flush=True)
+
+
+def _fetch_applied_checksum(cur, name: str) -> str:
+    cur.execute(
+        "SELECT checksum FROM qd_bootstrap_migrations WHERE name = %s",
+        (name,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return ""
+    if isinstance(row, dict):
+        return str(row.get("checksum") or "")
+    return str(row[0] or "")
+
+
+def _record_applied_checksum(cur, name: str, checksum: str) -> None:
+    # Explicit RETURNING avoids the compatibility cursor speculatively adding
+    # `RETURNING id` to this text-primary-key table.
+    cur.execute(
+        """
+        INSERT INTO qd_bootstrap_migrations (name, checksum, applied_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (name) DO UPDATE
+        SET checksum = EXCLUDED.checksum, applied_at = NOW()
+        RETURNING name
+        """,
+        (name, checksum),
+    )
+
+
+def _table_row_count(cur, table: str) -> int:
+    # `table` is only supplied by the static component definitions below.
+    cur.execute(f"SELECT COUNT(*) AS row_count FROM {table}")
+    row = cur.fetchone()
+    if not row:
+        return 0
+    if isinstance(row, dict):
+        return int(row.get("row_count") or 0)
+    return int(row[0] or 0)
+
+
+def _apply_migration_component(
+    conn,
+    logger,
+    *,
+    name: str,
+    path: Path,
+    baseline_table: str = "",
+    baseline_min_rows: int = 1,
+) -> str:
+    """Apply one bootstrap component once per content checksum.
+
+    Older installations predate the ledger.  Large seed components can be
+    baselined when their target is already populated; otherwise every Docker
+    restart needlessly upserts tens of thousands of rows.  Schema SQL is never
+    baselined and therefore still receives one upgrade pass.
+    """
+    if not path.exists():
+        return "missing"
+
+    checksum = _migration_checksum(path)
+    cur = conn.cursor()
+    try:
+        applied_checksum = _fetch_applied_checksum(cur, name)
+        if applied_checksum == checksum:
+            logger.info("Migration component %s unchanged; skipping", name)
+            _migration_progress(f"{name}: unchanged, skipped")
+            return "skipped"
+
+        if not applied_checksum and baseline_table:
+            existing_rows = _table_row_count(cur, baseline_table)
+            if existing_rows >= baseline_min_rows:
+                _record_applied_checksum(cur, name, checksum)
+                conn.commit()
+                logger.info(
+                    "Baselined migration component %s from %d existing rows",
+                    name,
+                    existing_rows,
+                )
+                _migration_progress(
+                    f"{name}: existing data detected ({existing_rows} rows), baselined"
+                )
+                return "baselined"
+
+        lock_timeout = _migration_timeout_seconds("MIGRATION_LOCK_TIMEOUT_SECONDS", 15)
+        statement_timeout = _migration_timeout_seconds("MIGRATION_STATEMENT_TIMEOUT_SECONDS", 180)
+        _migration_progress(f"{name}: applying {path.stat().st_size} bytes")
+        cur.execute(f"SET LOCAL lock_timeout = '{lock_timeout}s'")
+        cur.execute(f"SET LOCAL statement_timeout = '{statement_timeout}s'")
+        cur.execute(path.read_text(encoding="utf-8"))
+        _record_applied_checksum(cur, name, checksum)
+        conn.commit()
+        logger.info("Applied migration component %s (%d bytes)", name, path.stat().st_size)
+        _migration_progress(f"{name}: complete")
+        return "applied"
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        cur.close()
+
+
 def _apply_init_sql(logger, *, strict: bool = False):
     """Run ``migrations/init.sql`` idempotently.
 
@@ -128,27 +259,43 @@ def _apply_init_sql(logger, *, strict: bool = False):
         return
 
     try:
-        sql_parts = [init_sql.read_text(encoding='utf-8')]
         symbols_sql = _resolve_market_symbols_sql_path()
-        if symbols_sql.exists():
-            sql_parts.append(symbols_sql.read_text(encoding='utf-8'))
         templates_sql = _resolve_strategy_templates_sql_path()
-        if templates_sql.exists():
-            sql_parts.append(templates_sql.read_text(encoding='utf-8'))
-        sql_text = "\n\n".join(sql_parts)
         with get_db_connection() as conn:
             cur = conn.cursor()
             try:
-                cur.execute(sql_text)
+                cur.execute(_BOOTSTRAP_LEDGER_SQL)
+                conn.commit()
             finally:
                 cur.close()
-            conn.commit()
-        total_size = init_sql.stat().st_size
-        if symbols_sql.exists():
-            total_size += symbols_sql.stat().st_size
-        if templates_sql.exists():
-            total_size += templates_sql.stat().st_size
-        logger.info("Applied migrations seed SQL (%d bytes)", total_size)
+
+            _apply_migration_component(
+                conn,
+                logger,
+                name="schema-init",
+                path=init_sql,
+            )
+            _apply_migration_component(
+                conn,
+                logger,
+                name="market-symbols-master",
+                path=symbols_sql,
+                baseline_table="qd_market_symbols",
+                # init.sql contains a small starter universe.  A production
+                # master catalogue is much larger, so do not baseline a fresh
+                # database before the full catalogue has been installed.
+                baseline_min_rows=1000,
+            )
+            _apply_migration_component(
+                conn,
+                logger,
+                name="strategy-v2-templates",
+                path=templates_sql,
+                baseline_table="qd_script_templates",
+                baseline_min_rows=1,
+            )
+        logger.info("Database bootstrap components are current")
+        _migration_progress("all components complete")
     except Exception as exc:
         if strict:
             raise

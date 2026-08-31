@@ -313,6 +313,7 @@ class StrategyCommandRepository:
                     SET role = EXCLUDED.role, status = 'running',
                         metadata_json = EXCLUDED.metadata_json,
                         heartbeat_at = NOW(), updated_at = NOW()
+                    RETURNING worker_id
                     """,
                     (worker_id, role, json.dumps(metadata or {}, default=str)),
                 )
