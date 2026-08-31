@@ -177,7 +177,10 @@ def handle_data(context, data):
         persist=False,
     )
 
-    assert set(calls) == {"1h", "4h", "1d"}
+    # Benchmark retrieval has its own review frequency and is intentionally
+    # independent from the strategy's declared subscriptions.
+    declared_calls = [frequency for frequency in calls if frequency in bundles]
+    assert sorted(declared_calls) == ["1d", "1h", "4h"]
     assert result["dataProvenance"]["frequencies"] == ["1d", "4h", "1h"]
     assert set(result["dataProvenance"]["timeframes"]) == {"1d", "4h", "1h"}
     assert result["executionAssumptions"]["drivingFrequency"] == "1h"

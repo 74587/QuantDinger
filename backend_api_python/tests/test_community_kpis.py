@@ -33,3 +33,38 @@ def test_summary_keeps_legacy_annual_return_fields_compatible():
 
     assert camel_case["annual_return"] == 8.5
     assert snake_case["annual_return"] == 6.25
+
+
+def test_summary_separates_profit_factor_from_payoff_ratio():
+    summary = summarise_backtest_runs([
+        {
+            "id": 25,
+            "result_json": json.dumps({
+                "totalTrades": 89,
+                "profitFactor": 1020.950291,
+                "profitLossRatio": 11.601708,
+                "winningTrades": 88,
+                "losingTrades": 1,
+            }),
+        }
+    ])
+
+    assert summary["profit_factor"] == 1020.95
+    assert summary["profit_loss_ratio"] == 11.6
+    assert summary["winning_trades"] == 88
+    assert summary["losing_trades"] == 1
+
+
+def test_summary_derives_payoff_ratio_from_average_trade_fields():
+    summary = summarise_backtest_runs([
+        {
+            "id": 26,
+            "result_json": json.dumps({
+                "totalTrades": 4,
+                "avgWin": 6.0,
+                "avgLoss": -2.0,
+            }),
+        }
+    ])
+
+    assert summary["profit_loss_ratio"] == 3.0

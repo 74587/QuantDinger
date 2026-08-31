@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from app.services.ai_generation_contracts import (
     CTA_STRATEGY_SYSTEM_PROMPT,
@@ -81,10 +81,11 @@ def validate_generated_strategy(
     asset_type: str,
     generation_mode: str = "authoring",
     context: dict | None = None,
+    compiler: Callable[[str], Any] = compile_strategy_v2,
 ):
     normalized_type = normalize_asset_type(asset_type)
     context = dict(context or {})
-    program = compile_strategy_v2(code)
+    program = compiler(code)
     manifest = program.manifest
     expected_type = "portfolio" if normalized_type == "portfolio_strategy" else "cta"
     if manifest.strategy_type != expected_type:

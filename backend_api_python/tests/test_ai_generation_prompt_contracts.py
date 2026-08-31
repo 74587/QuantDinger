@@ -133,11 +133,17 @@ def test_strategy_generator_repairs_invalid_model_output_once(monkeypatch):
 
     compile_calls = []
 
+    class FakeManifest:
+        strategy_type = "cta"
+
+    class FakeProgram:
+        manifest = FakeManifest()
+
     def fake_compile(code):
         compile_calls.append(code)
         if code == "invalid source":
             raise ValueError("missing initialize")
-        return "compiled-program"
+        return FakeProgram()
 
     class FakeLLM:
         def __init__(self):
@@ -160,7 +166,7 @@ def test_strategy_generator_repairs_invalid_model_output_once(monkeypatch):
     )
 
     assert code == "repaired source"
-    assert program == "compiled-program"
+    assert isinstance(program, FakeProgram)
     assert compile_calls == ["invalid source", "repaired source"]
     assert len(llm.calls) == 1
     assert llm.calls[0]["temperature"] == 0.15

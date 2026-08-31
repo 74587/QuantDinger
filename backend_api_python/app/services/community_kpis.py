@@ -49,6 +49,9 @@ def summarise_backtest_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "max_drawdown": 0.0,
         "win_rate": 0.0,
         "profit_factor": 0.0,
+        "profit_loss_ratio": 0.0,
+        "winning_trades": 0,
+        "losing_trades": 0,
         "sample_size": 0,
         "best_run_id": None,
         "symbols": [],
@@ -99,6 +102,13 @@ def summarise_backtest_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         annual_return = best_result.get("annualReturn")
     if annual_return is None:
         annual_return = best_result.get("annual_return")
+    profit_loss_ratio = best_result.get("profitLossRatio")
+    if profit_loss_ratio is None:
+        profit_loss_ratio = best_result.get("profit_loss_ratio")
+    if profit_loss_ratio is None:
+        average_win = float(best_result.get("avgWin") or best_result.get("avg_win") or 0)
+        average_loss = abs(float(best_result.get("avgLoss") or best_result.get("avg_loss") or 0))
+        profit_loss_ratio = average_win / average_loss if average_loss > 0 else 0.0
     return {
         "score": round(float(best_score or 0), 2),
         "total_return": round(float(best_result.get("totalReturn") or 0), 2),
@@ -107,6 +117,12 @@ def summarise_backtest_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
         "max_drawdown": round(float(best_result.get("maxDrawdown") or 0), 2),
         "win_rate": round(float(best_result.get("winRate") or 0), 2),
         "profit_factor": round(float(best_result.get("profitFactor") or 0), 2),
+        # Payoff ratio is average winning trade / average losing trade. Keep it
+        # separate from profit factor (gross profit / gross loss): the latter
+        # can become extremely large when a run contains only one tiny loss.
+        "profit_loss_ratio": round(float(profit_loss_ratio or 0), 2),
+        "winning_trades": int(best_result.get("winningTrades") or best_result.get("winning_trades") or 0),
+        "losing_trades": int(best_result.get("losingTrades") or best_result.get("losing_trades") or 0),
         "sample_size": len(scored),
         "best_run_id": best_run_id or None,
         "symbols": dedupe(symbols),

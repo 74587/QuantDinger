@@ -61,6 +61,17 @@ logger = get_logger(__name__)
 indicator_blp = Blueprint("indicator", __name__)
 
 
+INDICATOR_IDE_SYSTEM_PROMPT = """You write production-ready QuantDinger chart indicators.
+The runtime provides pandas as `pd`, numpy as `np`, an OHLCV DataFrame named `df`, and a `params` dict.
+Keep every generated file chart-only: no orders, positions, schedules, leverage, network, file I/O, reflection, or dynamic execution.
+Use pandas Series for rolling, fill, shift, ewm, iloc, and list conversion. Coerce numpy results with
+`pd.Series(value, index=df.index)` before pandas-only operations so DatetimeIndex alignment is preserved.
+Visual markers should normally be one-bar events. A safe edge pattern is:
+`previous = condition.shift(1, fill_value=False).astype(bool)` followed by `condition & ~previous`.
+Return one complete Python source file only, without markdown fences or surrounding prose.
+"""
+
+
 def _sse_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
@@ -166,6 +177,13 @@ def _indicator_ai_text(key: str, lang: str = "zh-CN") -> str:
         "insufficient_credits": "Insufficient credits. Please top up and try again.",
         "candidate_ready": "A candidate version is ready and has passed automatic code checks. Preview it before applying it to the editor.",
         "candidate_needs_review": "A candidate is ready, but automatic checks found issues. Review the validation result before applying it.",
+        "no_declared_params": "no declared tunable parameters",
+        "no_standard_outputs": "no recognized standard output structure",
+        "discussion_summary": (
+            "The current indicator is {name}. Declared parameters: {params}. "
+            "Recognized outputs: {outputs}. You can ask about a variable, signal condition, or chart element. "
+            "This answer did not generate or modify code."
+        ),
     }
     if _is_zh_lang(lang):
         zh_texts = {
@@ -173,9 +191,33 @@ def _indicator_ai_text(key: str, lang: str = "zh-CN") -> str:
             "insufficient_credits": "积分不足，请充值后重试。",
             "candidate_ready": "候选版本已生成并通过自动代码检查。请先预览，再决定是否应用到编辑器。",
             "candidate_needs_review": "候选版本已生成，但自动检查发现问题。请先查看检查结果，不要直接应用。",
+            "no_declared_params": "未声明可调参数",
+            "no_standard_outputs": "尚未识别到标准输出结构",
+            "discussion_summary": (
+                "当前指标是「{name}」。代码声明的参数包括：{params}；输出结构包括：{outputs}。"
+                "你可以继续问具体变量、信号条件或图表含义。这次仅回答问题，没有生成或修改代码。"
+            ),
         }
         return zh_texts.get(key, texts.get(key, key))
     return texts.get(key, key)
+
+
+def _indicator_discussion_fallback(existing: str, context: Dict[str, Any], lang: str) -> str:
+    indicator_name = str(context.get("indicatorName") or "").strip() or "this indicator"
+    param_names = re.findall(r"^\s*#\s*@param\s+([A-Za-z_]\w*)", existing, flags=re.MULTILINE)
+    output_parts = [
+        key
+        for key in ("plots", "signals", "layers")
+        if re.search(rf"['\"]{key}['\"]\s*:", existing)
+    ]
+    separator = "、" if _is_zh_lang(lang) else ", "
+    params_text = separator.join(param_names[:8]) or _indicator_ai_text("no_declared_params", lang)
+    outputs_text = separator.join(output_parts) or _indicator_ai_text("no_standard_outputs", lang)
+    return _indicator_ai_text("discussion_summary", lang).format(
+        name=indicator_name,
+        params=params_text,
+        outputs=outputs_text,
+    )
 
 
 def _indicator_hint_to_text(hint_code: str, params: Dict[str, Any] | None = None, lang: str = "zh-CN") -> str:
@@ -794,181 +836,8 @@ def ai_generate():
         )
 
     # QuantDinger indicator IDE: chart render only; strategies are separate script assets.
-    SYSTEM_PROMPT = """# Role
-
-You write production-ready **QuantDinger** chart indicator scripts: Python that runs in the Indicator IDE and renders overlays/markers on the K-line chart. Indicators are **not executable strategies**: they must not open, close, size, backtest, or live trade. If a user wants trading logic, keep this file as a visual indicator and let the Strategy API V2 workflow generate executable strategy code separately.
-
-# Runtime (strict)
-
-- Environment: browser-side Pyodide-style sandbox **or** API verify sandbox: **no network**, no file I/O, no subprocess.
-- **`pd` and `np` are already available.** Do **not** write `import pandas` / `import numpy`. Avoid any `import` unless unavoidable; never import `os`, `sys`, `requests`, `socket`, `subprocess`, `threading`, `sqlite3`, `multiprocessing`, or other I/O/network modules.
-- Do **not** use: `eval`, `exec`, `compile`, `open`, `__import__`, `getattr`/`setattr`/`delattr` on untrusted names, `locals`, `globals`, `vars`, `dir`, or meta-programming to escape the sandbox.
-- Allowed imports only: `numpy`, `pandas`, `math`, `json`, `datetime`, `time`, `collections`, `functools`, `itertools`, `statistics`, `decimal`, `fractions`, `copy`. **Never** `import operator`.
-- Work **vectorized** with pandas on `df` where possible; avoid O(n) Python loops over every row for core series (rolling/ewm/shift are preferred).
-
-# Series vs ndarray contract (critical - common AI bug source)
-
-This is the #1 reason hand/AI-translated Pine/TDX scripts crash at runtime ("AttributeError: 'numpy.ndarray' object has no attribute 'rolling' / 'fillna' / 'iloc' / 'shift' / 'ewm'"). Pine auto-coerces types; Python does not.
-
-Hard rules:
-
-- `np.where(...)`, `np.maximum(...)`, `np.minimum(...)`, `np.abs(...)` on a Series **may return either a Series or an ndarray** depending on numpy version. **Never chain pandas methods on their result without coercing.** Coerce explicitly: `pd.Series(arr, index=df.index)`.
-- A user-defined helper like `def safe_div(a, b): return np.where(b == 0, 0, a / b)` returns **ndarray**. If you want `.fillna` / `.rolling` / `.shift` / `.ewm` / `.tolist()` on it, wrap: `pd.Series(safe_div(a, b), index=df.index)`. Better: rewrite the helper to return a Series directly, e.g. `return (a / b.replace(0, np.nan)).fillna(0)`.
-- Any helper that uses `.iloc` (TDX-style `sma`, custom filters, etc.) **MUST receive a Series**. If you call it with `np.where(...)` output you will get AttributeError on the first iteration. Either coerce the argument or make the helper auto-coerce: `if not isinstance(src, pd.Series): src = pd.Series(np.asarray(src), index=df.index)`.
-- `pd.Series(some_ndarray)` defaults to a `RangeIndex 0..n-1`. If `df.index` is a `DatetimeIndex` (very common), the new Series will **silently misalign** with `df` columns in subsequent comparisons / `where` / arithmetic. **Always pass `index=df.index`** when wrapping an ndarray that is sized to `len(df)`.
-
-Prefer pandas-native operators that **stay in Series-land**:
-
-- `np.where(cond, a, b)`         -> `a.where(cond, b)`     (returns Series when `a` is Series; `cond` aligned to `a`)
-- `np.where(cond, X, 0)`         -> `X.where(cond, 0)` or `pd.Series(0, index=df.index).mask(cond, X)`
-- `np.maximum(s, 0)`             -> `s.clip(lower=0)`
-- `np.minimum(s, k)`             -> `s.clip(upper=k)`
-- `np.abs(s)`                    -> `s.abs()`
-- division-by-zero protection    -> `num / den.replace(0, np.nan)` then `.fillna(0)` (do NOT use `np.where(den == 0, ...)` if you need to chain pandas methods)
-
-Self-check before returning code: every place where you call `.rolling` / `.fillna` / `.shift` / `.ewm` / `.iloc` / `.tolist()` - trace back: is the left-hand side a **Series**? If it came from `np.where` / `np.maximum` / `np.minimum` / a custom helper, wrap it first.
-
-# Input: `df`
-
-- `df` is a pandas `DataFrame` aligned to K-line bars (one row per bar).
-- You **must** start mutating with: `df = df.copy()`
-- Expected columns (use `.get` or try/except only if you document optional columns): `open`, `high`, `low`, `close`, `volume`. A `time` column may exist; do not assume dtypes beyond numeric OHLCV.
-- Do not rename or drop required columns in a way that breaks length alignment.
-
-# Required globals (strict)
-
-1. `my_indicator_name = "..."` - short display name (can match `output['name']`).
-2. `my_indicator_description = "..."` - one line describing logic and parameters.
-
-# Execution boundary (strict)
-
-- Do **not** create or require execution columns such as `df['open_long']`, `df['close_long']`, `df['open_short']`, `df['close_short']`, `df['add_long']`, or `df['reduce_long']`.
-- Do **not** emit `# @strategy`, `# signal_form`, `# exit_owner`, `# flip_mode`, `# timeframe`, risk defaults, position sizing, stop-loss, take-profit, trailing-stop, leverage, or trade-direction settings.
-- `output['signals']` are visual chart markers only. They never place orders.
-- If the user asks for a strategy, still return a chart indicator here: plots and visual markers that express the idea. Executable strategy code belongs in Strategy API V2.
-
-# User intent handling
-
-- Treat the user's text as product requirements, not as literal code unless they paste code.
-- Infer sensible defaults when the request is incomplete, but keep the code simple, readable, and stable.
-- If the user mentions a well-known indicator family, implement the core concept and add useful visual context rather than overfitting to one screenshot.
-- Use English for identifiers, metadata, comments, `@param` descriptions, and default plot, signal, and layer labels. Localize display labels only when the user explicitly requests a target language.
-- The current chart symbol/timeframe may be provided as context. Use it to choose sensible examples only; do **not** hardcode symbol, exchange, timeframe, account, leverage, or risk into indicator code.
-
-# Chart output: `output` dict (strict)
-
-After computation, set:
-
-`output = { 'name': ..., 'plots': [...], 'signals': [...], 'layers': [...] }`  (use the same string keys as below; `layers` is optional)
-
-- **`name`**: str, usually `my_indicator_name`.
-- **`plots`**: list of dicts, each with:
-  - `name` (str), `data` (list, length **exactly** `len(df)`), `color` (`#RRGGBB`), `overlay` (bool).
-  - `type`: optional, e.g. `'line'`.
-  - Price-scale series (MA, Bollinger on price): `overlay: True`. Oscillators (RSI 0-100): `overlay: False`.
-- **`signals`**: optional list for markers; each item:
-  - `type`: `'buy'` or `'sell'` controls marker orientation only; it is not the signal name.
-  - `text`: a stable descriptive signal name. Optional `textData` may provide a different label for each bar. Signal names are dynamic and are not limited to `Buy`, `Sell`, `Long Entry`, or `Long Exit`.
-  - `color`, `data`: list length **`len(df)`**, value `None` or a float price for marker Y.
-  - Only a finite numeric value in `data[i]` activates the signal on bar `i`. Static `text` or `textData` is label content only and must never activate a signal.
-  - Signal markers must usually represent **events**, not continuous states. If a condition can stay true for many bars, mark only the transition bar with an edge/flip condition. This prevents noisy charts and repeated signal notifications.
-- **`layers`**: optional list for advanced K-line overlays. Do not add layers by default. Use layers only when the user explicitly asks for zones, channels, support/resistance, invalidation areas, or when one sparse annotation materially improves readability. Prefer plots and signals for normal indicators.
-  - Zone layer: `{ 'type': 'zone', 'startIndex': int, 'endIndex': int, 'top': float, 'bottom': float, 'text': str, 'fillColor': '#RRGGBB', 'borderColor': '#RRGGBB', 'opacity': 0.12 }`.
-  - Line layer: `{ 'type': 'line', 'startIndex': int, 'endIndex': int, 'price': float, 'text': str, 'color': '#RRGGBB', 'dashed': true }`; for sloped lines use `startPrice` and `endPrice`.
-  - Label layer: `{ 'type': 'label', 'index': int, 'price': float, 'text': str, 'color': '#RRGGBB', 'textColor': '#FFFFFF' }`.
-  - Prefer `startIndex` / `endIndex` / `index` for generated code because they are stable with the current `df`. `startTime` / `endTime` / `time` are also supported if they match K-line timestamps.
-  - Do not use layers as execution signals. Indicators are chart-only.
-- **`calculatedVars`**: optional dict for future UI; may be `{}` or omitted.
-
-**Length rule:** every `plot['data']` and every `signal['data']` list must have the **same length as `df`** (same as number of rows). Layer objects do not need per-bar arrays, but their indices/times and prices must be valid for the visible `df`.
-
-# Optional tunable parameters: `# @param`
-
-If the indicator has knobs (periods, thresholds), declare them **once per line** at the top after name/description:
-
-`# @param <name> <int|float|bool|str> <default> <short description>`
-
-Example: `# @param rsi_len int 14 RSI period`
-
-The runtime merges these with user-supplied params.
-
-**Critical:** `# @param` only declares parameters for the UI/runtime. It does **not**
-create Python variables automatically. If you declare:
-
-`# @param fast_period int 10 Fast MA period`
-
-you must read it explicitly in code, for example:
-
-`fast_period = params.get('fast_period', 10)`
-
-The fallback default in `params.get` must exactly match the declared `# @param`
-default after type conversion. Example: if you declare
-`# @param fast_period int 18 Fast MA period`, the code must read
-`fast_period = int(params.get('fast_period', 18))`; never use 10, 30, or any
-second hard-coded default for the same parameter.
-
-Never use declared parameter names directly unless you first assign them from `params`.
-
-# Strategy defaults
-
-Do not use `# @strategy` in indicator code. Strategy defaults belong in Strategy API V2 code, not chart indicators.
-
-# Quality bar
-
-- Prefer clear variable names, short comments only where non-obvious.
-- Ensure visual markers are useful but not noisy. Do not widen or replace the requested signal condition merely to create more markers.
-- Use unambiguous marker text such as `Long Entry`, `Long Exit`, `Short Entry`, `Short Exit`, or `Warning`; a generic bearish/sell marker must not imply a short entry when it only exits a long position.
-- For notification-safe markers, convert state signals into one-bar events by default:
-  - `def edge(s): s = s.fillna(False).astype(bool); previous = s.shift(1, fill_value=False).astype(bool); return s & ~previous`
-  - Use `edge(condition)` for `output['signals']` unless the user explicitly asks for every bar where a condition is true.
-  - If the user requests "confirmed next bar" behavior, compute the raw condition on closed bars and shift the event one bar forward for display/notification: `confirmed = edge(raw_condition).shift(1, fill_value=False).astype(bool)`.
-- For state/regime visuals that should persist across bars, use overlay/non-overlay plots, lamp belts, or sparse layers instead of repeating `output['signals']` markers every bar.
-- For signal markers, prefer explicit lists with `None` for empty bars:
-  - `buy_marks = [df['low'].iloc[i] * 0.995 if bool(buy_signal.iloc[i]) else None for i in range(len(df))]`
-  - `sell_marks = [df['high'].iloc[i] * 1.005 if bool(sell_signal.iloc[i]) else None for i in range(len(df))]`
-  - Avoid `series.where(mask, None).tolist()` for marker data because float series may still contain `NaN` instead of real `None`.
-- Default to `output['layers'] = []`. Use `output['layers']` only when explicitly requested or when one sparse annotation materially improves readability, for example supply/demand zones, premium/discount ranges, support/resistance lines, BOS/CHoCH labels, or invalidation levels. Do not flood every bar with labels or add large filled zones by habit.
-- If the user asks for multi-signal lights, lamp belts, resonance rows, or dashboard-style states, create named non-overlay plot rows that encode each state with stable per-bar arrays, and keep labels concise. Each row should have a clear `name` such as `MACD`, `KDJ`, or `RSI`; do not hardcode a renderer-specific layout unless the requested visual needs it.
-- Convert warm-up `NaN` values to either `None` (preferred for sparse/optional lines) or a sensible neutral value for bounded oscillators; avoid drawing misleading zero lines on price overlays.
-- Before returning code, self-check:
-  1. every declared `# @param` used in code is read via `params.get(...)`
-  2. every `params.get('name', fallback)` fallback exactly equals that parameter's declared `# @param` default
-  3. no execution columns or `# @strategy` annotations are emitted
-  4. every `plot['data']` and `signal['data']` length equals `len(df)`
-  5. `output` exists and is a dict
-  6. **type audit**: scan every `.rolling` / `.fillna` / `.shift` / `.ewm` / `.iloc` / `.tolist` call site; confirm its left-hand side is a Series. If it came from `np.where` / `np.maximum` / `np.minimum` / a custom helper returning ndarray, you MUST wrap with `pd.Series(arr, index=df.index)` first
-  7. **index audit**: any `pd.Series(arr)` where `arr` is ndarray sized `len(df)` MUST pass `index=df.index`, otherwise it will silently misalign with DatetimeIndex-based `df`
-
-# Output format for this chat turn
-
-Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **no** explanation before or after the code. First non-empty line should be `my_indicator_name` or `# @param` immediately followed by `my_indicator_name`.
-""" + "\n\n" + INDICATOR_GENERATION_CONTRACT
-
-    def _discussion_fallback() -> str:
-        indicator_name = str(context.get("indicatorName") or "").strip() or "this indicator"
-        param_names = re.findall(r"^\s*#\s*@param\s+([A-Za-z_]\w*)", existing, flags=re.MULTILINE)
-        output_parts: List[str] = []
-        if re.search(r"['\"]plots['\"]\s*:", existing):
-            output_parts.append("plots")
-        if re.search(r"['\"]signals['\"]\s*:", existing):
-            output_parts.append("signals")
-        if re.search(r"['\"]layers['\"]\s*:", existing):
-            output_parts.append("layers")
-        if _is_zh_lang(lang):
-            params_text = "、".join(param_names[:8]) if param_names else "未声明可调参数"
-            outputs_text = "、".join(output_parts) if output_parts else "尚未识别到标准输出结构"
-            return (
-                f"当前指标是「{indicator_name}」。代码声明的参数包括：{params_text}；"
-                f"输出结构包括：{outputs_text}。你可以继续问具体变量、信号条件或图表含义。"
-                "这次仅回答问题，没有生成或修改代码。"
-            )
-        params_text = ", ".join(param_names[:8]) if param_names else "no declared tunable parameters"
-        outputs_text = ", ".join(output_parts) if output_parts else "no recognized standard output structure"
-        return (
-            f"The current indicator is {indicator_name}. Declared parameters: {params_text}. "
-            f"Recognized outputs: {outputs_text}. You can ask about a variable, signal condition, or chart element. "
-            "This answer did not generate or modify code."
-        )
+    # Marker edge contract: shift(1, fill_value=False).astype(bool)
+    system_prompt = INDICATOR_IDE_SYSTEM_PROMPT + "\n\n" + INDICATOR_GENERATION_CONTRACT
 
     def _generate_discussion_via_llm() -> str:
         """Answer a code question without returning replacement source."""
@@ -976,7 +845,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
 
         llm = LLMService()
         if not llm.get_api_key():
-            return _discussion_fallback()
+            return _indicator_discussion_fallback(existing, context, lang)
 
         discussion_system = """You are QuantDinger's indicator-code reviewer.
 Answer the user's question about the currently open indicator. Use the same language as the user.
@@ -1024,7 +893,7 @@ If the question actually requests a code modification, explain what should chang
             temperature=0.25,
             use_json_mode=False,
         )
-        return str(answer or "").strip() or _discussion_fallback()
+        return str(answer or "").strip() or _indicator_discussion_fallback(existing, context, lang)
 
     def _template_code() -> str:
         from app.services.indicator_default_template import build_default_indicator_template
@@ -1108,7 +977,7 @@ If the question actually requests a code modification, explain what should chang
         
         # Call LLM using the unified API (auto-selects provider based on LLM_PROVIDER env)
         # use_json_mode=False because we want raw Python code output
-        messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         if workspace_context:
             summary_text = json.dumps(workspace_context.get("summary") or {}, ensure_ascii=False, default=str)
             messages.append({
@@ -1207,7 +1076,7 @@ If the question actually requests a code modification, explain what should chang
 
         content = llm.call_llm_api(
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": repair_prompt},
             ],
             model=current_model,

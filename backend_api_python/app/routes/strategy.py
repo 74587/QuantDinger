@@ -339,6 +339,7 @@ def _compile_or_repair_generated_strategy(
             asset_type=asset_type,
             generation_mode=generation_mode,
             context=context,
+            compiler=compile_strategy_v2,
         )
     except Exception as first_error:
         logger.info("repairing invalid generated strategy: %s", first_error)
@@ -366,6 +367,7 @@ def _compile_or_repair_generated_strategy(
             asset_type=asset_type,
             generation_mode=generation_mode,
             context=context,
+            compiler=compile_strategy_v2,
         )
 
 
