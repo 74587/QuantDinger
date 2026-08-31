@@ -2023,11 +2023,32 @@ def _member_key(member: dict[str, Any]) -> str:
     return f"{market}:{symbol}{suffix}"
 
 
-def _latest_frame_timestamp(frame: pd.DataFrame | None) -> pd.Timestamp | None:
-    """Return the newest candle timestamp without assuming an index timezone."""
-    if frame is None or frame.empty:
-        return None
-    try:
-        return pd.Timestamp(frame.index[-1])
-    except (TypeError, ValueError, IndexError):
-        return None
+def _latest_frame_timestamp(
+    frames: pd.DataFrame | dict[str, pd.DataFrame] | None,
+) -> pd.Timestamp | None:
+    """Return the newest candle timestamp in a frame or instrument panel.
+
+    Live Strategy V2 sessions pass the driving-frequency panel as a mapping of
+    instrument keys to data frames.  Accepting a single frame as well keeps the
+    helper useful for focused callers and tests without confusing the panel
+    itself with a pandas object.
+    """
+    candidates = frames.values() if isinstance(frames, dict) else (frames,)
+    latest: pd.Timestamp | None = None
+    for frame in candidates:
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            continue
+        try:
+            timestamp = pd.Timestamp(frame.index[-1])
+            if pd.isna(timestamp):
+                continue
+            timestamp = (
+                timestamp.tz_localize("UTC")
+                if timestamp.tzinfo is None
+                else timestamp.tz_convert("UTC")
+            )
+        except (TypeError, ValueError, IndexError):
+            continue
+        if latest is None or timestamp > latest:
+            latest = timestamp
+    return latest

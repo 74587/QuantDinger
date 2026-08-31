@@ -143,6 +143,27 @@ def test_latest_frame_timestamp_detects_candle_advancement():
     assert _latest_frame_timestamp(second) > _latest_frame_timestamp(first)
 
 
+def test_latest_frame_timestamp_reads_strategy_instrument_panel():
+    import pandas as pd
+
+    panel = {
+        "Crypto:BTC/USDT@swap": pd.DataFrame(
+            {"close": [1.0, 2.0]},
+            index=pd.DatetimeIndex([
+                "2026-08-31T12:00:00Z",
+                "2026-08-31T12:01:00Z",
+            ]),
+        ),
+        "Crypto:ETH/USDT@swap": pd.DataFrame(
+            {"close": [3.0]},
+            index=pd.DatetimeIndex(["2026-08-31T12:02:00Z"]),
+        ),
+    }
+
+    assert _latest_frame_timestamp(panel) == pd.Timestamp("2026-08-31T12:02:00Z")
+    assert _latest_frame_timestamp({}) is None
+
+
 def test_finnhub_429_blocks_followup_requests_across_symbols(monkeypatch):
     class Client:
         def __init__(self):
