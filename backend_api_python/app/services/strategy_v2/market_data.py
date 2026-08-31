@@ -11,7 +11,10 @@ from typing import Optional
 import pandas as pd
 
 from app.data_sources import DataSourceFactory
-from app.data_sources.errors import MarketDataUnavailableError
+from app.data_sources.errors import (
+    MarketDataUnavailableError,
+    classify_market_data_failure,
+)
 from app.services.backtest_cache import KlineCache
 from app.utils.logger import get_logger
 
@@ -30,6 +33,8 @@ _shared_frames: dict[str, _SharedFrameEntry] = {}
 _shared_frame_locks: dict[str, threading.RLock] = {}
 _shared_frames_lock = threading.RLock()
 _SHARED_FRAME_CACHE_MAX_SIZE = 256
+_LIVE_CACHE_GRACE_BARS = 2
+_INCOMPLETE_WARMUP_RETRIES = 1
 
 TIMEFRAME_SECONDS = {
     "1m": 60,
@@ -56,6 +61,25 @@ def _normalize_utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _last_completed_bar_open(
+    timeframe_seconds: int,
+    *,
+    now: Optional[datetime] = None,
+) -> pd.Timestamp:
+    """Return the UTC open time of the most recently completed candle.
+
+    Using a bar-aligned cutoff avoids treating the seconds inside the current
+    minute as an uncovered cache tail and refetching the same 1m candle on
+    every runtime heartbeat.
+    """
+    seconds = max(1, int(timeframe_seconds or 1))
+    current = _normalize_utc_datetime(now or datetime.now(timezone.utc))
+    completed_open = ((int(current.timestamp()) // seconds) - 1) * seconds
+    return pd.Timestamp(
+        datetime.fromtimestamp(completed_open, tz=timezone.utc)
+    ).tz_localize(None)
 
 
 def _covers_crypto_window(
@@ -110,8 +134,8 @@ def _load_strategy_frame_uncached(
     ))
     requested_start = pd.Timestamp(start_utc).tz_localize(None)
     requested_end = pd.Timestamp(end_utc).tz_localize(None)
-    closed_bar_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=timeframe_seconds)
-    coverage_end = min(requested_end, pd.Timestamp(closed_bar_cutoff))
+    closed_bar_cutoff = _last_completed_bar_open(timeframe_seconds)
+    coverage_end = min(requested_end, closed_bar_cutoff)
     cached = _cache.get(cache_key)
     if cached is not None and not cached.empty:
         if str(market or "").strip().lower() != "crypto" or _covers_crypto_window(
@@ -187,7 +211,7 @@ def _load_strategy_frame_uncached(
         subset=["open", "high", "low", "close"]
     )
     if requested_end >= closed_bar_cutoff:
-        frame = frame[frame.index <= pd.Timestamp(closed_bar_cutoff)]
+        frame = frame[frame.index <= closed_bar_cutoff]
     if (
         str(market or "").strip().lower() == "crypto"
         and not _covers_crypto_window(frame, requested_start, coverage_end, timeframe_seconds)
@@ -202,7 +226,15 @@ def _load_strategy_frame_uncached(
                 frame.index.min(),
                 frame.index.max(),
             )
-        return pd.DataFrame()
+        raise MarketDataUnavailableError(
+            classify_market_data_failure(
+                "Incomplete K-line coverage after strategy window normalization",
+                exchange_id=exchange_id or "",
+                market_type=market_type or "",
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        )
     if not frame.empty:
         _cache.put(cache_key, frame, timeframe)
     return frame.copy()
@@ -253,6 +285,38 @@ def _evict_shared_frame_if_needed() -> None:
             _shared_frames.pop(oldest_key, None)
 
 
+def _is_live_request(
+    requested_end: pd.Timestamp,
+    closed_cutoff: pd.Timestamp,
+    timeframe_seconds: int,
+) -> bool:
+    tolerance = pd.Timedelta(seconds=max(1, timeframe_seconds) * 2)
+    return bool(requested_end >= closed_cutoff - tolerance)
+
+
+def _cached_crypto_frame_is_usable(
+    frame: pd.DataFrame,
+    requested_start: pd.Timestamp,
+    coverage_end: pd.Timestamp,
+    timeframe_seconds: int,
+    *,
+    live_request: bool,
+) -> bool:
+    if not _covers_crypto_window(
+        frame,
+        requested_start,
+        coverage_end,
+        timeframe_seconds,
+    ):
+        return False
+    if not live_request:
+        return True
+    max_lag = pd.Timedelta(
+        seconds=max(1, timeframe_seconds) * _LIVE_CACHE_GRACE_BARS
+    )
+    return bool(frame.index.max() >= coverage_end - max_lag)
+
+
 def clear_shared_strategy_frame_cache() -> None:
     """Clear process-local candle state. Intended for tests and controlled reloads."""
     with _shared_frames_lock:
@@ -283,11 +347,14 @@ def load_strategy_frame(
     timeframe_seconds = TIMEFRAME_SECONDS.get(normalized_timeframe, 86400)
     requested_start = pd.Timestamp(start_utc).tz_localize(None)
     requested_end = pd.Timestamp(end_utc).tz_localize(None)
-    closed_cutoff = pd.Timestamp(
-        datetime.now(timezone.utc).replace(tzinfo=None)
-        - timedelta(seconds=timeframe_seconds)
-    )
+    closed_cutoff = _last_completed_bar_open(timeframe_seconds)
     coverage_end = min(requested_end, closed_cutoff)
+    live_request = _is_live_request(
+        requested_end,
+        closed_cutoff,
+        timeframe_seconds,
+    )
+    crypto_market = str(market or "").strip().lower() == "crypto"
     key = _shared_frame_key(market, symbol, timeframe, market_type, exchange_id)
 
     with _lock_for_shared_frame(key):
@@ -316,39 +383,98 @@ def load_strategy_frame(
                 ))
 
         merged = entry.frame.copy() if entry is not None else pd.DataFrame()
-        successful_windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        last_failure: Optional[MarketDataUnavailableError] = None
         for window_start, window_end in fetch_windows:
-            incoming = _load_strategy_frame_uncached(
-                market,
-                symbol,
-                timeframe,
-                window_start.to_pydatetime().replace(tzinfo=timezone.utc),
-                window_end.to_pydatetime().replace(tzinfo=timezone.utc),
-                market_type=market_type,
-                exchange_id=exchange_id,
+            incoming = pd.DataFrame()
+            attempts = (
+                1 + _INCOMPLETE_WARMUP_RETRIES
+                if normalized_timeframe == "1m" and entry is None
+                else 1
             )
+            for attempt in range(attempts):
+                try:
+                    incoming = _load_strategy_frame_uncached(
+                        market,
+                        symbol,
+                        timeframe,
+                        window_start.to_pydatetime().replace(tzinfo=timezone.utc),
+                        window_end.to_pydatetime().replace(tzinfo=timezone.utc),
+                        market_type=market_type,
+                        exchange_id=exchange_id,
+                    )
+                    last_failure = None
+                    break
+                except MarketDataUnavailableError as exc:
+                    last_failure = exc
+                    should_retry = bool(
+                        exc.failure.code == "incomplete_market_data"
+                        and attempt + 1 < attempts
+                    )
+                    if should_retry:
+                        logger.warning(
+                            "Retrying incomplete %s %s warmup (%s/%s)",
+                            symbol,
+                            timeframe,
+                            attempt + 2,
+                            attempts,
+                        )
+                        continue
+                    break
             if incoming is not None and not incoming.empty:
                 merged = _merge_frames(merged, incoming)
-                successful_windows.append((window_start, min(window_end, coverage_end)))
 
         if merged.empty:
+            if last_failure is not None:
+                raise last_failure
             return pd.DataFrame()
 
-        new_start = entry.coverage_start if entry is not None else requested_start
-        new_end = entry.coverage_end if entry is not None else coverage_end
-        for window_start, window_end in successful_windows:
-            new_start = min(new_start, window_start)
-            new_end = max(new_end, window_end)
+        # Keep the cache bounded around the active warmup window. If a future
+        # caller requests older history, the missing prefix is fetched again.
+        overlap = pd.Timedelta(seconds=timeframe_seconds * 2)
+        merged = merged[merged.index >= requested_start - overlap]
+        actual_start = merged.index.min()
+        actual_end = merged.index.max()
         _shared_frames[key] = _SharedFrameEntry(
             frame=merged,
-            coverage_start=new_start,
-            coverage_end=new_end,
+            coverage_start=actual_start,
+            coverage_end=actual_end,
         )
         _evict_shared_frame_if_needed()
-        return merged[
+        result = merged[
             (merged.index >= requested_start)
             & (merged.index <= coverage_end)
         ].copy()
+        if crypto_market and not _cached_crypto_frame_is_usable(
+            result,
+            requested_start,
+            coverage_end,
+            timeframe_seconds,
+            live_request=live_request,
+        ):
+            logger.warning(
+                "Refused stale/incomplete cached crypto frame for %s %s: "
+                "requested=%s~%s, actual=%s~%s",
+                symbol,
+                timeframe,
+                requested_start,
+                coverage_end,
+                result.index.min() if not result.empty else "empty",
+                result.index.max() if not result.empty else "empty",
+            )
+            if last_failure is not None:
+                raise last_failure
+            return pd.DataFrame()
+        if last_failure is not None:
+            logger.warning(
+                "Using recent cached %s %s candles after transient %s failure; "
+                "latest=%s, required=%s",
+                symbol,
+                timeframe,
+                last_failure.failure.code,
+                result.index.max(),
+                coverage_end,
+            )
+        return result
 
 
 __all__ = [

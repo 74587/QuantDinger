@@ -5,6 +5,10 @@ import time
 import pandas as pd
 import pytest
 
+from app.data_sources.errors import (
+    MarketDataUnavailableError,
+    classify_market_data_failure,
+)
 from app.services.strategy_v2 import market_data
 
 
@@ -121,16 +125,17 @@ def test_crypto_market_data_rejects_partial_historical_window(monkeypatch):
         ],
     )
 
-    frame = market_data.load_strategy_frame(
-        "Crypto",
-        "ETH/USDT",
-        "1m",
-        datetime(2026, 8, 1),
-        datetime(2026, 8, 30),
-        market_type="swap",
-    )
+    with pytest.raises(MarketDataUnavailableError) as raised:
+        market_data.load_strategy_frame(
+            "Crypto",
+            "ETH/USDT",
+            "1m",
+            datetime(2026, 8, 1),
+            datetime(2026, 8, 30),
+            market_type="swap",
+        )
 
-    assert frame.empty
+    assert raised.value.failure.code == "incomplete_market_data"
 
 
 def test_crypto_market_data_ignores_partial_cached_window(monkeypatch):
@@ -227,3 +232,166 @@ def test_shared_market_data_extends_only_uncovered_tail(monkeypatch):
     assert windows[1][0] > start
     assert extended.index.is_unique
     assert extended.index.max() == pd.Timestamp("2026-08-01 00:11")
+
+
+def test_last_completed_bar_cutoff_is_aligned_to_the_previous_minute():
+    cutoff = market_data._last_completed_bar_open(
+        60,
+        now=datetime(2026, 8, 31, 18, 52, 37, tzinfo=timezone.utc),
+    )
+
+    assert cutoff == pd.Timestamp("2026-08-31 18:51:00")
+
+
+def test_live_one_minute_cache_survives_one_missing_bar_and_keeps_refetching(
+    monkeypatch,
+):
+    cutoff = [pd.Timestamp("2026-08-31 18:51:00")]
+    calls = []
+
+    def load(_market, _symbol, _timeframe, start_date, end_date, **_kwargs):
+        calls.append((start_date, end_date))
+        if len(calls) > 1:
+            raise MarketDataUnavailableError(
+                classify_market_data_failure(
+                    "Incomplete K-line coverage",
+                    exchange_id="binance",
+                    market_type="swap",
+                    symbol="BTC/USDT",
+                    timeframe="1m",
+                )
+            )
+        index = pd.date_range(
+            cutoff[0] - pd.Timedelta(minutes=99),
+            cutoff[0],
+            freq="1min",
+        )
+        return pd.DataFrame({"close": range(len(index))}, index=index)
+
+    monkeypatch.setattr(market_data, "_load_strategy_frame_uncached", load)
+    monkeypatch.setattr(
+        market_data,
+        "_last_completed_bar_open",
+        lambda _seconds: cutoff[0],
+    )
+    start = cutoff[0].to_pydatetime().replace(tzinfo=timezone.utc) - timedelta(minutes=99)
+    first_end = cutoff[0].to_pydatetime().replace(tzinfo=timezone.utc)
+
+    first = market_data.load_strategy_frame(
+        "Crypto",
+        "BTC/USDT",
+        "1m",
+        start,
+        first_end,
+        market_type="swap",
+        exchange_id="binance",
+    )
+    cutoff[0] += pd.Timedelta(minutes=1)
+    next_end = cutoff[0].to_pydatetime().replace(tzinfo=timezone.utc)
+    second = market_data.load_strategy_frame(
+        "Crypto",
+        "BTC/USDT",
+        "1m",
+        start,
+        next_end,
+        market_type="swap",
+        exchange_id="binance",
+    )
+    third = market_data.load_strategy_frame(
+        "Crypto",
+        "BTC/USDT",
+        "1m",
+        start,
+        next_end,
+        market_type="swap",
+        exchange_id="binance",
+    )
+
+    assert len(first) == 100
+    assert second.index.max() == pd.Timestamp("2026-08-31 18:51:00")
+    assert third.index.max() == second.index.max()
+    assert len(calls) == 3
+
+
+def test_live_one_minute_cache_rejects_data_older_than_grace_window(monkeypatch):
+    cutoff = [pd.Timestamp("2026-08-31 18:51:00")]
+    calls = []
+
+    def load(_market, _symbol, _timeframe, _start_date, _end_date, **_kwargs):
+        calls.append(True)
+        if len(calls) > 1:
+            return pd.DataFrame()
+        index = pd.date_range(
+            cutoff[0] - pd.Timedelta(minutes=199),
+            cutoff[0],
+            freq="1min",
+        )
+        return pd.DataFrame({"close": range(len(index))}, index=index)
+
+    monkeypatch.setattr(market_data, "_load_strategy_frame_uncached", load)
+    monkeypatch.setattr(
+        market_data,
+        "_last_completed_bar_open",
+        lambda _seconds: cutoff[0],
+    )
+    start = cutoff[0].to_pydatetime().replace(tzinfo=timezone.utc) - timedelta(minutes=199)
+    first_end = cutoff[0].to_pydatetime().replace(tzinfo=timezone.utc)
+    market_data.load_strategy_frame(
+        "Crypto",
+        "ETH/USDT",
+        "1m",
+        start,
+        first_end,
+        market_type="swap",
+        exchange_id="binance",
+    )
+    cutoff[0] += pd.Timedelta(minutes=3)
+
+    stale = market_data.load_strategy_frame(
+        "Crypto",
+        "ETH/USDT",
+        "1m",
+        start,
+        cutoff[0].to_pydatetime().replace(tzinfo=timezone.utc),
+        market_type="swap",
+        exchange_id="binance",
+    )
+
+    assert stale.empty
+    assert len(calls) == 2
+
+
+def test_initial_incomplete_one_minute_warmup_retries_once(monkeypatch):
+    calls = []
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=10)
+
+    def load(*_args, **_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise MarketDataUnavailableError(
+                classify_market_data_failure(
+                    "Incomplete K-line coverage",
+                    exchange_id="binance",
+                    market_type="swap",
+                    symbol="BTC/USDT",
+                    timeframe="1m",
+                )
+            )
+        index = pd.date_range(start.replace(tzinfo=None), periods=11, freq="1min")
+        return pd.DataFrame({"close": range(len(index))}, index=index)
+
+    monkeypatch.setattr(market_data, "_load_strategy_frame_uncached", load)
+
+    frame = market_data.load_strategy_frame(
+        "Crypto",
+        "BTC/USDT",
+        "1m",
+        start,
+        end,
+        market_type="swap",
+        exchange_id="binance",
+    )
+
+    assert len(calls) == 2
+    assert len(frame) == 11

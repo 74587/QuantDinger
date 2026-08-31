@@ -95,6 +95,19 @@ def classify_market_data_failure(
         code = "rate_limited"
         message = "The exchange rate limit was reached. Market data will be retried."
         retryable = True
+    elif any(token in text for token in (
+        "incomplete k-line",
+        "incomplete kline",
+        "incomplete candle",
+        "incomplete market data",
+        "incomplete history",
+    )):
+        code = "incomplete_market_data"
+        message = (
+            "The exchange returned incomplete K-line coverage. "
+            "The missing interval will be retried."
+        )
+        retryable = True
     elif any(token in text for token in ("timeout", "timed out", "network error", "connection reset", "connection refused", "exchange not available", "service unavailable", "502", "503", "504")):
         code = "exchange_unavailable"
         message = "The exchange market-data service is temporarily unreachable."

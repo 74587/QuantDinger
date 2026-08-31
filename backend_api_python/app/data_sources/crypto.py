@@ -698,6 +698,14 @@ class CryptoDataSource(BaseDataSource):
                     or int(klines[-1]["time"]) < int(before_time) - tolerance_seconds
                     or coverage_ratio < 0.98
                 ):
+                    self._set_last_failure(
+                        "Incomplete K-line coverage after normalization: "
+                        f"requested={after_time}~{before_time}, "
+                        f"actual={klines[0]['time']}~{klines[-1]['time']}, "
+                        f"rows={len(klines)}/{expected_rows}",
+                        symbol=symbol_pair,
+                        timeframe=timeframe,
+                    )
                     logger.warning(
                         "Rejected incomplete %s %s K-lines after normalization: "
                         "requested=%s~%s, actual=%s~%s, rows=%s/%s (%.2f%%)",
@@ -982,6 +990,13 @@ class CryptoDataSource(BaseDataSource):
                         int(ohlcv[0][0]) > requested_start_ms + tolerance_ms
                         or int(ohlcv[-1][0]) < end_ms - tolerance_ms
                     ):
+                        self._set_last_failure(
+                            "Incomplete K-line history: "
+                            f"requested={requested_start_ms}~{end_ms}, "
+                            f"actual={int(ohlcv[0][0])}~{int(ohlcv[-1][0])}",
+                            symbol=symbol_pair,
+                            timeframe=timeframe,
+                        )
                         logger.warning(
                             "Refused incomplete %s %s history: requested=%s~%s, actual=%s~%s",
                             exchange_id,

@@ -21,6 +21,7 @@ from app.utils.strategy_runtime_logs import format_market_data_log, parse_market
         ("ProxyError: tunnel connection failed", "proxy_failure"),
         ("binance does not have market symbol AVAX/USDT:USDT", "symbol_not_found"),
         ("HTTP 429 too many requests", "rate_limited"),
+        ("Incomplete K-line coverage", "incomplete_market_data"),
         ("request timed out", "exchange_unavailable"),
     ],
 )
