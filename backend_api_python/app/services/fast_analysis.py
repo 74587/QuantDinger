@@ -13,6 +13,7 @@ from app.services.fast_analysis_formatters import build_trend_outlook_summary, s
 from app.services.fast_analysis_fundamentals import build_score_payload, format_financial_statements, format_fundamental_metric, fundamental_provenance
 from app.services.fast_analysis_geo import is_major_geopolitical_news_text
 from app.services.fast_analysis_plan import finalize_trading_plan, trading_plan_risk_fields
+from app.services.fast_analysis_policy import direction_supported_by_consensus, should_override_with_consensus
 from app.services.fast_analysis_scoring import FastAnalysisScoringMixin
 
 logger = get_logger(__name__)
@@ -1135,7 +1136,7 @@ IMPORTANT:
             ):
                 min_abs_override = max(min_abs_override, 55.0 if risk_context.get("panic_breakdown") else 40.0)
 
-            if consensus_abs >= min_abs_override:
+            if should_override_with_consensus(consensus_decision, consensus_abs, min_abs_override):
                 final_decision = consensus_decision
                 if llm_decision != final_decision:
                     logger.warning(
@@ -1557,11 +1558,18 @@ IMPORTANT:
         )
         
         if confidence < 60:
-            if decision != "HOLD":
+            if decision == "HOLD":
+                return analysis
+            if not direction_supported_by_consensus(analysis, decision):
                 logger.warning(f"Decision {decision} with low confidence {confidence}, forcing to HOLD")
                 analysis["decision"] = "HOLD"
                 analysis["confidence"] = max(confidence, 45)  # 降低置信度
-            return analysis
+                analysis["decision_guard"] = "low_confidence_without_consensus"
+                return analysis
+            logger.info(
+                f"Keeping low-confidence {decision} because directional consensus confirms it "
+                f"(confidence={confidence})"
+            )
         
         allow_override = has_major_news or has_macro_event
         
@@ -1673,7 +1681,7 @@ IMPORTANT:
             return "SELL"
         else:
             return "HOLD"
-    
+
     def _calculate_overall_score(self, analysis: Dict) -> int:
         """Calculate weighted overall score (legacy method, now uses objective score if available)."""
         if "objective_score" in analysis:

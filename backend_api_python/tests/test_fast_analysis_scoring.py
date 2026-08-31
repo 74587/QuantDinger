@@ -1,4 +1,6 @@
 from app.services.fast_analysis import FastAnalysisService
+from app.services.fast_analysis_formatters import build_trend_outlook_summary
+from app.services.fast_analysis_policy import should_override_with_consensus
 
 
 def _service():
@@ -41,3 +43,61 @@ def test_bearish_breakdown_suppresses_oversold_buy_bias():
     assert risk["panic_breakdown"] is True
     assert score <= -20
 
+
+def test_neutral_consensus_never_overrides_directional_model_judgment():
+    svc = _service()
+
+    assert svc._score_to_decision(17.6, market="USStock") == "HOLD"
+    assert should_override_with_consensus("HOLD", 17.6, 15.0) is False
+    assert should_override_with_consensus("BUY", 20.0, 15.0) is True
+
+
+def test_low_confidence_direction_survives_when_consensus_confirms_it():
+    svc = _service()
+    analysis = {
+        "decision": "BUY",
+        "confidence": 56,
+        "consensus": {"consensus_decision": "BUY", "consensus_score": 22.0},
+        "objective_scores_by_timeframe": {"4H": {"decision": "BUY"}, "1D": {"decision": "BUY"}},
+    }
+    indicators = {
+        "rsi": {"value": 55},
+        "macd": {"signal": "bullish"},
+        "moving_averages": {"trend": "uptrend", "ma20": 95},
+        "current_price": 100,
+        "price_position": 60,
+        "volume_ratio": 1.0,
+    }
+
+    result = svc._validate_decision_against_indicators(analysis, indicators, 56)
+
+    assert result["decision"] == "BUY"
+    assert result.get("decision_guard") is None
+
+
+def test_low_confidence_direction_without_consensus_is_still_held():
+    svc = _service()
+    analysis = {
+        "decision": "BUY",
+        "confidence": 56,
+        "consensus": {"consensus_decision": "HOLD", "consensus_score": 17.6},
+    }
+
+    result = svc._validate_decision_against_indicators(analysis, {}, 56)
+
+    assert result["decision"] == "HOLD"
+    assert result["decision_guard"] == "low_confidence_without_consensus"
+
+
+def test_mild_direction_is_presented_without_changing_hold_action():
+    svc = _service()
+    outlook = {
+        "next_24h": {"trend": "HOLD", "score": 17.6, "strength": "neutral"},
+        "next_3d": {},
+        "next_1w": {},
+        "next_1m": {},
+    }
+
+    summary = build_trend_outlook_summary(outlook, "zh-CN")
+
+    assert "轻微利多·观望" in summary
