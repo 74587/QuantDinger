@@ -21,7 +21,10 @@ _SCOPED_INSTANCES: Dict[str, "CryptoDataSource"] = {}
 _PUBLIC_MARKET_INSTANCES: Dict[str, "CryptoDataSource"] = {}
 _INVALID_SYMBOL_UNTIL: Dict[str, float] = {}
 PUBLIC_KLINE_EXCHANGE_IDS = ("binance", "bitget", "bybit", "okx", "gate", "htx")
-PUBLIC_KLINE_FALLBACK_IDS = ("bitget", "okx", "gate", "htx", "bybit", "binance")
+# OKX is first because its historical endpoint reliably preserves complete
+# minute-level windows. Bitget is still available as the next public fallback,
+# but can omit a material number of old 1m candles on long ranges.
+PUBLIC_KLINE_FALLBACK_IDS = ("okx", "bitget", "gate", "htx", "bybit", "binance")
 
 
 class _PublicKlineUnavailable(RuntimeError):
@@ -145,6 +148,16 @@ class CryptoDataSource(BaseDataSource):
         "gate": 10000,
     }
 
+    _PAGINATION_BATCH_LIMITS: Dict[str, int] = {
+        "binance": 1000,
+        "binanceusdm": 1000,
+        "bitget": 1000,
+        "bybit": 1000,
+        "gate": 1000,
+        "htx": 1000,
+        "okx": 300,
+    }
+
     COMMON_QUOTES = ['USDT', 'USD', 'BTC', 'ETH', 'BUSD', 'USDC', 'BNB', 'EUR', 'GBP']
     
     def __init__(self):
@@ -156,11 +169,15 @@ class CryptoDataSource(BaseDataSource):
         self._preferred_public_exchange_id = ""
         self._markets_load_lock = threading.Lock()
         self._failure_local = threading.local()
-        default_ex = (CCXTConfig.DEFAULT_EXCHANGE or "binance").strip().lower()
+        # Public charts/backtests are research data, not execution-venue data.
+        # Keep them on a stable, credential-free primary (OKX) unless explicitly
+        # overridden; live strategies still use ``for_exchange`` and therefore
+        # remain pinned to their configured venue.
+        default_ex = (os.getenv("CRYPTO_PUBLIC_KLINE_PRIMARY") or "okx").strip().lower()
         if default_ex == "huobi":
             default_ex = "htx"
         if default_ex not in PUBLIC_KLINE_EXCHANGE_IDS:
-            default_ex = "binance"
+            default_ex = "okx"
         self._init_ccxt_exchange(default_ex, {})
 
     @classmethod
@@ -212,13 +229,13 @@ class CryptoDataSource(BaseDataSource):
             mt = "spot"
         exchange_id = (
             preferred_exchange_id
-            or CCXTConfig.DEFAULT_EXCHANGE
-            or "binance"
+            or os.getenv("CRYPTO_PUBLIC_KLINE_PRIMARY")
+            or "okx"
         ).strip().lower()
         if exchange_id == "huobi":
             exchange_id = "htx"
         if exchange_id not in PUBLIC_KLINE_EXCHANGE_IDS:
-            exchange_id = "binance"
+            exchange_id = "okx"
         cache_key = f"{exchange_id}|{mt}"
         cached = _PUBLIC_MARKET_INSTANCES.get(cache_key)
         if cached is not None:
@@ -668,6 +685,34 @@ class CryptoDataSource(BaseDataSource):
                 truncate=(after_time is None),
             )
 
+            if klines and after_time is not None and before_time is not None:
+                timeframe_seconds = int(TIMEFRAME_SECONDS.get(timeframe, 86400) or 86400)
+                tolerance_seconds = timeframe_seconds * 3
+                expected_rows = max(
+                    1,
+                    int((int(before_time) - int(after_time)) / timeframe_seconds),
+                )
+                coverage_ratio = len(klines) / expected_rows
+                if (
+                    int(klines[0]["time"]) > int(after_time) + tolerance_seconds
+                    or int(klines[-1]["time"]) < int(before_time) - tolerance_seconds
+                    or coverage_ratio < 0.98
+                ):
+                    logger.warning(
+                        "Rejected incomplete %s %s K-lines after normalization: "
+                        "requested=%s~%s, actual=%s~%s, rows=%s/%s (%.2f%%)",
+                        current_exchange or "default",
+                        timeframe,
+                        after_time,
+                        before_time,
+                        klines[0]["time"],
+                        klines[-1]["time"],
+                        len(klines),
+                        expected_rows,
+                        coverage_ratio * 100,
+                    )
+                    klines = []
+
             self.log_result(symbol, klines, timeframe)
 
             # Concise trace so backtest logs can correlate requested window with actual window
@@ -813,7 +858,12 @@ class CryptoDataSource(BaseDataSource):
                 start_dt = end_dt - timedelta(seconds=total_seconds)
                 if after_time is not None:
                     floor_dt = datetime.fromtimestamp(int(after_time), tz=timezone.utc)
-                    start_dt = min(start_dt, floor_dt)
+                    # `after_time` is an explicit historical left boundary.  The
+                    # caller already adds any required warmup, so starting from
+                    # the limit-derived buffered date only downloads unrelated
+                    # candles and can exhaust the pagination budget before the
+                    # requested end is reached.
+                    start_dt = floor_dt
                 timeframe_ms = TIMEFRAME_SECONDS.get(timeframe, 86400) * 1000
                 now_ms = now_ts * 1000
                 since = int(start_dt.timestamp() * 1000)
@@ -833,16 +883,17 @@ class CryptoDataSource(BaseDataSource):
                         )
                         return []
                     if since < earliest_supported_ms:
-                        logger.info(
-                            "Clamped %s %s history start to the exchange recent-candle limit (%s bars)",
+                        logger.warning(
+                            "Refused partial %s %s history: requested start predates the exchange "
+                            "recent-candle limit (%s bars)",
                             exchange_id,
                             ccxt_timeframe,
                             recent_limit,
                         )
-                        since = earliest_supported_ms
+                        return []
 
                 all_ohlcv: List[List[Any]] = []
-                batch_limit = 300  # Conservative cross-provider request limit.
+                batch_limit = int(self._PAGINATION_BATCH_LIMITS.get(exchange_id, 300))
                 current_since = since
                 max_batches = 6000
                 empty_streak = 0
@@ -924,6 +975,23 @@ class CryptoDataSource(BaseDataSource):
                     return self._fetch_ohlcv_fallback(
                         symbol_pair, ccxt_timeframe, limit, before_time, timeframe, after_time
                     )
+                if after_time is not None:
+                    tolerance_ms = timeframe_ms * 3
+                    requested_start_ms = int(after_time) * 1000
+                    if (
+                        int(ohlcv[0][0]) > requested_start_ms + tolerance_ms
+                        or int(ohlcv[-1][0]) < end_ms - tolerance_ms
+                    ):
+                        logger.warning(
+                            "Refused incomplete %s %s history: requested=%s~%s, actual=%s~%s",
+                            exchange_id,
+                            ccxt_timeframe,
+                            requested_start_ms,
+                            end_ms,
+                            int(ohlcv[0][0]),
+                            int(ohlcv[-1][0]),
+                        )
+                        return []
             else:
                 # No window specified: ask for at most the exchange's per-call cap.
                 # Passing the raw `limit` here can be tens of thousands for long
@@ -941,7 +1009,7 @@ class CryptoDataSource(BaseDataSource):
                 self._set_last_failure(e, symbol=symbol_pair, timeframe=timeframe)
                 return []
             partial_rows = locals().get("all_ohlcv") or []
-            if partial_rows:
+            if partial_rows and after_time is None:
                 logger.warning(
                     "CCXT paginated fetch stopped early for %s %s; returning %s available candles: %s",
                     symbol_pair,
@@ -951,6 +1019,14 @@ class CryptoDataSource(BaseDataSource):
                 )
                 by_ts = {int(row[0]): row for row in partial_rows if row and len(row) >= 6}
                 return sorted(by_ts.values(), key=lambda row: row[0])
+            if partial_rows:
+                logger.warning(
+                    "Discarded %s partial candles for %s %s after a historical fetch failed: %s",
+                    len(partial_rows),
+                    symbol_pair,
+                    ccxt_timeframe,
+                    str(e),
+                )
             logger.warning(f"CCXT fetch_ohlcv failed: {str(e)}; trying fallback")
             self._set_last_failure(e, symbol=symbol_pair, timeframe=timeframe)
             return self._fetch_ohlcv_fallback(
@@ -967,6 +1043,11 @@ class CryptoDataSource(BaseDataSource):
         after_time: Optional[int] = None,
     ) -> List:
         """备用获取方法"""
+        # An explicit historical window must never be replaced with a recent
+        # page. Returning no rows lets an unscoped research/backtest source try
+        # another public venue; a live venue-scoped source fails explicitly.
+        if after_time is not None:
+            return []
         try:
             total_seconds = self.calculate_time_range(timeframe, limit)
             
@@ -977,7 +1058,7 @@ class CryptoDataSource(BaseDataSource):
                 start_dt = end_dt - timedelta(seconds=total_seconds)
                 if after_time is not None:
                     floor_dt = datetime.fromtimestamp(int(after_time), tz=timezone.utc)
-                    start_dt = min(start_dt, floor_dt)
+                    start_dt = floor_dt
                 tf_ms = TIMEFRAME_SECONDS.get(timeframe, 86400) * 1000
                 now_ms = now_ts * 1000
                 since = int(start_dt.timestamp() * 1000)

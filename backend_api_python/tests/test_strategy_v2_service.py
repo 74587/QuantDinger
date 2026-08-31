@@ -3,9 +3,19 @@ from datetime import datetime
 import pandas as pd
 import pytest
 
-from app.services.strategy_v2 import StrategyV2ContractError
+from app.services.strategy_v2 import (
+    InstrumentSpec,
+    StrategyManifest,
+    StrategyV2ContractError,
+    SubscriptionSpec,
+    UniverseSpec,
+)
 from app.services.strategy_v2.service import (
     StrategyV2BacktestService,
+    _benchmark_for_manifest,
+    _build_benchmark_result,
+    _build_review_candle_snapshots,
+    _review_frequency_for_window,
     _universe_matches,
     _warmup_calendar_days,
 )
@@ -23,6 +33,137 @@ def test_warmup_days_follow_strategy_frequency():
     assert _warmup_calendar_days("4h", 120) == 30
     assert _warmup_calendar_days("1d", 10) == 19
     assert _warmup_calendar_days("1w", 10) == 80
+
+
+def test_benchmark_alignment_does_not_extend_stale_prices_past_real_coverage():
+    benchmark_index = pd.date_range("2026-08-23", periods=3, freq="D")
+    benchmark_frame = pd.DataFrame({"close": [100.0, 101.0, 102.0]}, index=benchmark_index)
+    equity_curve = [
+        {"time": f"2026-08-{day:02d}T00:00:00Z", "value": 10000.0}
+        for day in range(23, 28)
+    ]
+
+    result = _build_benchmark_result(
+        InstrumentSpec(market="Crypto", symbol="ETH/USDT", market_type="spot"),
+        benchmark_frame,
+        equity_curve,
+        10000.0,
+    )
+
+    assert result["benchmarkStatus"] == "partial"
+    assert len(result["benchmarkCurve"]) == 3
+    assert result["benchmarkCurve"][-1]["time"] == "2026-08-25T00:00:00Z"
+    assert result["benchmarkCurve"][-1]["value"] == pytest.approx(10200.0)
+    assert result["benchmarkCoverageRatio"] == pytest.approx(0.6)
+
+
+def _portfolio_manifest(*instruments: InstrumentSpec, benchmark=None) -> StrategyManifest:
+    return StrategyManifest(
+        api_version=2,
+        code_hash="test",
+        strategy_type="portfolio",
+        universe=UniverseSpec(kind="static", instruments=tuple(instruments)),
+        subscriptions=(SubscriptionSpec(instruments=tuple(instruments), frequency="1d"),),
+        schedules=(),
+        benchmark=benchmark,
+    )
+
+
+def test_portfolio_benchmark_inference_is_market_aware():
+    us = _benchmark_for_manifest(_portfolio_manifest(
+        InstrumentSpec(market="USStock", symbol="AAPL", market_type="spot"),
+        InstrumentSpec(market="USStock", symbol="MSFT", market_type="spot"),
+    ))
+    crypto = _benchmark_for_manifest(_portfolio_manifest(
+        InstrumentSpec(market="Crypto", symbol="ETH/USDT", exchange_id="okx", market_type="swap"),
+        InstrumentSpec(market="Crypto", symbol="SOL/USDT", exchange_id="okx", market_type="swap"),
+    ))
+    mixed = _benchmark_for_manifest(_portfolio_manifest(
+        InstrumentSpec(market="USStock", symbol="AAPL", market_type="spot"),
+        InstrumentSpec(market="Crypto", symbol="BTC/USDT", market_type="spot"),
+    ))
+
+    assert us == InstrumentSpec(market="USStock", symbol="SPY", market_type="spot")
+    assert crypto == InstrumentSpec(
+        market="Crypto", symbol="BTC/USDT", exchange_id="okx", market_type="spot"
+    )
+    assert mixed is None
+
+
+def test_explicit_portfolio_benchmark_is_never_overridden():
+    explicit = InstrumentSpec(market="USStock", symbol="QQQ", market_type="spot")
+    manifest = _portfolio_manifest(
+        InstrumentSpec(market="USStock", symbol="AAPL", market_type="spot"),
+        benchmark=explicit,
+    )
+
+    assert _benchmark_for_manifest(manifest) == explicit
+
+
+def test_benchmark_alignment_covers_the_full_final_intraday_bar():
+    benchmark_index = pd.date_range("2026-08-29T23:00:00", periods=4, freq="15min")
+    benchmark_frame = pd.DataFrame({"close": [100.0, 101.0, 102.0, 103.0]}, index=benchmark_index)
+    equity_curve = [
+        {"time": "2026-08-29T23:00:00Z", "value": 10000.0},
+        {"time": "2026-08-29T23:45:00Z", "value": 10010.0},
+        {"time": "2026-08-29T23:59:00Z", "value": 10020.0},
+    ]
+
+    result = _build_benchmark_result(
+        InstrumentSpec(market="Crypto", symbol="ETH/USDT", market_type="spot"),
+        benchmark_frame,
+        equity_curve,
+        10000.0,
+    )
+
+    assert result["benchmarkStatus"] == "available"
+    assert result["benchmarkCoverageRatio"] == pytest.approx(1.0)
+    assert len(result["benchmarkCurve"]) == len(equity_curve)
+    assert result["benchmarkCurve"][-1]["value"] == pytest.approx(10300.0)
+    assert result["benchmarkCoverageEnd"] == "2026-08-29T23:59:59.999999Z"
+
+
+def test_trade_review_snapshot_aggregates_month_of_minutes_and_keeps_only_ohlcv():
+    index = pd.date_range("2026-07-31", periods=30 * 24 * 60, freq="min")
+    frame = pd.DataFrame({
+        "open": range(len(index)),
+        "high": [value + 2 for value in range(len(index))],
+        "low": [value - 2 for value in range(len(index))],
+        "close": [value + 1 for value in range(len(index))],
+        "volume": [3] * len(index),
+        "private_rule": ["must-not-leak"] * len(index),
+    }, index=index)
+    symbol = "Crypto:ETH/USDT@swap"
+
+    snapshots = _build_review_candle_snapshots(
+        {symbol: frame},
+        [{
+            "symbol": symbol,
+            "entry_time": "2026-07-31T00:10:00Z",
+            "exit_time": "2026-08-29T23:40:00Z",
+        }],
+        source_frequency="1m",
+        start_date=datetime(2026, 7, 31),
+        end_date=datetime(2026, 8, 29, 23, 59),
+    )
+
+    snapshot = snapshots[symbol]
+    assert snapshot["timeframe"] == "1H"
+    assert 600 < len(snapshot["candles"]) <= 1000
+    assert set(snapshot["candles"][0]) == {"time", "open", "high", "low", "close", "volume"}
+    assert max(item["volume"] for item in snapshot["candles"]) > 3
+    first_time = pd.to_datetime(snapshot["candles"][0]["time"], unit="s", utc=True)
+    assert first_time < pd.Timestamp("2026-08-01T00:00:00Z")
+
+
+def test_month_of_minutes_uses_a_complete_coarser_benchmark_frequency():
+    timeframe, _rule, _seconds = _review_frequency_for_window(
+        "1m",
+        30 * 24 * 60 * 60,
+        max_bars=3000,
+    )
+
+    assert timeframe == "15m"
 
 
 def _frame(*_args, **_kwargs):
@@ -75,6 +216,41 @@ def handle_data(context, data):
     assert repository.persisted["initial_capital"] == 10000
     assert repository.persisted["leverage"] == 1.0
     assert repository.persisted["manifest"]["apiVersion"] == 2
+
+
+def test_v2_service_runs_a_multi_symbol_portfolio_and_preserves_symbol_attribution(tmp_path):
+    code = """
+def initialize(context):
+    context.set_universe(["USStock:AAPL", "USStock:MSFT"])
+    context.subscribe(frequency="1d")
+    run_daily(rebalance, time="09:35")
+
+def rebalance(context, data):
+    order_target_percent("AAPL", 0.5)
+    order_target_percent("MSFT", 0.5)
+"""
+    service = StrategyV2BacktestService(
+        repository=_Repository(),
+        frame_fetcher=_frame,
+        snapshot_store=MarketDataSnapshotStore(tmp_path),
+    )
+
+    _, result = service.run(
+        user_id=1,
+        code=code,
+        start_date=datetime(2026, 1, 1),
+        end_date=datetime(2026, 1, 5, 23, 59),
+        initial_capital=10000,
+        persist=False,
+    )
+
+    assert result["manifest"]["strategyType"] == "portfolio"
+    assert result["diagnostics"]["symbolsUsed"] == 2
+    assert {row["symbol"] for row in result["attribution"]["symbols"]} == {
+        "USStock:AAPL",
+        "USStock:MSFT",
+    }
+    assert result["benchmark"]["symbol"] == "SPY"
 
 
 def test_dynamic_universe_reference_matches_canonical_universe_code():

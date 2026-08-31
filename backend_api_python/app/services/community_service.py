@@ -581,7 +581,43 @@ class CommunityService:
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                if existing_indicator_id and existing_indicator_id > 0:
+                source_id_value = int(source_id or 0) or None
+                target_indicator_id = 0
+
+                # A script source is the stable marketplace identity.  The UI
+                # does not retain a marketplace row id between publish flows,
+                # so relying only on ``existing_indicator_id`` made every
+                # re-publish create a duplicate card.  Serialize publishes for
+                # the same owner/source pair, then resolve the existing row on
+                # the server before deciding between UPDATE and INSERT.
+                if source_id_value:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(?, ?)",
+                        (int(user_id), source_id_value),
+                    )
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM qd_indicator_codes
+                        WHERE user_id = ? AND source_script_source_id = ?
+                          AND COALESCE(asset_type, 'indicator') = 'script_template'
+                        ORDER BY CASE WHEN publish_to_community = 1 THEN 0 ELSE 1 END,
+                                 COALESCE(purchase_count, 0) DESC,
+                                 COALESCE(view_count, 0) DESC,
+                                 id ASC
+                        LIMIT 1
+                        """,
+                        (int(user_id), source_id_value),
+                    )
+                    existing_source_row = cur.fetchone()
+                    if existing_source_row:
+                        target_indicator_id = int(
+                            existing_source_row.get('id')
+                            if isinstance(existing_source_row, dict)
+                            else existing_source_row[0]
+                        )
+
+                if existing_indicator_id and existing_indicator_id > 0 and not target_indicator_id:
                     cur.execute(
                         """
                         SELECT id FROM qd_indicator_codes
@@ -589,9 +625,14 @@ class CommunityService:
                         """,
                         (existing_indicator_id, user_id),
                     )
-                    if not cur.fetchone():
+                    explicit_row = cur.fetchone()
+                    if not explicit_row:
                         cur.close()
                         return False, 'template not found', None
+                    target_indicator_id = int(existing_indicator_id)
+
+                publication_action = 'updated' if target_indicator_id else 'created'
+                if target_indicator_id:
                     cur.execute(
                         """
                         UPDATE qd_indicator_codes
@@ -612,16 +653,16 @@ class CommunityService:
                         (
                             name, code, description, pricing_type, price,
                             1 if code_hidden else 0, bool(vip_free),
-                            int(source_id or 0) or None, int(strategy_id or 0) or None,
+                            source_id_value, int(strategy_id or 0) or None,
                             contract_index['contract_json'], contract_index['contract_version'], contract_index['contract_hash'],
                             contract_index['binding_mode'], contract_index['strategy_type'], contract_index['direction_mode'],
                             contract_index['execution_mode'], contract_index['execution_frequency'],
                             contract_index['confirmation_frequencies'], contract_index['markets'], contract_index['market_types'],
                             review_status, user_id if is_admin else None,
-                            now_ts, existing_indicator_id, user_id,
+                            now_ts, target_indicator_id, user_id,
                         ),
                     )
-                    indicator_id = existing_indicator_id
+                    indicator_id = target_indicator_id
                 else:
                     cur.execute(
                         """
@@ -642,7 +683,7 @@ class CommunityService:
                         (
                             user_id, name, code, description, pricing_type, price,
                             1 if code_hidden else 0, bool(vip_free),
-                            int(source_id or 0) or None, int(strategy_id or 0) or None,
+                            source_id_value, int(strategy_id or 0) or None,
                             review_status,
                             contract_index['contract_json'], contract_index['contract_version'], contract_index['contract_hash'],
                             contract_index['binding_mode'], contract_index['strategy_type'], contract_index['direction_mode'],
@@ -662,6 +703,7 @@ class CommunityService:
                 'asset_type': 'script_template',
                 'strategy_id': strategy_id,
                 'source_id': int(source_id or 0),
+                'publication_action': publication_action,
                 'marketplace_contract': marketplace_contract,
                 'strategy_contract': marketplace_contract,
             }

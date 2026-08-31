@@ -21,11 +21,15 @@ class _Cursor:
 
     def __init__(self):
         self.executions = []
+        self._fetch_results = []
 
     def execute(self, sql, params=()):
         params = tuple(params)
         self.executions.append((sql, params))
         assert sql.count('?') == len(params), (sql, params)
+
+    def fetchone(self):
+        return self._fetch_results.pop(0) if self._fetch_results else None
 
     def close(self):
         return None
@@ -79,3 +83,30 @@ def test_publish_persists_derived_contract_and_search_indexes(monkeypatch):
     contract = next(json.loads(value) for value in params if isinstance(value, str) and value.startswith('{'))
     assert contract['contract_version'] == 2
     assert contract['binding_mode'] == 'parameterized'
+
+
+def test_republish_updates_listing_resolved_by_source_id(monkeypatch):
+    cursor = _Cursor()
+    cursor._fetch_results = [{'id': 41}]
+    db = _Db(cursor)
+    monkeypatch.setattr(community_service, 'get_db_connection', lambda: db)
+
+    ok, message, data = CommunityService().publish_script_template_from_strategy(
+        user_id=9,
+        strategy_id=0,
+        source_id=12,
+        name='Updated SPY strategy',
+        description='new version',
+        code=SOURCE,
+        is_admin=True,
+    )
+
+    assert ok is True
+    assert message == 'success'
+    assert data['indicator_id'] == 41
+    assert data['publication_action'] == 'updated'
+    statements = [sql for sql, _params in cursor.executions]
+    assert any('pg_advisory_xact_lock' in sql for sql in statements)
+    assert any('source_script_source_id = ?' in sql and 'SELECT id' in sql for sql in statements)
+    assert any('UPDATE qd_indicator_codes' in sql for sql in statements)
+    assert not any('INSERT INTO qd_indicator_codes' in sql for sql in statements)

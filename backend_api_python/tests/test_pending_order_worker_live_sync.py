@@ -1,9 +1,32 @@
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
+
 import pytest
 
 from app.services import pending_order_worker as worker_module
+from app.services.live_trading.adapters import LiveOrderPhaseAdapter
 from app.services.pending_orders.sent_order_recovery import is_final_fill, normalize_live_order_status
+
+
+def test_live_order_adapter_call_uses_only_supported_constructor_keywords():
+    """Keep the worker and adapter constructor contract in sync."""
+    source = textwrap.dedent(inspect.getsource(worker_module.PendingOrderWorker._execute_live_order))
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "LiveOrderPhaseAdapter"
+    ]
+
+    assert len(calls) == 1
+    passed_keywords = {keyword.arg for keyword in calls[0].keywords if keyword.arg}
+    supported_keywords = set(inspect.signature(LiveOrderPhaseAdapter).parameters)
+    assert passed_keywords <= supported_keywords
 
 
 def _row(*, filled: float, avg_price: float):

@@ -369,14 +369,32 @@ def _compile_or_repair_generated_strategy(
         )
 
 
-def _consume_strategy_ai_credit(user_id: int, reference: str):
+def _strategy_ai_billing_feature(intent: str) -> str:
+    """Match the indicator IDE tariff: chat is cheap, code changes use code-gen."""
+    return "ai_copilot_chat" if str(intent or "").strip().lower() == "discussion" else "ai_code_gen"
+
+
+def _consume_strategy_ai_credit(user_id: int, reference: str, feature: str):
     from app.services.billing_service import get_billing_service
 
     return get_billing_service().check_and_consume(
         user_id=int(user_id),
-        feature="ai_code_gen",
+        feature=feature,
         reference_id=reference,
     )
+
+
+def _strategy_ai_billing_meta(user_id: int, feature: str, consume_status: str) -> dict:
+    """Return enough billing state for the header balance to refresh immediately."""
+    from app.services.billing_service import get_billing_service
+
+    billing = get_billing_service()
+    charged = billing.get_feature_cost(feature) if consume_status == "consumed" else 0
+    return {
+        "feature": feature,
+        "credits_charged": int(charged or 0),
+        "remaining_credits": float(billing.get_user_credits(int(user_id))),
+    }
 
 
 @strategy_blp.route("/strategies/ai-workspace/<int:source_id>", methods=["GET"])
@@ -457,12 +475,15 @@ def run_strategy_workspace_turn():
             # an empty thread is harmless; a failed billing check must not add
             # a dangling user message to the conversation.
             get_strategy_ai_workspace(user_id, source_id, asset_type)
+        billing_feature = _strategy_ai_billing_feature(intent)
         accepted, message = _consume_strategy_ai_credit(
             user_id,
             f"strategy_ai_turn_{user_id}_{source_id}_{int(time.time())}",
+            billing_feature,
         )
         if not accepted:
             return _error(message or "strategyV2.insufficientCredits", 402)
+        billing_meta = _strategy_ai_billing_meta(user_id, billing_feature, message)
 
         workspace = None
         if source_id:
@@ -506,12 +527,20 @@ def run_strategy_workspace_turn():
                 use_json_mode=False,
             ) or "").strip()
             if workspace:
-                return _ok(complete_strategy_discussion_turn(
+                result = complete_strategy_discussion_turn(
                     user_id=user_id,
                     workspace=workspace,
                     answer=answer,
-                ))
-            return _ok({"reply_type": "discussion", "assistant_message": {"role": "assistant", "content": answer}})
+                )
+                result["billing"] = billing_meta
+                result.update(billing_meta)
+                return _ok(result)
+            return _ok({
+                "reply_type": "discussion",
+                "assistant_message": {"role": "assistant", "content": answer, "message_type": "discussion"},
+                "billing": billing_meta,
+                **billing_meta,
+            })
 
         system_prompt = select_strategy_system_prompt(asset_type, generation_mode)
         user_prompt = build_strategy_generation_request(
@@ -570,6 +599,8 @@ def run_strategy_workspace_turn():
                 assistant_message_key=STRATEGY_CANDIDATE_MESSAGE_KEY,
             )
             result.update({"code": candidate_code, "manifest": manifest})
+            result["billing"] = billing_meta
+            result.update(billing_meta)
             return _ok(result)
         return _ok({
             "reply_type": "candidate",
@@ -577,10 +608,13 @@ def run_strategy_workspace_turn():
                 "role": "assistant",
                 "content": assistant_text,
                 "message_key": STRATEGY_CANDIDATE_MESSAGE_KEY,
+                "message_type": "candidate",
             },
             "code": candidate_code,
             "manifest": manifest,
             "validation": validation,
+            "billing": billing_meta,
+            **billing_meta,
         })
     except LookupError as exc:
         return _error(str(exc), 404)

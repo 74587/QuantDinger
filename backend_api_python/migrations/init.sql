@@ -856,6 +856,38 @@ CREATE INDEX IF NOT EXISTS idx_indicator_review_status ON qd_indicator_codes USI
 CREATE INDEX IF NOT EXISTS idx_indicator_codes_source ON qd_indicator_codes USING btree (source_indicator_id);
 CREATE INDEX IF NOT EXISTS idx_indicator_codes_source_script ON qd_indicator_codes USING btree (source_script_source_id);
 CREATE INDEX IF NOT EXISTS idx_indicator_codes_source_strategy ON qd_indicator_codes USING btree (source_strategy_id);
+
+-- One strategy source owns one active marketplace listing per author.  Older
+-- installations may already contain duplicates from the former insert-only
+-- publish flow.  Keep the most established card active and only unpublish the
+-- extras, preserving their purchase/comment/version records for auditability.
+WITH ranked_script_listings AS (
+  SELECT id,
+         ROW_NUMBER() OVER (
+           PARTITION BY user_id, source_script_source_id
+           ORDER BY COALESCE(purchase_count, 0) DESC,
+                    COALESCE(rating_count, 0) DESC,
+                    COALESCE(view_count, 0) DESC,
+                    id ASC
+         ) AS listing_rank
+  FROM qd_indicator_codes
+  WHERE source_script_source_id IS NOT NULL
+    AND COALESCE(asset_type, 'indicator') = 'script_template'
+    AND publish_to_community = 1
+)
+UPDATE qd_indicator_codes AS listing
+SET publish_to_community = 0,
+    updated_at = NOW(),
+    updatetime = EXTRACT(EPOCH FROM NOW())::bigint
+FROM ranked_script_listings AS ranked
+WHERE listing.id = ranked.id
+  AND ranked.listing_rank > 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_indicator_codes_active_script_source
+ON qd_indicator_codes USING btree (user_id, source_script_source_id)
+WHERE source_script_source_id IS NOT NULL
+  AND COALESCE(asset_type, 'indicator') = 'script_template'
+  AND publish_to_community = 1;
 CREATE INDEX IF NOT EXISTS idx_indicator_strategy_binding ON qd_indicator_codes USING btree (strategy_binding_mode);
 CREATE INDEX IF NOT EXISTS idx_indicator_strategy_type ON qd_indicator_codes USING btree (strategy_type);
 CREATE INDEX IF NOT EXISTS idx_indicator_strategy_frequency ON qd_indicator_codes USING btree (strategy_primary_frequency);
@@ -1345,12 +1377,96 @@ CREATE TABLE IF NOT EXISTS qd_backtest_runs (
     status VARCHAR(20) DEFAULT 'success',
     error_message TEXT DEFAULT '',
     result_json TEXT DEFAULT '',
+    result_compacted BOOLEAN NOT NULL DEFAULT FALSE,
+    total_return DOUBLE PRECISION,
+    win_rate DOUBLE PRECISION,
+    total_trades INTEGER,
+    total_executions INTEGER,
+    max_drawdown DOUBLE PRECISION,
+    sharpe_ratio DOUBLE PRECISION,
+    result_status VARCHAR(32) DEFAULT 'unknown',
+    data_kind VARCHAR(32) DEFAULT 'unknown',
+    benchmark_total_return DOUBLE PRECISION,
+    summary_backfilled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS total_return DOUBLE PRECISION;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS win_rate DOUBLE PRECISION;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS total_trades INTEGER;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS total_executions INTEGER;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS max_drawdown DOUBLE PRECISION;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS sharpe_ratio DOUBLE PRECISION;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS result_status VARCHAR(32) DEFAULT 'unknown';
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS data_kind VARCHAR(32) DEFAULT 'unknown';
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS benchmark_total_return DOUBLE PRECISION;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS summary_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS result_compacted BOOLEAN NOT NULL DEFAULT FALSE;
+
+DO $$
+DECLARE
+    run_row RECORD;
+BEGIN
+    FOR run_row IN
+        SELECT id, result_json
+        FROM qd_backtest_runs
+        WHERE summary_backfilled = FALSE
+    LOOP
+        BEGIN
+            UPDATE qd_backtest_runs
+            SET total_return = ((regexp_match(run_row.result_json, '"totalReturn"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION,
+                win_rate = ((regexp_match(run_row.result_json, '"winRate"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION,
+                total_trades = ((regexp_match(run_row.result_json, '"totalTrades"[[:space:]]*:[[:space:]]*([0-9]+)'))[1])::INTEGER,
+                total_executions = ((regexp_match(run_row.result_json, '"totalExecutions"[[:space:]]*:[[:space:]]*([0-9]+)'))[1])::INTEGER,
+                result_status = COALESCE((regexp_match(run_row.result_json, '"resultStatus"[[:space:]]*:[[:space:]]*"([^"]+)"'))[1], 'unknown'),
+                data_kind = COALESCE((regexp_match(run_row.result_json, '"dataProvenance"[[:space:]]*:[[:space:]]*[{][^}]*"kind"[[:space:]]*:[[:space:]]*"([^"]+)"'))[1], 'unknown'),
+                benchmark_total_return = ((regexp_match(run_row.result_json, '"benchmarkTotalReturn"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION,
+                summary_backfilled = TRUE
+            WHERE id = run_row.id;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE qd_backtest_runs
+            SET result_status = 'unknown', data_kind = 'unknown', summary_backfilled = TRUE
+            WHERE id = run_row.id;
+        END;
+    END LOOP;
+END $$;
+
+-- Historical backtests used to duplicate several large time-series arrays in
+-- result_json. Keep the authoritative detail tables and scalar summaries, then
+-- release the monolithic payload. Legacy rows stay marked non-compacted so the
+-- service hydrates their bounded trades/equity detail tables on demand.
+DO $$
+DECLARE
+    run_row RECORD;
+BEGIN
+    FOR run_row IN
+        SELECT id, result_json
+        FROM qd_backtest_runs
+        WHERE result_compacted = FALSE AND result_json IS NOT NULL AND result_json <> '{}'
+    LOOP
+        BEGIN
+            UPDATE qd_backtest_runs
+            SET max_drawdown = COALESCE(
+                    max_drawdown,
+                    ((regexp_match(run_row.result_json, '"maxDrawdown"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION
+                ),
+                sharpe_ratio = COALESCE(
+                    sharpe_ratio,
+                    ((regexp_match(run_row.result_json, '"sharpeRatio"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION
+                ),
+                result_json = '{}'
+            WHERE id = run_row.id;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE qd_backtest_runs SET result_json = '{}' WHERE id = run_row.id;
+        END;
+    END LOOP;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_user_id ON qd_backtest_runs(user_id);
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy_id ON qd_backtest_runs(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_source_id ON qd_backtest_runs(source_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_user_recent ON qd_backtest_runs(user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_user_source_recent ON qd_backtest_runs(user_id, source_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS qd_backtest_trades (
     id SERIAL PRIMARY KEY,
@@ -1402,15 +1518,54 @@ CREATE TABLE IF NOT EXISTS qd_factor_research_runs (
     manifest_json TEXT NOT NULL DEFAULT '{}',
     code_hash VARCHAR(128) DEFAULT '',
     result_json TEXT NOT NULL DEFAULT '{}',
+    rank_ic DOUBLE PRECISION,
+    icir DOUBLE PRECISION,
+    coverage DOUBLE PRECISION,
+    net_long_short_return DOUBLE PRECISION,
+    observation_count INTEGER,
+    summary_backfilled BOOLEAN NOT NULL DEFAULT TRUE,
     status VARCHAR(20) DEFAULT 'success',
     error_message TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+ALTER TABLE qd_factor_research_runs ADD COLUMN IF NOT EXISTS rank_ic DOUBLE PRECISION;
+ALTER TABLE qd_factor_research_runs ADD COLUMN IF NOT EXISTS icir DOUBLE PRECISION;
+ALTER TABLE qd_factor_research_runs ADD COLUMN IF NOT EXISTS coverage DOUBLE PRECISION;
+ALTER TABLE qd_factor_research_runs ADD COLUMN IF NOT EXISTS net_long_short_return DOUBLE PRECISION;
+ALTER TABLE qd_factor_research_runs ADD COLUMN IF NOT EXISTS observation_count INTEGER;
+ALTER TABLE qd_factor_research_runs ADD COLUMN IF NOT EXISTS summary_backfilled BOOLEAN NOT NULL DEFAULT FALSE;
+
+DO $$
+DECLARE
+    run_row RECORD;
+BEGIN
+    FOR run_row IN
+        SELECT id, result_json
+        FROM qd_factor_research_runs
+        WHERE summary_backfilled = FALSE
+    LOOP
+        BEGIN
+            UPDATE qd_factor_research_runs
+            SET rank_ic = ((regexp_match(run_row.result_json, '"rankIc"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION,
+                icir = ((regexp_match(run_row.result_json, '"icir"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION,
+                coverage = ((regexp_match(run_row.result_json, '"coverage"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION,
+                net_long_short_return = ((regexp_match(run_row.result_json, '"netLongShortReturn"[[:space:]]*:[[:space:]]*(-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)'))[1])::DOUBLE PRECISION,
+                observation_count = 0,
+                summary_backfilled = TRUE
+            WHERE id = run_row.id;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE qd_factor_research_runs SET observation_count = 0, summary_backfilled = TRUE WHERE id = run_row.id;
+        END;
+    END LOOP;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_factor_research_runs_user_id
   ON qd_factor_research_runs(user_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_factor_research_runs_source_id
   ON qd_factor_research_runs(source_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_factor_research_runs_user_source_recent
+  ON qd_factor_research_runs(user_id, source_id, id DESC);
 
 -- =============================================================================
 -- 13. Exchange Credentials

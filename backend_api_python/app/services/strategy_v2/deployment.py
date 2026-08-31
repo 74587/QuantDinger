@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from app.services.script_source import get_script_source_service
+from app.services.live_trading.capabilities import supported_crypto_exchange_ids
 from app.services.strategy_direction import (
     direction_mode_position_side,
     normalize_direction_mode,
@@ -278,7 +279,7 @@ class StrategyV2DeploymentService:
         if len(market_set) != 1:
             raise StrategyV2ContractError("strategyV2.mixedMarketLiveUnsupported")
         market = next(iter(market_set), "")
-        if market == "Crypto" and exchange_id not in {"binance", "bitget", "bybit", "okx", "gate", "htx"}:
+        if market == "Crypto" and exchange_id not in supported_crypto_exchange_ids():
             raise StrategyV2ContractError("strategyV2.cryptoCredentialRequired")
         if market == "USStock" and exchange_id not in {"alpaca", "ibkr"}:
             raise StrategyV2ContractError("strategyV2.stockCredentialRequired")

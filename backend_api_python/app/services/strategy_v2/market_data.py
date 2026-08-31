@@ -43,6 +43,28 @@ def _normalize_utc_datetime(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _covers_crypto_window(
+    frame: pd.DataFrame,
+    requested_start: pd.Timestamp,
+    requested_end: pd.Timestamp,
+    timeframe_seconds: int,
+) -> bool:
+    """Crypto trades continuously, so a historical frame must cover both endpoints."""
+    if frame is None or frame.empty:
+        return False
+    tolerance = pd.Timedelta(seconds=max(1, timeframe_seconds) * 3)
+    expected_rows = max(
+        1,
+        int((requested_end - requested_start).total_seconds() / max(1, timeframe_seconds)) + 1,
+    )
+    coverage_ratio = len(frame) / expected_rows
+    return bool(
+        frame.index.min() <= requested_start + tolerance
+        and frame.index.max() >= requested_end - tolerance
+        and coverage_ratio >= 0.98
+    )
+
+
 def load_strategy_frame(
     market: str,
     symbol: str,
@@ -71,9 +93,28 @@ def load_strategy_frame(
         start_utc.isoformat(),
         end_utc.isoformat(),
     ))
+    requested_start = pd.Timestamp(start_utc).tz_localize(None)
+    requested_end = pd.Timestamp(end_utc).tz_localize(None)
+    closed_bar_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=timeframe_seconds)
+    coverage_end = min(requested_end, pd.Timestamp(closed_bar_cutoff))
     cached = _cache.get(cache_key)
     if cached is not None and not cached.empty:
-        return cached.copy()
+        if str(market or "").strip().lower() != "crypto" or _covers_crypto_window(
+            cached,
+            requested_start,
+            coverage_end,
+            timeframe_seconds,
+        ):
+            return cached.copy()
+        logger.warning(
+            "Ignored incomplete cached crypto history for %s %s: requested=%s~%s, actual=%s~%s",
+            symbol,
+            timeframe,
+            requested_start,
+            coverage_end,
+            cached.index.min(),
+            cached.index.max(),
+        )
     try:
         kwargs = {
             "market": market,
@@ -127,14 +168,26 @@ def load_strategy_frame(
         if column not in frame.columns:
             frame[column] = 0.0
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    requested_start = pd.Timestamp(start_utc).tz_localize(None)
-    requested_end = pd.Timestamp(end_utc).tz_localize(None)
     frame = frame[(frame.index >= requested_start) & (frame.index <= requested_end)].dropna(
         subset=["open", "high", "low", "close"]
     )
-    closed_bar_cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=timeframe_seconds)
     if requested_end >= closed_bar_cutoff:
         frame = frame[frame.index <= pd.Timestamp(closed_bar_cutoff)]
+    if (
+        str(market or "").strip().lower() == "crypto"
+        and not _covers_crypto_window(frame, requested_start, coverage_end, timeframe_seconds)
+    ):
+        if not frame.empty:
+            logger.error(
+                "Rejected incomplete crypto history for %s %s: requested=%s~%s, actual=%s~%s",
+                symbol,
+                timeframe,
+                requested_start,
+                coverage_end,
+                frame.index.min(),
+                frame.index.max(),
+            )
+        return pd.DataFrame()
     if not frame.empty:
         _cache.put(cache_key, frame, timeframe)
     return frame.copy()

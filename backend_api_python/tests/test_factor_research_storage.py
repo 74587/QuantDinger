@@ -25,3 +25,19 @@ def test_factor_research_history_hydrates_summary_and_full_result():
     assert "result" not in summary
     assert detail["manifest"]["strategyType"] == "portfolio"
     assert detail["result"] == result
+
+
+def test_factor_research_persisted_summary_does_not_require_result_json():
+    summary = FactorResearchRepository._hydrate_summary({
+        "id": 8,
+        "manifest_json": json.dumps({"strategyType": "portfolio"}),
+        "rank_ic": 0.2,
+        "icir": 1.8,
+        "coverage": 0.91,
+        "net_long_short_return": 0.07,
+        "observation_count": 20,
+    })
+
+    assert summary["rank_ic"] == 0.2
+    assert summary["observation_count"] == 20
+    assert "result" not in summary

@@ -13,7 +13,11 @@ from app.services.strategy_ai_generation import (
     validate_generated_strategy,
 )
 from app.services.strategy_v2 import StrategyV2ContractError
-from app.routes.strategy import STRATEGY_CANDIDATE_MESSAGE_KEY, _strategy_ai_text
+from app.routes.strategy import (
+    STRATEGY_CANDIDATE_MESSAGE_KEY,
+    _strategy_ai_billing_feature,
+    _strategy_ai_text,
+)
 from app.services.strategy_ai_workspace import (
     RECENT_MESSAGE_LIMIT,
     WORKSPACE_MESSAGE_LIMIT,
@@ -217,6 +221,11 @@ def test_strategy_candidate_status_message_follows_interface_language():
     assert _strategy_ai_text(STRATEGY_CANDIDATE_MESSAGE_KEY, "en-US") == (
         "Candidate generated and validated against the current Strategy API V2 workspace contract."
     )
+
+
+def test_strategy_ai_billing_matches_indicator_ai_tariff():
+    assert _strategy_ai_billing_feature("discussion") == "ai_copilot_chat"
+    assert _strategy_ai_billing_feature("modify") == "ai_code_gen"
 
 
 def test_strategy_ide_uses_candidate_workflow_and_indicator_conversion_contract():

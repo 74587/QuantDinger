@@ -20,6 +20,18 @@ def test_existing_indicator_tables_receive_marketplace_columns_before_indexes():
     assert sql.index(source_upgrade) < sql.index(source_index)
 
 
+def test_marketplace_strategy_source_has_one_active_listing_per_author():
+    sql = MIGRATION.read_text(encoding="utf-8")
+
+    dedupe = "WITH ranked_script_listings AS"
+    unique_index = "CREATE UNIQUE INDEX IF NOT EXISTS uq_indicator_codes_active_script_source"
+    assert dedupe in sql
+    assert unique_index in sql
+    assert sql.index(dedupe) < sql.index(unique_index)
+    assert "PARTITION BY user_id, source_script_source_id" in sql
+    assert "publish_to_community = 1" in sql
+
+
 def test_author_published_surfaces_database_errors(monkeypatch):
     def fail_connection():
         raise RuntimeError("schema mismatch")
