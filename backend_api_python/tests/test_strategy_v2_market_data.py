@@ -1,8 +1,18 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import time
 
 import pandas as pd
+import pytest
 
 from app.services.strategy_v2 import market_data
+
+
+@pytest.fixture(autouse=True)
+def _clear_shared_frame_cache():
+    market_data.clear_shared_strategy_frame_cache()
+    yield
+    market_data.clear_shared_strategy_frame_cache()
 
 
 def test_market_data_normalizes_numeric_time_series_and_lowercase_timeframe(monkeypatch):
@@ -165,3 +175,55 @@ def test_crypto_market_data_ignores_partial_cached_window(monkeypatch):
 
     assert calls == [True]
     assert frame.index.min() == pd.Timestamp("2026-07-01")
+
+
+def test_shared_market_data_collapses_concurrent_identical_fetches(monkeypatch):
+    calls = []
+
+    def load(*_args, **_kwargs):
+        calls.append(True)
+        time.sleep(0.05)
+        index = pd.date_range("2026-08-01 00:00", periods=11, freq="1min")
+        return pd.DataFrame({"close": range(len(index))}, index=index)
+
+    monkeypatch.setattr(market_data, "_load_strategy_frame_uncached", load)
+    args = (
+        "Crypto",
+        "BTC/USDT",
+        "1m",
+        datetime(2026, 8, 1, tzinfo=timezone.utc),
+        datetime(2026, 8, 1, 0, 10, tzinfo=timezone.utc),
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        frames = list(pool.map(lambda _index: market_data.load_strategy_frame(*args), range(4)))
+
+    assert len(calls) == 1
+    assert all(len(frame) == 11 for frame in frames)
+
+
+def test_shared_market_data_extends_only_uncovered_tail(monkeypatch):
+    windows = []
+
+    def load(_market, _symbol, _timeframe, start_date, end_date, **_kwargs):
+        windows.append((start_date, end_date))
+        index = pd.date_range(
+            pd.Timestamp(start_date).tz_localize(None),
+            pd.Timestamp(end_date).tz_localize(None),
+            freq="1min",
+        )
+        return pd.DataFrame({"close": range(len(index))}, index=index)
+
+    monkeypatch.setattr(market_data, "_load_strategy_frame_uncached", load)
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    market_data.load_strategy_frame(
+        "Crypto", "ETH/USDT", "1m", start, start + timedelta(minutes=10)
+    )
+    extended = market_data.load_strategy_frame(
+        "Crypto", "ETH/USDT", "1m", start, start + timedelta(minutes=11)
+    )
+
+    assert len(windows) == 2
+    assert windows[1][0] >= start + timedelta(minutes=8)
+    assert windows[1][0] > start
+    assert extended.index.is_unique
+    assert extended.index.max() == pd.Timestamp("2026-08-01 00:11")

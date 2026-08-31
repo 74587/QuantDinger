@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import pandas as pd
@@ -24,6 +24,15 @@ def live_history_days(frequency: str, warmup_bars: int) -> int:
     bars = max(10, max(1, int(warmup_bars or 0)) * 3)
     seconds = frequency_seconds(frequency) * bars
     return max(1, int(math.ceil(seconds / 86_400)))
+
+
+def completed_bar_token(frequency: str, now: datetime | None = None) -> int:
+    """Return a stable token for the latest fully completed UTC candle."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    seconds = max(1, frequency_seconds(frequency))
+    return int(current.timestamp()) // seconds - 1
 
 
 def load_live_frequency_frames(
@@ -100,4 +109,4 @@ def load_live_frequency_frames(
     return bundles
 
 
-__all__ = ["live_history_days", "load_live_frequency_frames"]
+__all__ = ["completed_bar_token", "live_history_days", "load_live_frequency_frames"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict
 
 from app.utils.db import get_db_connection
@@ -18,6 +19,9 @@ class RuntimeStateStore:
         self.strategy_id = int(strategy_id or 0)
         self.strategy_run_id = int(strategy_run_id or 0)
         self.state_key = str(state_key or "script")
+        self._last_serialized = ""
+        self._last_saved_at = 0.0
+        self._pending: Dict[str, Any] | None = None
 
     def load(self) -> Dict[str, Any]:
         if self.strategy_id <= 0:
@@ -45,13 +49,42 @@ class RuntimeStateStore:
             logger.debug("runtime state load skipped: %s", exc)
         return {}
 
-    def save(self, values: Dict[str, Any]) -> None:
+    def save(
+        self,
+        values: Dict[str, Any],
+        *,
+        min_interval_seconds: float = 0.0,
+        force: bool = False,
+    ) -> bool:
         if self.strategy_id <= 0:
-            return
+            return False
         try:
             safe = json.loads(json.dumps(values or {}, default=str))
         except Exception:
             safe = {}
+        serialized = json.dumps(safe, ensure_ascii=False, sort_keys=True)
+        now = time.monotonic()
+        if not force and serialized == self._last_serialized:
+            self._pending = None
+            return False
+        if (
+            not force
+            and self._last_saved_at > 0
+            and now - self._last_saved_at < max(0.0, float(min_interval_seconds or 0.0))
+        ):
+            self._pending = safe
+            return False
+        return self._write(safe, serialized=serialized, saved_at=now)
+
+    def flush(self) -> bool:
+        """Persist the newest coalesced snapshot before a runtime exits."""
+        if self._pending is None:
+            return False
+        safe = self._pending
+        serialized = json.dumps(safe, ensure_ascii=False, sort_keys=True)
+        return self._write(safe, serialized=serialized, saved_at=time.monotonic())
+
+    def _write(self, safe: Dict[str, Any], *, serialized: str, saved_at: float) -> bool:
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -70,12 +103,17 @@ class RuntimeStateStore:
                         self.strategy_run_id,
                         self.strategy_id,
                         self.state_key,
-                        json.dumps(safe, ensure_ascii=False),
+                        serialized,
                     ),
                 )
                 db.commit()
                 cur.close()
+            self._last_serialized = serialized
+            self._last_saved_at = saved_at
+            self._pending = None
+            return True
         except Exception as exc:
+            self._pending = safe
             logger.warning(
                 "Runtime state persistence failed: strategy=%s run=%s key=%s",
                 self.strategy_id,
@@ -83,6 +121,7 @@ class RuntimeStateStore:
                 self.state_key,
                 exc_info=True,
             )
+            return False
 
 
 class RuntimeStateProxy:

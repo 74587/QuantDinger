@@ -381,6 +381,7 @@ class DataSourceFactory:
                 str(e),
             )
             return {'last': 0, 'symbol': symbol}
+
         except NotImplementedError:
             cls._log_limited(
                 "warning",
@@ -401,3 +402,47 @@ class DataSourceFactory:
                 str(e),
             )
             return {'last': 0, 'symbol': symbol}
+
+    @classmethod
+    def get_tickers(
+        cls,
+        market: str,
+        symbols: List[str],
+        exchange_id: Optional[str] = None,
+        market_type: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Fetch a quote batch through the market's shared coordinator."""
+        normalized_symbols = list(dict.fromkeys(
+            str(symbol or "").strip()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        ))
+        if not normalized_symbols:
+            return {}
+        m = cls.normalize_market(market or "")
+        try:
+            source = cls._resolve_source(
+                m,
+                exchange_id=exchange_id,
+                market_type=market_type,
+            )
+            batch_fetch = getattr(source, "get_tickers", None)
+            if callable(batch_fetch):
+                return dict(batch_fetch(normalized_symbols) or {})
+        except Exception as exc:
+            cls._log_limited(
+                "warning",
+                f"ticker-batch:{m}:{type(exc).__name__}:{str(exc)[:160]}",
+                "Batch ticker fetch failed for %s: %s",
+                m,
+                exc,
+            )
+        return {
+            symbol: cls.get_ticker(
+                m,
+                symbol,
+                exchange_id=exchange_id,
+                market_type=market_type,
+            )
+            for symbol in normalized_symbols
+        }

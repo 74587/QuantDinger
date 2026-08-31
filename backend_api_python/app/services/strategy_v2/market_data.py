@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -15,6 +17,19 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 _cache = KlineCache()
+
+
+@dataclass
+class _SharedFrameEntry:
+    frame: pd.DataFrame
+    coverage_start: pd.Timestamp
+    coverage_end: pd.Timestamp
+
+
+_shared_frames: dict[str, _SharedFrameEntry] = {}
+_shared_frame_locks: dict[str, threading.RLock] = {}
+_shared_frames_lock = threading.RLock()
+_SHARED_FRAME_CACHE_MAX_SIZE = 256
 
 TIMEFRAME_SECONDS = {
     "1m": 60,
@@ -65,7 +80,7 @@ def _covers_crypto_window(
     )
 
 
-def load_strategy_frame(
+def _load_strategy_frame_uncached(
     market: str,
     symbol: str,
     timeframe: str,
@@ -191,3 +206,153 @@ def load_strategy_frame(
     if not frame.empty:
         _cache.put(cache_key, frame, timeframe)
     return frame.copy()
+
+
+def _shared_frame_key(
+    market: str,
+    symbol: str,
+    timeframe: str,
+    market_type: Optional[str],
+    exchange_id: Optional[str],
+) -> str:
+    """Return the process-wide identity for one canonical candle stream."""
+    return ":".join((
+        str(exchange_id or "default").strip().lower(),
+        str(market or "").strip().lower(),
+        str(market_type or "default").strip().lower(),
+        str(symbol or "").strip().upper(),
+        str(timeframe or "1d").strip().lower(),
+    ))
+
+
+def _lock_for_shared_frame(key: str) -> threading.RLock:
+    with _shared_frames_lock:
+        lock = _shared_frame_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _shared_frame_locks[key] = lock
+        return lock
+
+
+def _merge_frames(current: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    if current is None or current.empty:
+        return incoming.copy()
+    if incoming is None or incoming.empty:
+        return current.copy()
+    merged = pd.concat([current, incoming]).sort_index()
+    return merged[~merged.index.duplicated(keep="last")]
+
+
+def _evict_shared_frame_if_needed() -> None:
+    with _shared_frames_lock:
+        while len(_shared_frames) > _SHARED_FRAME_CACHE_MAX_SIZE:
+            oldest_key = min(
+                _shared_frames,
+                key=lambda item: _shared_frames[item].coverage_end,
+            )
+            _shared_frames.pop(oldest_key, None)
+
+
+def clear_shared_strategy_frame_cache() -> None:
+    """Clear process-local candle state. Intended for tests and controlled reloads."""
+    with _shared_frames_lock:
+        _shared_frames.clear()
+        _shared_frame_locks.clear()
+
+
+def load_strategy_frame(
+    market: str,
+    symbol: str,
+    timeframe: str,
+    start_date: datetime,
+    end_date: datetime,
+    *,
+    market_type: Optional[str] = None,
+    exchange_id: Optional[str] = None,
+) -> pd.DataFrame:
+    """Load candles through a process-wide, incremental singleflight cache.
+
+    The first caller warms the complete requested window. Later callers sharing
+    exchange/market/symbol/timeframe reuse that frame and only request uncovered
+    edges. The per-stream lock makes concurrent warmups and increments collapse
+    into one upstream request.
+    """
+    start_utc = _normalize_utc_datetime(start_date)
+    end_utc = _normalize_utc_datetime(end_date)
+    normalized_timeframe = str(timeframe or "1d").strip().lower()
+    timeframe_seconds = TIMEFRAME_SECONDS.get(normalized_timeframe, 86400)
+    requested_start = pd.Timestamp(start_utc).tz_localize(None)
+    requested_end = pd.Timestamp(end_utc).tz_localize(None)
+    closed_cutoff = pd.Timestamp(
+        datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(seconds=timeframe_seconds)
+    )
+    coverage_end = min(requested_end, closed_cutoff)
+    key = _shared_frame_key(market, symbol, timeframe, market_type, exchange_id)
+
+    with _lock_for_shared_frame(key):
+        entry = _shared_frames.get(key)
+        if (
+            entry is not None
+            and requested_start >= entry.coverage_start
+            and coverage_end <= entry.coverage_end
+        ):
+            return entry.frame[
+                (entry.frame.index >= requested_start)
+                & (entry.frame.index <= coverage_end)
+            ].copy()
+
+        fetch_windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        if entry is None:
+            fetch_windows.append((requested_start, requested_end))
+        else:
+            overlap = pd.Timedelta(seconds=timeframe_seconds * 2)
+            if requested_start < entry.coverage_start:
+                fetch_windows.append((requested_start, entry.coverage_start + overlap))
+            if coverage_end > entry.coverage_end:
+                fetch_windows.append((
+                    max(requested_start, entry.coverage_end - overlap),
+                    requested_end,
+                ))
+
+        merged = entry.frame.copy() if entry is not None else pd.DataFrame()
+        successful_windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        for window_start, window_end in fetch_windows:
+            incoming = _load_strategy_frame_uncached(
+                market,
+                symbol,
+                timeframe,
+                window_start.to_pydatetime().replace(tzinfo=timezone.utc),
+                window_end.to_pydatetime().replace(tzinfo=timezone.utc),
+                market_type=market_type,
+                exchange_id=exchange_id,
+            )
+            if incoming is not None and not incoming.empty:
+                merged = _merge_frames(merged, incoming)
+                successful_windows.append((window_start, min(window_end, coverage_end)))
+
+        if merged.empty:
+            return pd.DataFrame()
+
+        new_start = entry.coverage_start if entry is not None else requested_start
+        new_end = entry.coverage_end if entry is not None else coverage_end
+        for window_start, window_end in successful_windows:
+            new_start = min(new_start, window_start)
+            new_end = max(new_end, window_end)
+        _shared_frames[key] = _SharedFrameEntry(
+            frame=merged,
+            coverage_start=new_start,
+            coverage_end=new_end,
+        )
+        _evict_shared_frame_if_needed()
+        return merged[
+            (merged.index >= requested_start)
+            & (merged.index <= coverage_end)
+        ].copy()
+
+
+__all__ = [
+    "TIMEFRAME_SECONDS",
+    "clear_shared_strategy_frame_cache",
+    "load_strategy_frame",
+]

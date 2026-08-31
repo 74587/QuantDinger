@@ -2,10 +2,14 @@
 美股数据源
 使用 yfinance 和 finnhub 获取数据
 """
+import os
+import threading
+import time
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 
 import yfinance as yf
+import pandas as pd
 import requests
 
 from app.data_sources.base import BaseDataSource
@@ -19,6 +23,15 @@ class USStockDataSource(BaseDataSource):
     """美股数据源"""
     
     name = "USStock/yfinance"
+    _quote_batch_lock = threading.RLock()
+    _quote_condition = threading.Condition(_quote_batch_lock)
+    _quote_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+    _quote_pending: set[str] = set()
+    _quote_batch_inflight = False
+    _finnhub_lock = threading.Lock()
+    _finnhub_next_request_at = 0.0
+    _finnhub_blocked_until = 0.0
+    _finnhub_failures = 0
     
     INTERVAL_MAP = {
         '1m': '1m',
@@ -96,7 +109,257 @@ class USStockDataSource(BaseDataSource):
     def _nasdaq_symbol(symbol: str) -> str:
         return (symbol or "").strip().upper().replace("$", "^")
     
+    @staticmethod
+    def _quote_cache_ttl() -> float:
+        try:
+            return max(1.0, float(os.getenv("US_STOCK_QUOTE_CACHE_TTL_SEC", "15")))
+        except (TypeError, ValueError):
+            return 15.0
+
+    @staticmethod
+    def _finnhub_min_interval() -> float:
+        try:
+            return max(0.0, float(os.getenv("FINNHUB_QUOTE_MIN_INTERVAL_SEC", "1.05")))
+        except (TypeError, ValueError):
+            return 1.05
+
+    @staticmethod
+    def _finnhub_rate_limit_backoff() -> float:
+        try:
+            return max(5.0, float(os.getenv("FINNHUB_429_BACKOFF_SEC", "60")))
+        except (TypeError, ValueError):
+            return 60.0
+
+    @classmethod
+    def clear_quote_cache(cls) -> None:
+        with cls._quote_condition:
+            cls._quote_cache.clear()
+            cls._quote_pending.clear()
+            cls._quote_batch_inflight = False
+            cls._quote_condition.notify_all()
+        with cls._finnhub_lock:
+            cls._finnhub_next_request_at = 0.0
+            cls._finnhub_blocked_until = 0.0
+            cls._finnhub_failures = 0
+
+    def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Coalesce concurrent requests into one cache/rate-limited quote batch."""
+        normalized = list(dict.fromkeys(
+            str(symbol or "").strip().upper()
+            for symbol in symbols
+            if str(symbol or "").strip()
+        ))
+        if not normalized:
+            return {}
+
+        is_leader = False
+        deadline = time.monotonic() + 45.0
+        while True:
+            with self._quote_condition:
+                now = time.monotonic()
+                output = {
+                    symbol: dict(cached[1])
+                    for symbol in normalized
+                    if (cached := self._quote_cache.get(symbol)) and cached[0] > now
+                }
+                missing = [symbol for symbol in normalized if symbol not in output]
+                if not missing:
+                    return output
+                self._quote_pending.update(missing)
+                if not self._quote_batch_inflight:
+                    self.__class__._quote_batch_inflight = True
+                    is_leader = True
+                    break
+                remaining = deadline - now
+                if remaining <= 0:
+                    return {
+                        **output,
+                        **{
+                            symbol: {"last": 0, "symbol": symbol}
+                            for symbol in missing
+                        },
+                    }
+                self._quote_condition.wait(timeout=min(remaining, 5.0))
+
+        if is_leader:
+            # Allow requests from sibling strategy threads to join this batch.
+            try:
+                batch_window = max(
+                    0.0,
+                    min(
+                        0.25,
+                        float(os.getenv("US_STOCK_QUOTE_BATCH_WINDOW_MS", "50")) / 1000.0,
+                    ),
+                )
+            except (TypeError, ValueError):
+                batch_window = 0.05
+            if batch_window:
+                time.sleep(batch_window)
+            with self._quote_condition:
+                batch_symbols = sorted(self._quote_pending)
+                self._quote_pending.clear()
+            try:
+                fresh_quotes = (
+                    self._fetch_yfinance_batch_quotes(batch_symbols)
+                    if len(batch_symbols) > 1
+                    else {}
+                )
+                for symbol in batch_symbols:
+                    if symbol not in fresh_quotes:
+                        fresh_quotes[symbol] = self._fetch_ticker(symbol)
+            except Exception as exc:
+                logger.warning("US stock quote batch failed: %s", exc)
+                fresh_quotes = {
+                    symbol: {"last": 0, "symbol": symbol}
+                    for symbol in batch_symbols
+                }
+            finally:
+                with self._quote_condition:
+                    success_expiry = time.monotonic() + self._quote_cache_ttl()
+                    failure_expiry = time.monotonic() + 2.0
+                    for symbol in batch_symbols:
+                        quote = dict(fresh_quotes.get(symbol) or {})
+                        quote.setdefault("symbol", symbol)
+                        expires_at = (
+                            success_expiry
+                            if float(quote.get("last") or 0.0) > 0
+                            else failure_expiry
+                        )
+                        self._quote_cache[symbol] = (expires_at, quote)
+                    self.__class__._quote_batch_inflight = False
+                    self._quote_condition.notify_all()
+
+        with self._quote_condition:
+            now = time.monotonic()
+            return {
+                symbol: dict(cached[1])
+                for symbol in normalized
+                if (cached := self._quote_cache.get(symbol)) and cached[0] > now
+            }
+
+    def _fetch_yfinance_batch_quotes(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch the latest minute for several US symbols through one batch API."""
+        if not symbols:
+            return {}
+        yahoo_to_source = {
+            self._yahoo_symbol(symbol): symbol
+            for symbol in symbols
+        }
+        try:
+            frame = yf.download(
+                list(yahoo_to_source),
+                period="2d",
+                interval="1m",
+                group_by="ticker",
+                auto_adjust=False,
+                prepost=True,
+                progress=False,
+                threads=True,
+                timeout=8,
+            )
+        except Exception as exc:
+            logger.debug("yfinance batch quote failed; using provider fallbacks: %s", exc)
+            return {}
+        if frame is None or frame.empty:
+            return {}
+        output: Dict[str, Dict[str, Any]] = {}
+        for yahoo_symbol, source_symbol in yahoo_to_source.items():
+            try:
+                quote_frame = frame[yahoo_symbol]
+                closes = quote_frame["Close"].dropna()
+            except (KeyError, TypeError):
+                continue
+            if closes.empty:
+                continue
+            session_dates = pd.Index(closes.index.date)
+            latest_session = session_dates[-1]
+            latest_mask = session_dates == latest_session
+            latest_closes = closes[latest_mask]
+            latest_frame = quote_frame.loc[latest_closes.index]
+            prior_closes = closes[~latest_mask]
+            last = float(latest_closes.iloc[-1])
+            previous_close = (
+                float(prior_closes.iloc[-1])
+                if not prior_closes.empty
+                else 0.0
+            )
+            opens = latest_frame["Open"].dropna()
+            highs = latest_frame["High"].dropna()
+            lows = latest_frame["Low"].dropna()
+            open_price = float(opens.iloc[0]) if not opens.empty else last
+            change = last - previous_close if previous_close else 0.0
+            output[source_symbol] = {
+                "last": last,
+                "change": change,
+                "changePercent": (
+                    change / previous_close * 100.0
+                    if previous_close
+                    else 0.0
+                ),
+                "high": float(highs.max()) if not highs.empty else last,
+                "low": float(lows.min()) if not lows.empty else last,
+                "open": open_price,
+                "previousClose": previous_close,
+            }
+        return output
+
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
+        normalized = str(symbol or "").strip().upper()
+        return self.get_tickers([normalized]).get(
+            normalized,
+            {"last": 0, "symbol": normalized},
+        )
+
+    def _fetch_finnhub_quote(self, symbol: str) -> Dict[str, Any]:
+        if not self.finnhub_client:
+            return {}
+        with self._finnhub_lock:
+            now = time.monotonic()
+            if now < self._finnhub_blocked_until:
+                return {}
+            wait_seconds = self._finnhub_next_request_at - now
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self.__class__._finnhub_next_request_at = (
+                time.monotonic() + self._finnhub_min_interval()
+            )
+            try:
+                quote = self.finnhub_client.quote(symbol)
+                if quote and quote.get("c"):
+                    self.__class__._finnhub_failures = 0
+                    return quote
+            except Exception as exc:
+                detail = str(exc).lower()
+                is_rate_limited = "429" in detail or "rate limit" in detail
+                no_access = (
+                    "403" in detail
+                    or "don't have access" in detail
+                    or "no access" in detail
+                )
+                self.__class__._finnhub_failures += 1
+                if is_rate_limited:
+                    delay = self._finnhub_rate_limit_backoff()
+                elif no_access:
+                    delay = 300.0
+                else:
+                    delay = min(60.0, float(2 ** min(self._finnhub_failures, 6)))
+                self.__class__._finnhub_blocked_until = time.monotonic() + delay
+                if is_rate_limited:
+                    logger.warning(
+                        "Finnhub quote rate limited; pausing all quote requests for %.0fs",
+                        delay,
+                    )
+                elif no_access:
+                    logger.debug("Finnhub quote skipped (no access): %s: %s", symbol, exc)
+                else:
+                    logger.warning(
+                        "Finnhub quote failed; shared retry backoff %.0fs: %s",
+                        delay,
+                        exc,
+                    )
+        return {}
+
+    def _fetch_ticker(self, symbol: str) -> Dict[str, Any]:
         """
         获取美股实时报价
         
@@ -115,25 +378,17 @@ class USStockDataSource(BaseDataSource):
         """
         symbol = (symbol or '').strip().upper()
         
-        if self.finnhub_client:
-            try:
-                quote = self.finnhub_client.quote(symbol)
-                if quote and quote.get('c'):
-                    return {
-                        'last': quote.get('c', 0),           # 当前价格
-                        'change': quote.get('d', 0),         # 涨跌额
-                        'changePercent': quote.get('dp', 0), # 涨跌幅
-                        'high': quote.get('h', 0),           # 日内最高
-                        'low': quote.get('l', 0),            # 日内最低
-                        'open': quote.get('o', 0),           # 开盘价
-                        'previousClose': quote.get('pc', 0)  # 昨收价
-                    }
-            except Exception as e:
-                msg = str(e).lower()
-                if "403" in str(e) or "don't have access" in msg or "no access" in msg:
-                    logger.debug(f"Finnhub quote skipped (no access): {symbol}: {e}")
-                else:
-                    logger.warning(f"Finnhub quote failed for {symbol}: {e}")
+        quote = self._fetch_finnhub_quote(symbol)
+        if quote:
+            return {
+                'last': quote.get('c', 0),
+                'change': quote.get('d', 0),
+                'changePercent': quote.get('dp', 0),
+                'high': quote.get('h', 0),
+                'low': quote.get('l', 0),
+                'open': quote.get('o', 0),
+                'previousClose': quote.get('pc', 0),
+            }
 
         nasdaq_quote = self._fetch_nasdaq_quote(symbol)
         if nasdaq_quote:
@@ -642,4 +897,3 @@ class USStockDataSource(BaseDataSource):
                 continue
         
         return klines
-

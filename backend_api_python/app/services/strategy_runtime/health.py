@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 from typing import Any, Dict, Iterable
 
@@ -21,6 +23,21 @@ logger = get_logger(__name__)
 # attention window instead: recurring failures refresh it, while a transient
 # exchange error clears automatically after healthy operation resumes.
 FAILED_ORDER_ATTENTION_WINDOW_SEC = 300
+_heartbeat_lock = threading.Lock()
+_heartbeat_writes: dict[tuple[int, int], tuple[float, tuple[object, ...]]] = {}
+
+
+def _heartbeat_write_interval_seconds() -> float:
+    try:
+        return max(1.0, float(os.getenv("STRATEGY_HEARTBEAT_WRITE_INTERVAL_SEC", "10")))
+    except (TypeError, ValueError):
+        return 10.0
+
+
+def reset_runtime_heartbeat_coalescer() -> None:
+    """Reset process-local heartbeat throttling (used by tests/reloads)."""
+    with _heartbeat_lock:
+        _heartbeat_writes.clear()
 
 
 def load_runtime_health(
@@ -84,8 +101,31 @@ def record_runtime_heartbeat(
         return
     from app.services.strategy_runtime.state import RuntimeStateStore
 
-    now = int(time.time())
-    RuntimeStateStore(
+    wall_now = time.time()
+    now = int(wall_now)
+    identity = (int(strategy_id), int(strategy_run_id or 0))
+    critical_signature = (
+        str(status or "healthy"),
+        str(last_error or "")[:1000],
+        str(price_source or ""),
+        str(trigger_mode or ""),
+        str(fill_transport or ""),
+    )
+    with _heartbeat_lock:
+        previous_at, previous_signature = _heartbeat_writes.get(
+            identity,
+            (0.0, ()),
+        )
+        should_write = bool(
+            previous_at <= 0
+            or wall_now - previous_at >= _heartbeat_write_interval_seconds()
+            or critical_signature != previous_signature
+        )
+        if should_write:
+            _heartbeat_writes[identity] = (wall_now, critical_signature)
+    if not should_write:
+        return
+    saved = RuntimeStateStore(
         strategy_id=int(strategy_id),
         strategy_run_id=int(strategy_run_id or 0),
         state_key="health",
@@ -103,6 +143,11 @@ def record_runtime_heartbeat(
         "trigger_mode": str(trigger_mode or ""),
         "fill_transport": str(fill_transport or ""),
     })
+    if saved is False:
+        with _heartbeat_lock:
+            if _heartbeat_writes.get(identity) == (wall_now, critical_signature):
+                _heartbeat_writes.pop(identity, None)
+        return
     # Keep a low-frequency equity mark so tomorrow's P&L can use a real
     # midnight baseline even when nobody has the monitoring page open.
     from app.services.strategy_daily_pnl import maybe_capture_strategy_equity_snapshot
