@@ -724,7 +724,7 @@ def _build_review_candle_snapshots(
     """Persist bounded OHLCV-only snapshots for fast, reproducible trade review."""
     grouped: dict[str, list[dict[str, Any]]] = {}
     for trade in trades or []:
-        symbol = str((trade or {}).get("symbol") or "")
+        symbol = _review_instrument_key((trade or {}).get("symbol"))
         if symbol and symbol in frames:
             grouped.setdefault(symbol, []).append(trade)
     snapshots: dict[str, dict[str, Any]] = {}
@@ -788,6 +788,15 @@ def _build_review_candle_snapshots(
             ],
         }
     return snapshots
+
+
+def _review_instrument_key(value: object) -> str:
+    """Map a hedged position key back to the market-data instrument key."""
+    symbol = str(value or "").strip()
+    base, separator, suffix = symbol.rpartition("::")
+    if separator and suffix.strip().lower() in {"long", "short"}:
+        return base
+    return symbol
 
 
 def _review_frequency_seconds(value: str) -> int:

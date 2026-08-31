@@ -156,6 +156,33 @@ def test_trade_review_snapshot_aggregates_month_of_minutes_and_keeps_only_ohlcv(
     assert first_time < pd.Timestamp("2026-08-01T00:00:00Z")
 
 
+def test_trade_review_snapshot_maps_hedged_position_leg_to_market_data_symbol():
+    index = pd.date_range("2026-08-20", periods=3 * 24 * 60, freq="min")
+    frame = pd.DataFrame({
+        "open": [100.0] * len(index),
+        "high": [101.0] * len(index),
+        "low": [99.0] * len(index),
+        "close": [100.5] * len(index),
+        "volume": [10.0] * len(index),
+    }, index=index)
+    symbol = "Crypto:SOL/USDT@swap"
+
+    snapshots = _build_review_candle_snapshots(
+        {symbol: frame},
+        [{
+            "symbol": f"{symbol}::long",
+            "entry_time": "2026-08-20T08:01:00Z",
+            "exit_time": "2026-08-22T12:34:00Z",
+        }],
+        source_frequency="1m",
+        start_date=datetime(2026, 8, 20),
+        end_date=datetime(2026, 8, 22, 23, 59),
+    )
+
+    assert set(snapshots) == {symbol}
+    assert snapshots[symbol]["candles"]
+
+
 def test_month_of_minutes_uses_a_complete_coarser_benchmark_frequency():
     timeframe, _rule, _seconds = _review_frequency_for_window(
         "1m",
