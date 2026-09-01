@@ -19,6 +19,12 @@ def test_okx_missing_credentials_fatal():
     assert is_fatal_exchange_error("Missing OKX api_key/secret_key/passphrase")
 
 
+def test_internal_order_adapter_signature_error_is_fatal():
+    assert is_fatal_exchange_error(
+        "make_client_order_id() got an unexpected keyword argument 'market_type'"
+    )
+
+
 def test_maybe_auto_stop_fatal():
     from unittest.mock import patch
 

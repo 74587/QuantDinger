@@ -733,6 +733,11 @@ def build_executor_strategy_payload(payload: Dict[str, Any], *, user_id: int) ->
             "source": "robot_builder",
             "executor_type": kind,
             "executor_config": executor_config,
+            # The editable-code flow persists this metadata before the live
+            # deployment wizard opens.  Keep the complete runtime contract on
+            # the source so grid bot_params and the non-grid trigger mode do
+            # not disappear when the strategy is deployed by source id.
+            "last_run_config": trading_config,
             "trigger_contract": {
                 "entry": (
                     "exchange_resting_orders"

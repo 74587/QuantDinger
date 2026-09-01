@@ -1,6 +1,21 @@
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
+
+import pytest
+
+from app.services import pending_order_worker as worker_module
 from app.services.live_trading.base import LiveTradingError
+from app.services.live_trading.binance import BinanceFuturesClient
+from app.services.live_trading.binance_spot import BinanceSpotClient
+from app.services.live_trading.bitget import BitgetMixClient
+from app.services.live_trading.bitget_spot import BitgetSpotClient
+from app.services.live_trading.bybit import BybitClient
+from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.htx import HtxClient
+from app.services.live_trading.okx import OkxClient
 from app.services.pending_orders import live_order_phases
 from app.services.pending_orders.live_order_support import (
     FillAccumulator,
@@ -22,6 +37,106 @@ def test_make_client_order_id_okx_is_compact_alphanumeric():
 
 def test_make_client_order_id_default_keeps_phase():
     assert make_client_order_id(exchange_id="bitget", strategy_id=12, order_id=34, phase="mkt") == "qd_12_34_mkt"
+
+
+def test_all_worker_client_order_id_calls_match_helper_signature():
+    """The common path runs before venue dispatch, so every call must obey the helper contract."""
+    source = textwrap.dedent(inspect.getsource(worker_module.PendingOrderWorker._execute_live_order))
+    tree = ast.parse(source)
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "make_client_order_id"
+    ]
+    supported = set(inspect.signature(make_client_order_id).parameters)
+
+    assert len(calls) == 3
+    for call in calls:
+        passed = {keyword.arg for keyword in call.keywords if keyword.arg}
+        assert passed <= supported
+
+
+def _isinstance_class_names(test):
+    for node in ast.walk(test):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "isinstance"
+            and len(node.args) == 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "client"
+        ):
+            continue
+        target = node.args[1]
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Tuple):
+            return [item.id for item in target.elts if isinstance(item, ast.Name)]
+    return []
+
+
+def test_all_crypto_order_phase_calls_match_exchange_client_signatures():
+    """Audit spot/swap limit, market, fill and cancel calls for every supported crypto venue."""
+    clients = {
+        cls.__name__: cls
+        for cls in (
+            BinanceFuturesClient,
+            BinanceSpotClient,
+            OkxClient,
+            BitgetMixClient,
+            BitgetSpotClient,
+            BybitClient,
+            GateSpotClient,
+            GateUsdtFuturesClient,
+            HtxClient,
+        )
+    }
+    helpers = (
+        live_order_phases.place_live_limit_order,
+        live_order_phases.place_live_market_order,
+        live_order_phases.wait_live_order_fill,
+        live_order_phases.cancel_live_limit_order,
+    )
+    checked = set()
+
+    for helper in helpers:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(helper)))
+        for branch in (node for node in ast.walk(tree) if isinstance(node, ast.If)):
+            class_names = _isinstance_class_names(branch.test)
+            if not class_names:
+                continue
+            calls = []
+            for statement in branch.body:
+                calls.extend(
+                    node
+                    for node in ast.walk(statement)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "client"
+                )
+            for class_name in class_names:
+                client_class = clients[class_name]
+                for call in calls:
+                    method_name = call.func.attr
+                    method = getattr(client_class, method_name)
+                    supported = set(inspect.signature(method).parameters)
+                    passed = {keyword.arg for keyword in call.keywords if keyword.arg}
+                    assert passed <= supported, (
+                        f"{helper.__name__}: {class_name}.{method_name} received unsupported "
+                        f"keywords {sorted(passed - supported)}"
+                    )
+                    checked.add((helper.__name__, class_name, method_name))
+
+    expected_dispatches = {
+        (helper.__name__, client.__name__)
+        for helper in helpers
+        for client in clients.values()
+    }
+    actual_dispatches = {(helper, client) for helper, client, _method in checked}
+    assert expected_dispatches <= actual_dispatches
 
 
 def test_signal_to_side_pos_reduce_exit_aliases():
@@ -204,6 +319,45 @@ def test_build_live_order_context_rejects_missing_symbol():
         assert "missing symbol" in exc.console_message
     else:
         raise AssertionError("expected LiveOrderRejected")
+
+
+def test_build_live_order_context_rejects_entry_after_strategy_stops():
+    with pytest.raises(LiveOrderRejected, match="strategy_not_running"):
+        build_live_order_context(
+            order_id=1,
+            order_row={"strategy_id": 9, "symbol": "SOL/USDT", "signal_type": "add_long"},
+            payload={},
+            load_strategy_configs=lambda strategy_id: {
+                "user_id": 7,
+                "status": "stopped",
+                "market_category": "Crypto",
+                "market_type": "swap",
+                "exchange_config": {"exchange_id": "binance"},
+                "trading_config": {},
+            },
+            resolve_exchange_config=lambda cfg, user_id: cfg,
+            safe_exchange_config_for_log=lambda cfg: cfg,
+        )
+
+
+def test_build_live_order_context_allows_close_after_strategy_stops():
+    ctx = build_live_order_context(
+        order_id=1,
+        order_row={"strategy_id": 9, "symbol": "SOL/USDT", "signal_type": "close_long"},
+        payload={},
+        load_strategy_configs=lambda strategy_id: {
+            "user_id": 7,
+            "status": "stopped",
+            "market_category": "Crypto",
+            "market_type": "swap",
+            "exchange_config": {"exchange_id": "binance"},
+            "trading_config": {},
+        },
+        resolve_exchange_config=lambda cfg, user_id: cfg,
+        safe_exchange_config_for_log=lambda cfg: cfg,
+    )
+
+    assert ctx.signal_type == "close_long"
 
 
 def test_build_live_order_context_rejects_policy_violation():

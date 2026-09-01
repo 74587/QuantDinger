@@ -98,7 +98,8 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
         cur = db.cursor()
         cur.execute(
             """
-            SELECT id, user_id, symbol, exchange_config, trading_config, market_type, leverage, execution_mode, market_category
+            SELECT id, user_id, symbol, exchange_config, trading_config, market_type,
+                   leverage, execution_mode, market_category, status
             FROM qd_strategies_trading
             WHERE id = %s
             """,
@@ -147,6 +148,7 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
         "leverage": leverage,
         "execution_mode": execution_mode,
         "market_category": market_category,
+        "status": str(row.get("status") or "").strip().lower(),
     }
 
 
@@ -273,5 +275,4 @@ def coalesce_exchange_config_from_payload(payload: Dict[str, Any]) -> Dict[str, 
             ex_cfg["credential_id"] = cred
 
     return ex_cfg
-
 

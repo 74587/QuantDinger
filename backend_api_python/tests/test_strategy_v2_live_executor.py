@@ -417,6 +417,85 @@ def test_live_order_is_not_submitted_when_position_leg_has_inflight_work():
     assert result is False
 
 
+def test_stopped_live_strategy_does_not_queue_remaining_callback_orders():
+    executor = TradingExecutor.__new__(TradingExecutor)
+    executor._load_strategy = lambda _strategy_id: {
+        "user_id": 12,
+        "status": "stopped",
+        "trading_config": {},
+    }
+
+    class Gateway:
+        @staticmethod
+        def submit(_request):
+            raise AssertionError("stopped strategy must not submit another order")
+
+    executor.order_gateway = Gateway()
+
+    result = executor._execute_signal(
+        strategy_id=7,
+        strategy_run_id=42,
+        symbol="SOL/USDT",
+        signal_type="add_long",
+        script_base_qty=0.22,
+        current_price=103.0,
+        market_type="swap",
+        execution_mode="live",
+        leverage=3.0,
+        initial_capital=1_000.0,
+        signal_ts=5,
+    )
+
+    assert result is False
+
+
+def test_limit_queue_log_identifies_grid_level_order(monkeypatch):
+    executor = TradingExecutor.__new__(TradingExecutor)
+    executor._load_strategy = lambda _strategy_id: {
+        "user_id": 12,
+        "status": "running",
+        "trading_config": {},
+    }
+    logs = []
+    monkeypatch.setattr(
+        trading_executor,
+        "append_strategy_log",
+        lambda *args: logs.append(args),
+    )
+
+    class Gateway:
+        @staticmethod
+        def submit(_request):
+            return 81
+
+    executor.order_gateway = Gateway()
+
+    result = executor._execute_signal(
+        strategy_id=7,
+        strategy_run_id=42,
+        symbol="SOL/USDT",
+        signal_type="add_long",
+        script_base_qty=0.22,
+        current_price=103.0,
+        market_type="swap",
+        execution_mode="live",
+        leverage=3.0,
+        initial_capital=1_000.0,
+        signal_ts=5,
+        order_type="limit",
+        execution_algo="limit",
+        limit_price=98.7654321,
+        client_order_id="grid-58-long-entry-1",
+    )
+
+    assert result is True
+    assert logs
+    message = logs[-1][2]
+    assert "pending_id=81" in message
+    assert "limit_price=98.7654321" in message
+    assert "client_order_id=grid-58-long-entry-1" in message
+
+
 def test_demo_account_price_overrides_public_market_price(monkeypatch):
     from app.services.live_trading import factory
 
@@ -457,9 +536,10 @@ def test_live_frame_latest_completed_bar_is_not_overwritten_by_execution_price()
     ]
 
 
-def test_live_loop_does_not_use_realtime_price_hook_for_strategy_orders():
+def test_live_loop_uses_realtime_price_hook_for_realtime_robot_templates():
     source = inspect.getsource(TradingExecutor._run_strategy_loop)
 
-    assert ".evaluate_price_tick(" not in source
+    assert ".evaluate_price_tick(" in source
+    assert 'bot_type in {"martingale", "layered_martingale"}' in source
     assert ".evaluate_equity_risk(" in source
     assert ".evaluate_protections(" in source

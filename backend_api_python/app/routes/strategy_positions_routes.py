@@ -233,6 +233,7 @@ def get_positions():
             try:
                 from app.services.exchange_execution import resolve_exchange_config
                 from app.services.live_trading.account_positions import (
+                    filter_position_rows_by_symbols,
                     list_account_positions,
                     list_strategy_allocations_for_account,
                     reconcile_strategy_vs_account,
@@ -267,11 +268,7 @@ def get_positions():
                     credential_id=cred_id if cred_id > 0 else None,
                     market_type=market_type,
                 )
-                if allowed:
-                    account_rows = [
-                        r for r in account_rows
-                        if normalize_strategy_symbol(str(r.get("symbol") or "")).upper() in allowed_upper
-                    ]
+                account_rows = filter_position_rows_by_symbols(account_rows, allowed)
                 allocated_rows = list_strategy_allocations_for_account(
                     user_id=int(user_id),
                     credential_id=cred_id,
@@ -288,6 +285,7 @@ def get_positions():
                     credential_id=cred_id,
                     market_type=market_type,
                 )
+                protected_rows = filter_position_rows_by_symbols(protected_rows, allowed)
                 account_reconciliation = reconcile_strategy_vs_account(
                     out,
                     account_rows,

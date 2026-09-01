@@ -233,6 +233,26 @@ def build_live_order_context(
         )
 
     cfg = load_strategy_configs(strategy_id)
+    strategy_status = str(cfg.get("status") or "").strip().lower()
+    if (
+        strategy_status
+        and strategy_status != "running"
+        and str(signal_type).strip().lower() in {
+            "open_long",
+            "add_long",
+            "open_short",
+            "add_short",
+        }
+    ):
+        raise LiveOrderRejected(
+            error="strategy_not_running",
+            strategy_id=strategy_id,
+            console_message=(
+                f"[worker] entry rejected: strategy_id={strategy_id} "
+                f"pending_id={order_id} status={strategy_status}"
+            ),
+            strategy_log="Entry order cancelled because the strategy is no longer running",
+        )
     strategy_user_id = int(cfg.get("user_id") or 1)
     exchange_config = resolve_exchange_config(cfg.get("exchange_config") or {}, user_id=strategy_user_id)
     safe_cfg = safe_exchange_config_for_log(exchange_config)

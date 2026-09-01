@@ -120,6 +120,46 @@ def test_deployment_recovers_legacy_visual_grid_runtime_from_executor_type(monke
     assert trading_config["bot_params"]["amountPerGridPct"] == pytest.approx(0.25)
 
 
+def test_deployment_recovers_grid_contract_from_legacy_root_metadata(monkeypatch):
+    class _LegacyGridSources:
+        @staticmethod
+        def get_source(_source_id, user_id=None):
+            return {
+                "id": 9,
+                "name": "Legacy grid strategy",
+                "code": SOURCE,
+                "metadata": {
+                    "executor_type": "grid",
+                    "executor_config": {
+                        "side": "long",
+                        "start_price": 90,
+                        "end_price": 110,
+                        "grid_count": 5,
+                        "total_amount_quote": 500,
+                        "initial_position_pct": 0.6,
+                        "max_open_orders": 4,
+                        "dynamic_anchor": True,
+                    },
+                },
+            }
+
+    cursor = _Cursor()
+    monkeypatch.setattr(deployment, "get_script_source_service", lambda: _LegacyGridSources())
+    monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
+
+    StrategyV2DeploymentService().save(user_id=7, payload=_payload("both"))
+    trading_config = json.loads(cursor.params[-1])
+
+    assert trading_config["strategy_family"] == "robot"
+    assert trading_config["executor_type"] == "grid"
+    assert trading_config["bot_type"] == "grid"
+    assert trading_config["entry_trigger_mode"] == "exchange_resting_orders"
+    assert trading_config["bot_params"]["gridCount"] == 5
+    assert trading_config["bot_params"]["lowerPrice"] == pytest.approx(90)
+    assert trading_config["bot_params"]["upperPrice"] == pytest.approx(110)
+    assert trading_config["bot_params"]["amountPerGridPct"] == pytest.approx(0.2)
+
+
 def test_deployment_manifest_overrides_stale_editor_symbol_and_market_type(monkeypatch):
     stock_source = """
 def initialize(context):

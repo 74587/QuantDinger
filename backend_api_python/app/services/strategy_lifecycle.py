@@ -28,6 +28,11 @@ def is_fatal_exchange_error(msg: str) -> bool:
     if "unsupported market type" in m or "unsupported market" in m:
         return True
     tokens = (
+        # Programming/adapter contract failures are deterministic. Retrying on
+        # every candle can enqueue an entire robot order ladder without any
+        # chance of recovery until the service is upgraded.
+        "got an unexpected keyword argument",
+        "missing 1 required positional argument",
         "binance http 401",
         '"code":-2015',
         "-2015",

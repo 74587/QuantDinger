@@ -440,11 +440,20 @@ class TradingExecutor:
             self._heartbeat(strategy_id, run_id, primary, last_prices, 0)
             from app.services.strategy_runtime.bot_type import resolve_bot_type
 
-            bot_type = resolve_bot_type(strategy, trading_config)
+            bot_type = resolve_bot_type(
+                strategy,
+                trading_config,
+                source_code=code,
+            )
             if bot_type:
                 # Keep all downstream risk helpers on the same canonical
                 # classification, including legacy executor_type deployments.
                 trading_config["bot_type"] = bot_type
+            if bot_type == "grid":
+                trading_config = self._recover_generated_grid_config(
+                    trading_config,
+                    program.namespace,
+                )
             if execution_mode == "live" and bot_type == "grid":
                 exit_reason = self._run_grid_resting_loop(
                     strategy_id=strategy_id,
@@ -710,10 +719,61 @@ class TradingExecutor:
                     # strategy position snapshot becomes flat.
                     protected = session.pending_protection_exit_symbols()
 
-                    # Realtime prices are an execution/risk input only. Normal
-                    # strategy entries and scale-ins remain completed-candle
-                    # driven through ``session.process(frames)`` below.
                     pending_count = len(equity_intents) + len(protection_intents)
+                    # Martingale templates explicitly declare a realtime
+                    # price trigger.  Run only their optional tick hook here;
+                    # ordinary Strategy V2 sources and DCA remain driven by
+                    # completed candles/schedules below.  The generated robot
+                    # keeps stable client ids and pending level state, so an
+                    # async order cannot be emitted again on the next tick.
+                    if (
+                        execution_mode == "live"
+                        and not equity_stop_reason
+                        and active_prices
+                        and bot_type in {"martingale", "layered_martingale"}
+                    ):
+                        realtime_intents, realtime_messages = session.evaluate_price_tick(
+                            active_prices,
+                            timestamp=risk_timestamp,
+                        )
+                        realtime_intents = [
+                            intent
+                            for intent in realtime_intents
+                            if _runtime_position_key(
+                                intent.symbol,
+                                intent.position_side,
+                            ) not in protected
+                        ]
+                        pending_count += len(realtime_intents)
+                        for message in realtime_messages:
+                            append_strategy_log(strategy_id, "info", message)
+                        for intent in realtime_intents:
+                            submitted = self._execute_strategy_v2_intent(
+                                strategy_id=strategy_id,
+                                strategy_name=strategy_name,
+                                intent=intent,
+                                frames=frames,
+                                candidates=candidates,
+                                initial_capital=initial_capital,
+                                leverage=leverage,
+                                execution_mode=execution_mode,
+                                notification_config=notification_config,
+                                trading_config=trading_config,
+                                exchange_config=exchange_config,
+                                signal_ts=self._intent_signal_timestamp(intent, risk_timestamp),
+                                strategy_run_id=run_id,
+                                current_price_override=active_prices.get(str(intent.symbol)),
+                                direction_mode=direction_mode,
+                            )
+                            if intent.client_order_id:
+                                session.context.update_order_statuses({
+                                    intent.client_order_id: {
+                                        "client_order_id": intent.client_order_id,
+                                        "status": (
+                                            "submitted" if submitted else "rejected"
+                                        ),
+                                    },
+                                })
                     if not equity_stop_reason and cycle_started >= next_signal_poll:
                         current_bar_token = completed_bar_token(frequency)
                         has_new_closed_bar = (
@@ -1009,7 +1069,21 @@ class TradingExecutor:
     def _execute_signal(self, **values: Any) -> bool:
         strategy_id = int(values["strategy_id"])
         strategy = self._load_strategy(strategy_id) or {}
-        if str(values.get("execution_mode") or "signal").strip().lower() == "live":
+        requested_execution_mode = str(
+            values.get("execution_mode") or "signal"
+        ).strip().lower()
+        # A fatal worker error stops the strategy through the database.  The
+        # current runtime callback may still hold more intents, so enforce the
+        # lifecycle state again at the queue boundary to prevent a burst of
+        # orders after the stop has been requested.
+        persisted_status = str(strategy.get("status") or "").strip().lower()
+        if (
+            requested_execution_mode == "live"
+            and persisted_status
+            and persisted_status != "running"
+        ):
+            return False
+        if requested_execution_mode == "live":
             from app.services.strategy_live_guard import (
                 StrategyDirectionModeViolation,
                 validate_strategy_signal_direction,
@@ -1122,11 +1196,19 @@ class TradingExecutor:
             return False
         pending_id = self.order_gateway.submit(request)
         if pending_id:
+            order_details = [f"pending_id={pending_id}"]
+            if request.order_type == "limit":
+                order_details.append(
+                    f"limit_price={format_decimal(request.limit_price, decimal_places=8)}"
+                )
+            if request.client_order_id:
+                order_details.append(f"client_order_id={request.client_order_id}")
             append_strategy_log(
                 strategy_id,
                 "trade",
                 f"Order queued: {request.action} {request.symbol} "
-                f"quantity={format_decimal(request.quantity)}",
+                f"quantity={format_decimal(request.quantity)} "
+                + " ".join(order_details),
             )
         return bool(pending_id)
 
@@ -1311,6 +1393,87 @@ class TradingExecutor:
             grid_price_feed.stop()
             runner.shutdown()
         return grid_exit_reason
+
+    @staticmethod
+    def _recover_generated_grid_config(
+        trading_config: Dict[str, Any],
+        namespace: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Recover the durable grid contract from an already-saved template.
+
+        Some deployed visual-builder sources predate ``last_run_config``.  The
+        generated constants are part of the compiled source contract, so use
+        them only when the persisted grid parameters are incomplete.
+        """
+        runtime_config = dict(trading_config or {})
+        existing = (
+            dict(runtime_config.get("bot_params") or {})
+            if isinstance(runtime_config.get("bot_params"), dict)
+            else {}
+        )
+        if all(
+            float(existing.get(key) or 0.0) > 0
+            for key in ("lowerPrice", "upperPrice", "gridCount")
+        ):
+            return runtime_config
+
+        lower_values = namespace.get("CELL_LOWER")
+        upper_values = namespace.get("CELL_UPPER")
+        if not isinstance(lower_values, (list, tuple)) or not isinstance(
+            upper_values,
+            (list, tuple),
+        ):
+            return runtime_config
+        try:
+            lowers = [float(value) for value in lower_values]
+            uppers = [float(value) for value in upper_values]
+        except (TypeError, ValueError):
+            return runtime_config
+        if not lowers or len(lowers) != len(uppers):
+            return runtime_config
+        boundaries = lowers + [uppers[-1]]
+        deltas = [
+            boundaries[index + 1] - boundaries[index]
+            for index in range(len(boundaries) - 1)
+        ]
+        average_delta = sum(deltas) / len(deltas) if deltas else 0.0
+        arithmetic = bool(
+            average_delta > 0
+            and max(abs(value - average_delta) for value in deltas)
+            <= abs(average_delta) * 1e-6
+        )
+        count = len(lowers)
+        existing.update({
+            "lowerPrice": min(lowers),
+            "upperPrice": max(uppers),
+            "gridCount": count,
+            "gridCountUnit": "cells",
+            "amountPerGridPct": 1.0 / count,
+            "gridMode": "arithmetic" if arithmetic else "geometric",
+            "gridDirection": str(namespace.get("GRID_SIDE") or "long").strip().lower(),
+            "initialPositionPct": float(namespace.get("INITIAL_POSITION_PCT") or 0.0),
+            "orderMode": "maker",
+            "boundaryAction": "pause",
+            "maxOpenOrders": max(
+                1,
+                int(namespace.get("MAX_OPEN_ENTRY_ORDERS") or count),
+            ),
+            "dynamicAnchor": bool(namespace.get("DYNAMIC_ANCHOR")),
+        })
+        runtime_config["strategy_family"] = "robot"
+        runtime_config["executor_type"] = "grid"
+        runtime_config["bot_type"] = "grid"
+        runtime_config["bot_params"] = existing
+        for runtime_key, source_key in (
+            ("equity_take_profit_pct", "EQUITY_TAKE_PROFIT"),
+            ("equity_stop_loss_pct", "EQUITY_STOP_LOSS"),
+            ("equity_trailing_enabled", "EQUITY_TRAILING_ENABLED"),
+            ("equity_trailing_activation_pct", "EQUITY_TRAILING_ACTIVATION"),
+            ("equity_trailing_callback_pct", "EQUITY_TRAILING_CALLBACK"),
+        ):
+            if runtime_key not in runtime_config and source_key in namespace:
+                runtime_config[runtime_key] = namespace[source_key]
+        return runtime_config
 
     @staticmethod
     def _materialize_grid_anchor(
@@ -1794,7 +1957,11 @@ class TradingExecutor:
         from app.services.strategy_runtime.bot_type import resolve_bot_type
         from app.services.strategy_runtime.robot_v2 import migrate_legacy_robot_v2_source
 
-        bot_type = resolve_bot_type(strategy, trading_config)
+        bot_type = resolve_bot_type(
+            strategy,
+            trading_config,
+            source_code=code,
+        )
         migrated = migrate_legacy_robot_v2_source(code, bot_type) if bot_type else code
         if migrated != code:
             # Upgrade generated legacy allocation units at the execution

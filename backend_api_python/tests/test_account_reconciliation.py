@@ -1,6 +1,9 @@
 """Tests for L1/L3 reconciliation helpers."""
 
-from app.services.live_trading.account_positions import reconcile_strategy_vs_account
+from app.services.live_trading.account_positions import (
+    filter_position_rows_by_symbols,
+    reconcile_strategy_vs_account,
+)
 
 
 def test_reconcile_ok_when_both_flat():
@@ -35,3 +38,14 @@ def test_reconcile_size_mismatch():
     out = reconcile_strategy_vs_account(local, account)
     assert out["status"] == "mismatch"
     assert any("size_mismatch" in n for n in out["notes"])
+
+
+def test_reconciliation_filters_other_symbols_from_account_ownership():
+    rows = [
+        {"symbol_canonical": "BTC/USDT", "side": "long", "manual_reserved_qty": 0.0006},
+        {"symbol_canonical": "SOL/USDT", "side": "long", "manual_reserved_qty": 1.5},
+    ]
+
+    filtered = filter_position_rows_by_symbols(rows, ["SOL/USDT"])
+
+    assert [row["symbol_canonical"] for row in filtered] == ["SOL/USDT"]

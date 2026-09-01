@@ -2086,7 +2086,6 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 )
                 limit_client_oid = make_client_order_id(
                     exchange_id=exchange_id,
-                    market_type=market_type,
                     strategy_id=strategy_id,
                     order_id=order_id,
                     phase="lmt",
@@ -2202,6 +2201,12 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             _console_print(f"[worker] order unexpected error: strategy_id={strategy_id} pending_id={order_id} err={e}")
             _notify_live_best_effort(status="failed", error=str(e), amount_hint=amount, price_hint=ref_price)
             append_strategy_log(strategy_id, "error", f"Unexpected order error ({exchange_id} {symbol} {signal_type}): {e}")
+            if is_fatal_exchange_error(str(e)):
+                auto_stop_live_strategy(
+                    int(strategy_id),
+                    str(e),
+                    source="pending_order_contract",
+                )
             return
 
         # Build final result (best-effort); live path never fabricates fill qty from request amount.

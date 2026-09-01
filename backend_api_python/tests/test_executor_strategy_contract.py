@@ -110,6 +110,7 @@ def test_every_robot_generates_a_compilable_strategy_v2_source(executor_type):
     assert payload["metadata"]["equity_risk"]["trailing_enabled"] is True
     assert "PERSIST_RUNTIME_STATE = True" in payload["code"]
     assert payload["trading_config"]["equity_trailing_enabled"] is True
+    assert payload["metadata"]["last_run_config"] == payload["trading_config"]
 
 
 @pytest.mark.parametrize("executor_type", ["grid", "dca", "martingale", "layered_martingale"])

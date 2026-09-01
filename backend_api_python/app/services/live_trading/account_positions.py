@@ -181,6 +181,27 @@ def list_account_positions(
     return [dict(r) for r in rows]
 
 
+def filter_position_rows_by_symbols(
+    rows: List[Dict[str, Any]], allowed_symbols: Optional[List[str]]
+) -> List[Dict[str, Any]]:
+    """Keep account/ownership rows inside the current strategy universe."""
+    allowed = {
+        normalize_strategy_symbol(str(symbol or "")).upper()
+        for symbol in (allowed_symbols or [])
+        if normalize_strategy_symbol(str(symbol or ""))
+    }
+    if not allowed:
+        return list(rows or [])
+    return [
+        row
+        for row in (rows or [])
+        if normalize_strategy_symbol(
+            str(row.get("symbol_canonical") or row.get("symbol") or "")
+        ).upper()
+        in allowed
+    ]
+
+
 def reconcile_strategy_vs_account(
     local_rows: List[Dict[str, Any]],
     account_rows: List[Dict[str, Any]],
