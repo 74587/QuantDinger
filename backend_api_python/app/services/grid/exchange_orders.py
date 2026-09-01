@@ -44,7 +44,7 @@ class GridMarketOrderExecution:
         yield self.avg_price
 
 
-def normalize_grid_order_quantity(
+def _normalize_grid_order_quantity_for_client(
     client: BaseRestClient,
     *,
     symbol: str,
@@ -172,6 +172,94 @@ def normalize_grid_order_quantity(
         logger.warning("grid quantity normalization failed for %s: %s", symbol, exc)
         return 0.0
     return qty
+
+
+def _grid_exchange_id(client: BaseRestClient, exchange_config: Dict[str, Any]) -> str:
+    configured = str(
+        exchange_config.get("exchange_id")
+        or exchange_config.get("exchange")
+        or exchange_config.get("exchangeId")
+        or ""
+    ).strip().lower()
+    aliases = {
+        "gateio": "gate",
+        "gate.io": "gate",
+        "huobi": "htx",
+    }
+    if configured:
+        return aliases.get(configured, configured)
+    if isinstance(client, (BinanceFuturesClient, BinanceSpotClient)):
+        return "binance"
+    if isinstance(client, (BitgetMixClient, BitgetSpotClient)):
+        return "bitget"
+    if isinstance(client, BybitClient):
+        return "bybit"
+    if isinstance(client, (GateUsdtFuturesClient, GateSpotClient)):
+        return "gate"
+    if isinstance(client, HtxClient):
+        return "htx"
+    if isinstance(client, OkxClient):
+        return "okx"
+    return ""
+
+
+def normalize_grid_order_quantity(
+    client: BaseRestClient,
+    *,
+    symbol: str,
+    quantity: float,
+    market_type: str,
+    exchange_config: Optional[Dict[str, Any]] = None,
+    price: float = 0.0,
+) -> float:
+    """Normalize a grid order against both client and native exchange rules.
+
+    The client-specific pass converts contracts to base units where needed.
+    The common rules pass then floors amount precision and rejects quantities
+    below either the exchange minimum amount or minimum order notional.
+    """
+    cfg = exchange_config if isinstance(exchange_config, dict) else {}
+    normalized = _normalize_grid_order_quantity_for_client(
+        client,
+        symbol=symbol,
+        quantity=quantity,
+        market_type=market_type,
+        exchange_config=cfg,
+    )
+    if normalized <= 0:
+        return 0.0
+
+    exchange_id = _grid_exchange_id(client, cfg)
+    if not exchange_id:
+        return normalized
+    try:
+        from app.services.instrument_rules import get_instrument_rules_provider
+
+        rules = get_instrument_rules_provider().get_rules(
+            symbol,
+            exchange_id=exchange_id,
+            market_type=market_type,
+            client=client,
+        )
+        normalized = rules.normalize_amount(normalized, enforce_minimum=True)
+        px = max(0.0, float(price or 0.0))
+        min_notional = max(0.0, float(rules.min_notional or 0.0))
+        if normalized <= 0:
+            return 0.0
+        if px > 0 and min_notional > 0 and normalized * px < min_notional:
+            return 0.0
+        return normalized
+    except Exception as exc:
+        # If native rules cannot be verified, skipping the grid order is safer
+        # than passing an unrounded float to an exchange. The next sync cycle
+        # retries after the provider cache/endpoint recovers.
+        logger.warning(
+            "grid native quantity rules unavailable exchange=%s symbol=%s: %s",
+            exchange_id,
+            symbol,
+            exc,
+        )
+        return 0.0
 
 
 def make_grid_initial_client_order_id(strategy_id: int, leg: str = "") -> str:

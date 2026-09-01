@@ -1162,6 +1162,7 @@ class GridEngine:
                 quantity=float(qty),
                 market_type=self.cfg.market_type,
                 exchange_config=self.exchange_config,
+                price=float(price),
             )
         except Exception as e:
             logger.debug("grid normalize qty sid=%s: %s", self.strategy_id, e)

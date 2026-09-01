@@ -201,6 +201,14 @@ def test_runner_startup_places_both_neutral_legs_in_hedge_mode(monkeypatch):
         def get_account_pos_mode(self, **kwargs):
             return "hedge_mode"
 
+        def get_contract(self, **kwargs):
+            return {
+                "sizeMultiplier": "0.0001",
+                "minTradeNum": "0.0001",
+                "contractSize": "1",
+                "priceStep": "0.01",
+            }
+
     placed = []
     monkeypatch.setattr(
         "app.services.live_trading.position_query.query_exchange_position_size",
