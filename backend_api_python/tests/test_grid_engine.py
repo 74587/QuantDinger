@@ -357,6 +357,15 @@ def test_initial_market_target_qty_100u_20pct_20x():
     assert make_grid_initial_client_order_id(42, leg="long") != make_grid_initial_client_order_id(42, leg="short")
 
 
+def test_grid_resting_client_order_ids_do_not_collide_within_same_second():
+    from app.services.grid.exchange_orders import make_grid_client_order_id
+
+    order_ids = {make_grid_client_order_id(42, 58, "long_exit") for _ in range(100)}
+
+    assert len(order_ids) == 100
+    assert all(len(order_id) <= 32 and order_id.isalnum() for order_id in order_ids)
+
+
 def test_grid_line_qty_uses_quote_amount_times_leverage():
     from app.services.grid.engine import GridEngine
 
@@ -1578,3 +1587,58 @@ def test_grid_fill_profit_uses_cell_entry_price(monkeypatch):
     assert captured["profit"] == pytest.approx(expected)
     assert captured["grid_matched_profit"] == pytest.approx(expected)
     assert captured["matched_entry_price"] == pytest.approx(669.3)
+
+
+def test_grid_fill_ledger_failure_is_not_silently_marked_processed(monkeypatch):
+    from app.services.grid import fill_handler
+    from app.services.grid.resting_orders_repo import GridRestingOrder
+
+    monkeypatch.setattr(fill_handler, "resolve_leg_context", lambda **kwargs: None)
+    monkeypatch.setattr(
+        fill_handler,
+        "apply_fill_to_local_position",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("ledger unavailable")),
+    )
+
+    order = GridRestingOrder(
+        id=99,
+        strategy_id=1,
+        symbol="BNB/USDT",
+        cell_index=11,
+        purpose="long_entry",
+        side="buy",
+        pos_side="long",
+        price=676.7,
+        quantity=0.05,
+    )
+
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        fill_handler.apply_grid_fill_to_local_state(
+            1,
+            "BNB/USDT",
+            order,
+            0.05,
+            676.7,
+            {"market_type": "swap"},
+        )
+
+
+def test_grid_market_fill_ledger_failure_is_not_silently_accepted(monkeypatch):
+    from app.services.grid import fill_handler
+
+    monkeypatch.setattr(fill_handler, "resolve_leg_context", lambda **kwargs: None)
+    monkeypatch.setattr(
+        fill_handler,
+        "apply_fill_to_local_position",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("ledger unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        fill_handler.record_grid_market_fill(
+            1,
+            "BNB/USDT",
+            "open_long",
+            0.05,
+            676.7,
+            {"market_type": "swap"},
+        )

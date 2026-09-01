@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -182,7 +183,12 @@ def make_grid_initial_client_order_id(strategy_id: int, leg: str = "") -> str:
 
 
 def make_grid_client_order_id(strategy_id: int, cell_index: int, purpose: str) -> str:
-    """Short client oid (OKX max 32). purpose: e/l/x/s = entry long/exit/short entry."""
+    """Return a collision-resistant grid order id within OKX's 32-char limit.
+
+    Resting orders for the same cell can be replaced more than once in one
+    second. A second-resolution suffix is therefore not unique enough and is
+    rejected by exchanges such as Binance after an id has been used once.
+    """
     p = (purpose or "x")[:1].lower()
     if "long_entry" in purpose:
         p = "e"
@@ -192,8 +198,8 @@ def make_grid_client_order_id(strategy_id: int, cell_index: int, purpose: str) -
         p = "s"
     elif "short_exit" in purpose:
         p = "c"
-    ts = int(__import__("time").time()) % 1000000
-    return f"g{int(strategy_id) % 10000:04d}c{int(cell_index):03d}{p}{ts % 99999:05d}"[:32]
+    nonce = secrets.token_hex(6)
+    return f"g{int(strategy_id) % 10000:04d}c{int(cell_index):03d}{p}{nonce}"[:32]
 
 
 def place_grid_limit_order(

@@ -81,6 +81,34 @@ def test_poller_dispatches_partial_fill_immediately():
     assert update.call_args.kwargs["processed_fill_qty"] == pytest.approx(0.4)
 
 
+def test_poller_retries_fill_when_local_ledger_posting_fails():
+    poller = GridFillPoller()
+    runner = MagicMock()
+    runner.engine.on_order_filled.side_effect = RuntimeError("ledger unavailable")
+    order = GridRestingOrder(
+        id=14,
+        strategy_id=1,
+        symbol="BTC/USDT",
+        price=100.0,
+        quantity=1.0,
+        processed_fill_qty=0.0,
+        filled_quantity=0.0,
+        status="open",
+    )
+
+    with patch(
+        "app.services.grid.poller.query_grid_order_fill",
+        return_value=(0.4, 99.5, "partial"),
+    ):
+        with patch.object(poller._repo, "update_status") as update:
+            poller._poll_order(runner, MagicMock(), order, "swap")
+
+    runner.engine.on_order_filled.assert_called_once_with(order, 0.4, 99.5)
+    assert update.call_args.kwargs["status"] == "partial"
+    assert update.call_args.kwargs["filled_quantity"] == pytest.approx(0.4)
+    assert update.call_args.kwargs["processed_fill_qty"] == pytest.approx(0.0)
+
+
 def test_poller_reconciles_cancelled_partial_fill():
     poller = GridFillPoller()
     runner = MagicMock()

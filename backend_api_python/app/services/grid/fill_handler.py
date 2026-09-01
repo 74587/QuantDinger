@@ -91,40 +91,39 @@ def apply_grid_fill_to_local_state(
         market_type=str(tc.get("market_type") or "swap"),
         fill_source="grid_poller",
     )
-    try:
-        profit, _pos, matched_entry = apply_fill_to_local_position(
-            strategy_id=int(strategy_id),
-            symbol=sym,
-            signal_type=signal_type,
-            filled=qty,
-            avg_price=px,
-            leg=leg,
-        )
-        if grid_profit is not None:
-            profit = grid_profit
-            matched_entry = grid_entry_price
-        record_trade(
-            strategy_id=int(strategy_id),
-            symbol=sym,
-            trade_type=signal_type,
-            price=px,
-            amount=qty,
-            commission=float(commission or 0.0),
-            commission_ccy=str(commission_ccy or ""),
-            commission_quote=commission_quote,
-            profit=profit,
-            close_reason=purpose,
-            matched_entry_price=matched_entry,
-            grid_matched_profit=profit if purpose in ("long_exit", "short_exit") and profit is not None else None,
-            leg=leg,
-            exchange_fill_id=str(exchange_fill_id or ""),
-            execution_event_id=int(execution_event_id or 0),
-            grid_order_id=int(order.id or 0),
-            fee_status=str(fee_status or "pending"),
-            fee_source=str(fee_source or ""),
-        )
-    except Exception as e:
-        logger.warning("apply_grid_fill sid=%s: %s", strategy_id, e)
+    profit, _pos, matched_entry = apply_fill_to_local_position(
+        strategy_id=int(strategy_id),
+        symbol=sym,
+        signal_type=signal_type,
+        filled=qty,
+        avg_price=px,
+        leg=leg,
+    )
+    if grid_profit is not None:
+        profit = grid_profit
+        matched_entry = grid_entry_price
+    record_trade(
+        strategy_id=int(strategy_id),
+        symbol=sym,
+        trade_type=signal_type,
+        price=px,
+        amount=qty,
+        commission=float(commission or 0.0),
+        commission_ccy=str(commission_ccy or ""),
+        commission_quote=commission_quote,
+        profit=profit,
+        close_reason=purpose,
+        matched_entry_price=matched_entry,
+        grid_matched_profit=(
+            profit if purpose in ("long_exit", "short_exit") and profit is not None else None
+        ),
+        leg=leg,
+        exchange_fill_id=str(exchange_fill_id or ""),
+        execution_event_id=int(execution_event_id or 0),
+        grid_order_id=int(order.id or 0),
+        fee_status=str(fee_status or "pending"),
+        fee_source=str(fee_source or ""),
+    )
 
 
 def record_grid_market_fill(
@@ -162,56 +161,54 @@ def record_grid_market_fill(
         market_type=str(tc.get("market_type") or "swap"),
         fill_source="grid_market",
     )
-    try:
-        profit, _pos, matched_entry = apply_fill_to_local_position(
-            strategy_id=int(strategy_id),
-            symbol=sym,
-            signal_type=sig,
-            filled=qty,
-            avg_price=px,
-            leg=leg,
-        )
-        trade_id = record_trade(
-            strategy_id=int(strategy_id),
-            symbol=sym,
-            trade_type=sig,
-            price=px,
-            amount=qty,
-            commission=float(commission or 0.0),
-            commission_ccy=str(commission_ccy or ""),
-            commission_quote=commission_quote,
-            profit=profit,
-            close_reason=str(reason or sig),
-            matched_entry_price=matched_entry,
-            leg=leg,
-            fee_status=str(fee_status or "pending"),
-            fee_source=str(fee_source or "rest"),
-        )
-        if trade_id and (exchange_order_id or client_order_id):
-            try:
-                from app.services.execution_streams.repository import ExecutionEventRepository
+    profit, _pos, matched_entry = apply_fill_to_local_position(
+        strategy_id=int(strategy_id),
+        symbol=sym,
+        signal_type=sig,
+        filled=qty,
+        avg_price=px,
+        leg=leg,
+    )
+    trade_id = record_trade(
+        strategy_id=int(strategy_id),
+        symbol=sym,
+        trade_type=sig,
+        price=px,
+        amount=qty,
+        commission=float(commission or 0.0),
+        commission_ccy=str(commission_ccy or ""),
+        commission_quote=commission_quote,
+        profit=profit,
+        close_reason=str(reason or sig),
+        matched_entry_price=matched_entry,
+        leg=leg,
+        fee_status=str(fee_status or "pending"),
+        fee_source=str(fee_source or "rest"),
+    )
+    if trade_id and (exchange_order_id or client_order_id):
+        try:
+            from app.services.execution_streams.repository import ExecutionEventRepository
 
-                ExecutionEventRepository().register_binding(
-                    credential_id=int(leg.credential_id or 0),
-                    exchange_id=str(exchange_id or tc.get("exchange_id") or tc.get("exchange") or ""),
-                    market_type=leg.normalized_market_type(),
-                    owner_type="grid_market",
-                    owner_id=int(trade_id),
-                    user_id=int(user_id or 1),
-                    strategy_id=int(strategy_id),
-                    symbol=sym,
-                    signal_type=sig,
-                    client_order_id=str(client_order_id or ""),
-                    exchange_order_id=str(exchange_order_id or ""),
-                    observed_filled=qty,
-                )
-            except Exception:
-                logger.debug(
-                    "grid market execution binding failed trade_id=%s",
-                    trade_id,
-                    exc_info=True,
-                )
-        return int(trade_id or 0)
-    except Exception as e:
-        logger.warning("record_grid_market_fill sid=%s: %s", strategy_id, e)
-        return 0
+            ExecutionEventRepository().register_binding(
+                credential_id=int(leg.credential_id or 0),
+                exchange_id=str(
+                    exchange_id or tc.get("exchange_id") or tc.get("exchange") or ""
+                ),
+                market_type=leg.normalized_market_type(),
+                owner_type="grid_market",
+                owner_id=int(trade_id),
+                user_id=int(user_id or 1),
+                strategy_id=int(strategy_id),
+                symbol=sym,
+                signal_type=sig,
+                client_order_id=str(client_order_id or ""),
+                exchange_order_id=str(exchange_order_id or ""),
+                observed_filled=qty,
+            )
+        except Exception:
+            logger.debug(
+                "grid market execution binding failed trade_id=%s",
+                trade_id,
+                exc_info=True,
+            )
+    return int(trade_id or 0)
