@@ -136,6 +136,10 @@ credentials unreadable.
   indicator execution boundary in August 2026. The research was performed
   against the public repository only and did not access the hosted service or
   real user data.
+- **Jo Arsy**, security researcher — responsibly disclosed an issue involving
+  improper trust of client-supplied proxy IP headers in September 2026. The
+  report helped strengthen QuantDinger's IP-based authentication and anti-abuse
+  controls.
 
 ---
 
