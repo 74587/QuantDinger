@@ -1,5 +1,6 @@
 """Shared authentication session helpers."""
 
+from ipaddress import ip_address
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from flask import request
@@ -55,12 +56,25 @@ def build_frontend_login_redirect(frontend_url: str, **params) -> str:
 
 
 def get_client_ip() -> str:
-    """Get client IP address from proxy headers or Flask request."""
-    if request.headers.get("X-Forwarded-For"):
-        return request.headers.get("X-Forwarded-For").split(",")[0].strip()
-    if request.headers.get("X-Real-IP"):
-        return request.headers.get("X-Real-IP")
-    return request.remote_addr or "0.0.0.0"
+    """Get the client IP, trusting forwarding headers only from an internal proxy."""
+    remote_addr = (request.remote_addr or "0.0.0.0").strip()
+    try:
+        remote_ip = ip_address(remote_addr)
+    except ValueError:
+        return remote_addr
+
+    if not (remote_ip.is_private or remote_ip.is_loopback):
+        return remote_addr
+
+    candidate = (request.headers.get("X-Real-IP") or "").strip()
+    if not candidate:
+        forwarded_for = request.headers.get("X-Forwarded-For") or ""
+        candidate = forwarded_for.rsplit(",", 1)[-1].strip()
+
+    try:
+        return str(ip_address(candidate)) if candidate else remote_addr
+    except ValueError:
+        return remote_addr
 
 
 def get_user_agent() -> str:
@@ -121,4 +135,3 @@ def must_change_initial_password(user_id: int) -> bool:
         return get_user_service().must_change_initial_password(int(user_id))
     except Exception:
         return False
-
