@@ -84,6 +84,8 @@ FRONTEND_HOST=127.0.0.1
 FRONTEND_PORT=8888
 MOBILE_HOST=127.0.0.1
 MOBILE_PORT=8889
+# 第一个地址是 OAuth 登录后的默认跳转目标
+FRONTEND_URL=https://app.example.com,https://m.example.com
 BACKEND_PORT=127.0.0.1:5000
 DB_PORT=127.0.0.1:5432
 REDIS_PORT=127.0.0.1:6379
@@ -113,7 +115,7 @@ docker compose -f docker-compose.ghcr.yml up -d --force-recreate frontend mobile
 
 `backend` 容器内部监听 `5000` 是应用协议的一部分，保持不变是正常的。`BACKEND_PORT=127.0.0.1:5000` 修改的是宿主机绑定；前端容器通过 Docker 网络访问 `backend:5000`。如需调整用户访问端口，只修改 `FRONTEND_PORT` / `MOBILE_PORT`，然后重新创建容器。
 
-生产环境不要把 `5000`、`5432`、`6379` 直接暴露到公网。宝塔 Nginx/站点反向代理应把公网 `80/443` 转发到宿主机本地的 Web 前端端口（默认 `127.0.0.1:8888`），API 继续由前端容器同源转发。
+生产环境不要把 `5000`、`5432`、`6379` 直接暴露到公网。宝塔或 1Panel 的 Nginx/OpenResty 应只对公网开放 `80/443`：页面请求转发到宿主机本地的 Web 前端端口（默认 `127.0.0.1:8888`），`/api/` 请求直接转发到同样只绑定本机的后端端口 `127.0.0.1:5000`。这样仍保持浏览器同源，同时避免前端容器二次代理覆盖真实客户端 IP。
 
 ### 可选：完整源码部署
 
@@ -135,7 +137,7 @@ FRONTEND_URL=https://app.example.com,https://m.example.com
 ALLOW_LOCAL_DESKTOP_BROKERS=false
 ```
 
-也可以按上面的示例创建项目根目录 `.env`。
+也可以按上面的示例创建项目根目录 `.env`。Compose 会从根目录 `.env` 展开并向后端容器注入 `FRONTEND_URL`；请在这里也设置生产前端域名，并与后端运行时 env 保持一致。否则 Compose 的 localhost 默认值会覆盖后端运行时 env 中的值。
 
 启动：
 
@@ -153,9 +155,9 @@ docker compose ps
 |------|--------|------|
 | `backend.env` | `docker-compose.ghcr.yml` 的后端容器 | 应用运行时配置：管理员账号、`SECRET_KEY`、LLM key、OAuth、券商或交易所 key |
 | `backend_api_python/.env` | 完整源码部署的后端容器 | 源码部署时的应用运行时配置 |
-| 项目根目录 `.env` | Docker Compose | 端口、镜像 tag、镜像地址、Postgres 镜像和数据目录、镜像源 |
+| 项目根目录 `.env` | Docker Compose | 公共前端域名、端口、镜像 tag、镜像地址、Postgres 镜像和数据目录、镜像源 |
 
-除非 Compose 明确需要，不要把交易所 API key 这类业务密钥放到项目根目录 `.env`。
+除非 Compose 明确需要，不要把交易所 API key 这类业务密钥放到项目根目录 `.env`。当前 Compose 会显式注入 `FRONTEND_URL`，因此该项应写入根目录 `.env`；应用密钥仍写入 `backend.env` 或 `backend_api_python/.env`。
 
 ## 5. 配置 Nginx
 
@@ -168,12 +170,46 @@ sudo apt install -y nginx
 
 创建 `/etc/nginx/sites-available/quantdinger.conf`：
 
+宿主机代理应在同一公网域名下拆分页面与 API：`/api/` 直接进入只绑定本机的后端 `5000`，其余页面进入 Web `8888` 或移动 H5 `8889`。不要把全部请求先送入前端容器再二次代理 API；新版后端会安全地验证代理来源，而二次代理可能把 `X-Real-IP` 覆盖为 Docker 网关地址。
+
 ```nginx
 server {
     listen 80;
     server_name app.example.com;
 
     client_max_body_size 20m;
+
+    location = /api/ai/chat/message/stream {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_request_buffering off;
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        send_timeout 600s;
+        add_header X-Accel-Buffering "no" always;
+        add_header Cache-Control "no-cache, no-transform" always;
+    }
+
+    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8888;
@@ -191,6 +227,38 @@ server {
 
     client_max_body_size 20m;
 
+    location = /api/ai/chat/message/stream {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_request_buffering off;
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        send_timeout 600s;
+        add_header X-Accel-Buffering "no" always;
+        add_header Cache-Control "no-cache, no-transform" always;
+    }
+
+    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8889;
         proxy_http_version 1.1;
@@ -202,7 +270,7 @@ server {
 }
 ```
 
-如果不需要独立移动端域名，可以删除第二个 `server` 块。移动 H5 也可以通过你自己配置的端口、路径或域名访问。
+如果不需要独立移动端域名，可以删除第二个 `server` 块。移动 H5 也可以通过你自己配置的端口、路径或域名访问。`5000` 仍只监听 `127.0.0.1`，由同机 Nginx/OpenResty 访问，不等于将后端端口暴露到公网。
 
 启用站点：
 
@@ -239,10 +307,11 @@ https://m.example.com
 
 ## 7. 可选 API 子域名
 
-推荐部署方式是让 API 通过前端容器保持同源访问：
+推荐部署方式是在宿主机反向代理处保持同源并拆分流量：
 
 ```text
-Browser -> https://app.example.com -> 宿主机 Nginx -> frontend 容器 -> /api -> backend:5000
+Browser -> https://app.example.com -> 宿主机 Nginx -> /      -> frontend:8888
+                                                    -> /api/ -> backend:5000
 ```
 
 如果确实需要 `api.example.com`，只通过 Nginx 暴露宿主机本地后端端口：
@@ -387,6 +456,22 @@ docker compose -f docker-compose.ghcr.yml logs --tail=100 frontend
 docker compose -f docker-compose.ghcr.yml logs --tail=100 backend
 ```
 
+### 注册或登录 IP 显示为 Docker 网关
+
+如果审计记录中的客户端 IP 全部显示为 `172.17.0.1`、`172.18.0.1`、`172.19.0.1` 等私网地址，说明后端记录的是 Docker 网关，而不是真实访客地址。典型原因是宿主机代理先把全部请求送到 `8888` 或 `8889`，随后前端容器再次代理 `/api/` 并覆盖 `X-Real-IP`。
+
+使用第 5 节的拆分配置：
+
+- PC 和移动域名的 `/api/` 都直接转发到 `127.0.0.1:5000`；
+- PC 页面 `/` 转发到 `127.0.0.1:8888`；
+- 移动 H5 页面 `/` 转发到 `127.0.0.1:8889`；
+- 每层受信代理都应覆盖 `X-Real-IP`，并使用 `$proxy_add_x_forwarded_for` 追加转发链；
+- 不要为了修复显示结果而让后端无条件信任来自公网的 `X-Forwarded-For`，否则客户端可以伪造审计 IP。
+
+1Panel/OpenResty 经常把通用 `location /` 放在单独的 `proxy/*.conf` 中。改成完整站点配置时，不要同时保留另一个定义相同 `location` 的 include，否则 Nginx 会因重复 location 无法加载。历史记录不会自动修改；请在重载代理后用新登录或测试账号验证。
+
+如果域名前还有 Cloudflare 或其他 CDN，宿主机看到的 `$remote_addr` 默认可能是 CDN 节点。应按照 CDN 官方公布的最新出口 CIDR 配置 Nginx `real_ip` 模块，并限制只有受信 CDN 可以访问源站；不要直接信任任意请求传入的 `CF-Connecting-IP` 或类似请求头。
+
 ### AI 流式输出约 50～60 秒后中断
 
 典型症状：
@@ -397,11 +482,11 @@ docker compose -f docker-compose.ghcr.yml logs --tail=100 backend
 
 这通常发生在宿主机 Nginx、1Panel OpenResty 等外层反向代理继续使用默认超时和响应缓冲时。即使 Docker 内部的前端代理已经配置 600 秒，外层代理仍可能先中断 SSE 连接。
 
-在每个对外提供 AI 聊天的域名配置中，为 SSE 路径增加独立的精确匹配。移动 H5 默认转发到 `8889`；Web 前端请把端口改为 `8888`：
+在每个对外提供 AI 聊天的域名配置中，为 SSE 路径增加独立的精确匹配，并直接转发到只绑定宿主机本地的后端端口 `5000`：
 
 ```nginx
 location = /api/ai/chat/message/stream {
-    proxy_pass http://127.0.0.1:8889;
+    proxy_pass http://127.0.0.1:5000;
 
     proxy_http_version 1.1;
     proxy_set_header Host $host;

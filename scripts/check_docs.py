@@ -19,6 +19,7 @@ IGNORED_DIRECTORIES = {
     ".pytest_cache",
     ".ruff_cache",
     ".test_deps",
+    ".venv",
     "__pycache__",
     "data",
     "logs",

@@ -84,6 +84,8 @@ FRONTEND_HOST=127.0.0.1
 FRONTEND_PORT=8888
 MOBILE_HOST=127.0.0.1
 MOBILE_PORT=8889
+# The first origin is the default post-login OAuth redirect target.
+FRONTEND_URL=https://app.example.com,https://m.example.com
 BACKEND_PORT=127.0.0.1:5000
 DB_PORT=127.0.0.1:5432
 REDIS_PORT=127.0.0.1:6379
@@ -113,7 +115,7 @@ docker compose -f docker-compose.ghcr.yml up -d --force-recreate frontend mobile
 
 The `backend` container listening internally on port `5000` is part of the application contract and is expected to remain fixed. `BACKEND_PORT=127.0.0.1:5000` controls only the host binding; frontend containers reach the API through `backend:5000` on the Docker network. To change the user-facing local port, update `FRONTEND_PORT` / `MOBILE_PORT` and recreate the containers.
 
-In production, never publish `5000`, `5432`, or `6379` directly to the internet. Configure the BT Panel Nginx/site reverse proxy to expose only `80/443` and forward to the host-local Web frontend (default `127.0.0.1:8888`); the frontend container continues to proxy API requests internally.
+In production, never publish `5000`, `5432`, or `6379` directly to the internet. Expose only `80/443` through BT Panel or 1Panel Nginx/OpenResty: send page requests to the host-local Web frontend (default `127.0.0.1:8888`) and send `/api/` directly to the backend at `127.0.0.1:5000`. This remains same-origin in the browser while preventing a second proxy hop in the frontend container from replacing the real client IP.
 
 ### Optional: full repository deployment
 
@@ -135,7 +137,7 @@ FRONTEND_URL=https://app.example.com,https://m.example.com
 ALLOW_LOCAL_DESKTOP_BROKERS=false
 ```
 
-Optionally create project-root `.env` with the same port settings shown above.
+Optionally create project-root `.env` with the same settings shown above. Compose expands and injects `FRONTEND_URL` from this file into the backend container, so set the production frontend origins here too and keep them aligned with the backend runtime env. Otherwise the Compose localhost default overrides the value in the backend runtime env.
 
 Start:
 
@@ -153,9 +155,9 @@ Keep these files separate:
 |------|---------|---------|
 | `backend.env` | `docker-compose.ghcr.yml` backend container | Runtime app config: admin account, `SECRET_KEY`, LLM keys, OAuth, broker keys |
 | `backend_api_python/.env` | full repository backend container | Same runtime app config when building from source |
-| project-root `.env` | Docker Compose | Ports, image tags, image paths, Postgres image/data options, image mirrors |
+| project-root `.env` | Docker Compose | Public frontend origins, ports, image tags, image paths, Postgres image/data options, image mirrors |
 
-Do not put secrets such as exchange API keys into the project-root `.env` unless Compose explicitly needs them.
+Do not put secrets such as exchange API keys into the project-root `.env` unless Compose explicitly needs them. The current Compose file explicitly injects `FRONTEND_URL`, so put that setting in the project-root `.env`; application secrets still belong in `backend.env` or `backend_api_python/.env`.
 
 ## 5. Configure Nginx
 
@@ -168,12 +170,46 @@ sudo apt install -y nginx
 
 Create `/etc/nginx/sites-available/quantdinger.conf`:
 
+Split page and API traffic at the host proxy while keeping the same public origin: send `/api/` directly to the backend bound on localhost port `5000`, and send all other page requests to Web port `8888` or mobile H5 port `8889`. Do not send all traffic through a frontend container and then proxy the API a second time. The current backend validates the forwarding peer, and a second proxy can replace `X-Real-IP` with a Docker gateway address.
+
 ```nginx
 server {
     listen 80;
     server_name app.example.com;
 
     client_max_body_size 20m;
+
+    location = /api/ai/chat/message/stream {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_request_buffering off;
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        send_timeout 600s;
+        add_header X-Accel-Buffering "no" always;
+        add_header Cache-Control "no-cache, no-transform" always;
+    }
+
+    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8888;
@@ -191,6 +227,38 @@ server {
 
     client_max_body_size 20m;
 
+    location = /api/ai/chat/message/stream {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_request_buffering off;
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        send_timeout 600s;
+        add_header X-Accel-Buffering "no" always;
+        add_header Cache-Control "no-cache, no-transform" always;
+    }
+
+    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 75s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8889;
         proxy_http_version 1.1;
@@ -202,7 +270,7 @@ server {
 }
 ```
 
-If you do not need a separate mobile domain, omit the second server block. Users can still access the mobile H5 service through the bound port or a path/domain you configure yourself.
+If you do not need a separate mobile domain, omit the second server block. Users can still access the mobile H5 service through the bound port or a path/domain you configure yourself. Port `5000` remains bound to `127.0.0.1` for access by Nginx/OpenResty on the same host; this does not expose the backend port directly to the internet.
 
 Enable:
 
@@ -239,10 +307,11 @@ https://m.example.com
 
 ## 7. Optional API Subdomain
 
-The recommended setup keeps API traffic same-origin through the frontend container:
+The recommended setup stays same-origin while splitting traffic at the host reverse proxy:
 
 ```text
-Browser -> https://app.example.com -> host Nginx -> frontend container -> /api -> backend:5000
+Browser -> https://app.example.com -> host Nginx -> /      -> frontend:8888
+                                                 -> /api/ -> backend:5000
 ```
 
 If you need a separate `api.example.com`, expose only the host-local backend through Nginx:
@@ -387,6 +456,22 @@ docker compose -f docker-compose.ghcr.yml logs --tail=100 frontend
 docker compose -f docker-compose.ghcr.yml logs --tail=100 backend
 ```
 
+### Registration or login IP is a Docker gateway
+
+If every audit record shows a private address such as `172.17.0.1`, `172.18.0.1`, or `172.19.0.1`, the backend is recording the Docker gateway instead of the real client. This commonly happens when the host proxy sends all traffic to port `8888` or `8889`, after which the frontend container proxies `/api/` a second time and replaces `X-Real-IP`.
+
+Use the split configuration from section 5:
+
+- send `/api/` on both Web and mobile domains directly to `127.0.0.1:5000`;
+- send Web page requests under `/` to `127.0.0.1:8888`;
+- send mobile H5 page requests under `/` to `127.0.0.1:8889`;
+- have every trusted proxy overwrite `X-Real-IP` and append the forwarding chain with `$proxy_add_x_forwarded_for`;
+- do not make the backend trust arbitrary public `X-Forwarded-For` headers merely to fix the display, because clients could then forge audit IPs.
+
+1Panel/OpenResty commonly stores a general `location /` in a separate `proxy/*.conf` file. When replacing it with a complete site configuration, do not retain another include that defines the same location, or Nginx will reject the duplicate. Existing audit rows are not rewritten; validate with a new login or test account after reloading the proxy.
+
+If Cloudflare or another CDN is in front of the domain, `$remote_addr` on the host may be a CDN edge address. Configure the Nginx `real_ip` module with the provider's current official egress CIDRs and restrict origin access to trusted CDN traffic. Do not blindly trust a client-supplied `CF-Connecting-IP` or similar header.
+
 ### AI streaming stops after about 50–60 seconds
 
 Typical symptoms:
@@ -397,11 +482,11 @@ Typical symptoms:
 
 This usually means an outer reverse proxy, such as host Nginx or 1Panel OpenResty, is still using default proxy timeouts and response buffering. A 600-second timeout inside the Docker frontend does not help when the outer proxy closes the SSE connection first.
 
-Add an exact SSE location to every public domain that serves AI chat. Mobile H5 normally proxies to port `8889`; use port `8888` for the Web frontend:
+Add an exact SSE location to every public domain that serves AI chat and send it directly to the backend bound on host-local port `5000`:
 
 ```nginx
 location = /api/ai/chat/message/stream {
-    proxy_pass http://127.0.0.1:8889;
+    proxy_pass http://127.0.0.1:5000;
 
     proxy_http_version 1.1;
     proxy_set_header Host $host;
