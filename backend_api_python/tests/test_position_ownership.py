@@ -94,6 +94,40 @@ def test_material_unknown_position_still_blocks_with_dust_tolerance():
     assert snapshot.reason == "unallocated_account_position"
 
 
+def test_strict_mode_allows_small_fee_and_rounding_shortfall():
+    snapshot = calculate_position_ownership(
+        symbol="BTC/USDT",
+        side="long",
+        account_qty=0.9955,
+        strategy_qty=1.0,
+    )
+    assert snapshot.status == STATUS_OK
+    assert snapshot.allowed is True
+    assert snapshot.tolerance == pytest.approx(0.005)
+
+
+def test_strict_mode_still_blocks_material_shortfall():
+    snapshot = calculate_position_ownership(
+        symbol="BTC/USDT",
+        side="long",
+        account_qty=0.994,
+        strategy_qty=1.0,
+    )
+    assert snapshot.status == STATUS_BLOCKED
+    assert snapshot.reason == "account_below_protected_allocation"
+
+
+def test_strict_mode_does_not_apply_fee_tolerance_to_extra_inventory():
+    snapshot = calculate_position_ownership(
+        symbol="BTC/USDT",
+        side="long",
+        account_qty=1.004,
+        strategy_qty=1.0,
+    )
+    assert snapshot.status == STATUS_BLOCKED
+    assert snapshot.reason == "unallocated_account_position"
+
+
 def test_manual_reduction_below_protected_total_blocks_entries():
     snapshot = calculate_position_ownership(
         symbol="BTC/USDT",

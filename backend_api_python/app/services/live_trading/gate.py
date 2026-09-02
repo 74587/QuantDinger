@@ -28,6 +28,16 @@ from app.utils.numeric_precision import floor_decimal_to_step
 logger = logging.getLogger(__name__)
 
 
+def _gate_decimal_text(value: Union[Decimal, float, int, str]) -> str:
+    """Serialize numeric order fields without scientific notation.
+
+    Gate spot rejects otherwise valid small amounts such as ``5e-05``.  Build
+    the decimal from ``str`` first so binary-float artifacts are not exposed,
+    then force fixed-point output for every Gate order path.
+    """
+    return format(Decimal(str(value)), "f")
+
+
 def _gate_ticker_response_to_normalized(raw: Any) -> Dict[str, Any]:
     """Parse Gate spot/futures tickers API (array of one row) into a dict with float ``last`` for quick_trade."""
     row: Dict[str, Any] = {}
@@ -184,8 +194,8 @@ class GateSpotClient(_GateBase):
             "currency_pair": to_gate_currency_pair(symbol),
             "side": sd,
             "type": "limit",
-            "amount": str(qty),
-            "price": str(px),
+            "amount": _gate_decimal_text(qty),
+            "price": _gate_decimal_text(px),
             "time_in_force": "gtc",
         }
         text = self._format_text(client_order_id)
@@ -207,7 +217,7 @@ class GateSpotClient(_GateBase):
             "currency_pair": to_gate_currency_pair(symbol),
             "side": sd,
             "type": "market",
-            "amount": str(qty),
+            "amount": _gate_decimal_text(qty),
             "time_in_force": "ioc",
         }
         text = self._format_text(client_order_id)
@@ -674,7 +684,12 @@ class GateUsdtFuturesClient(_GateBase):
         size_str, extra_headers = self._resolve_order_size(contract=contract, side=sd, base_size=base_qty)
         if size_str in ("0", "-0", ""):
             raise LiveTradingError("Invalid size (resolved contracts == 0)")
-        body: Dict[str, Any] = {"contract": contract, "size": size_str, "price": str(px), "tif": "gtc"}
+        body: Dict[str, Any] = {
+            "contract": contract,
+            "size": size_str,
+            "price": _gate_decimal_text(px),
+            "tif": "gtc",
+        }
         if reduce_only:
             body["reduce_only"] = True
         text = self._format_text(client_order_id)

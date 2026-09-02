@@ -1,6 +1,7 @@
 """OKX order size precision inference from lotSz."""
 
 import time
+from unittest.mock import patch
 
 from app.services.live_trading.okx import OkxClient
 
@@ -49,3 +50,39 @@ def test_positive_exponent_lot_sz_clamps_to_zero_precision():
     )
     assert precision == 0
     assert c._dec_str(sz, strict_precision=precision) == "20"
+
+
+def test_spot_limit_order_serializes_small_price_without_exponent():
+    c = _client_with_instrument("SHIB-USDT", "SPOT", "1", "1")
+    with patch.object(c, "_signed_request", return_value={"data": [{"ordId": "123"}]}) as request:
+        c.place_limit_order(
+            market_type="spot",
+            symbol="SHIB/USDT",
+            side="buy",
+            size=10,
+            price=1e-05,
+        )
+
+    body = request.call_args.kwargs["json_body"]
+    assert body["px"] == "0.00001"
+    assert "e" not in body["px"].lower()
+
+
+def test_swap_limit_order_serializes_small_price_without_exponent():
+    c = _client_with_instrument("SHIB-USDT-SWAP", "SWAP", "1", "1")
+    c._inst_cache["SWAP:SHIB-USDT-SWAP"][1]["ctVal"] = "1"
+    with (
+        patch.object(c, "_resolve_pos_side", return_value="net"),
+        patch.object(c, "_signed_request", return_value={"data": [{"ordId": "123"}]}) as request,
+    ):
+        c.place_limit_order(
+            market_type="swap",
+            symbol="SHIB/USDT",
+            side="buy",
+            size=10,
+            price=1e-05,
+        )
+
+    body = request.call_args.kwargs["json_body"]
+    assert body["px"] == "0.00001"
+    assert "e" not in body["px"].lower()

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict
 
 from app.services.live_trading.position_ownership import (
+    DEFAULT_SHORTFALL_RELATIVE_TOLERANCE,
     evaluate_and_record_ownership,
     normalize_market_type,
     ownership_log_message,
@@ -61,11 +62,20 @@ def evaluate_entry_position_guard(
         dust_quote = float(
             trading_config.get("position_drift_tolerance_quote")
             or strategy_config.get("position_drift_tolerance_quote")
-            or 1.0
+            or 3.0
         )
     except (TypeError, ValueError):
-        dust_quote = 1.0
+        dust_quote = 3.0
     dust_quote = min(5.0, max(0.0, dust_quote))
+    try:
+        shortfall_ratio = float(
+            trading_config.get("position_shortfall_tolerance_ratio")
+            or strategy_config.get("position_shortfall_tolerance_ratio")
+            or DEFAULT_SHORTFALL_RELATIVE_TOLERANCE
+        )
+    except (TypeError, ValueError):
+        shortfall_ratio = DEFAULT_SHORTFALL_RELATIVE_TOLERANCE
+    shortfall_ratio = min(0.02, max(0.001, shortfall_ratio))
     price = max(0.0, float(reference_price or 0.0))
     absolute_tolerance = dust_quote / price if dust_quote > 0 and price > 0 else 0.0
     snapshot = evaluate_and_record_ownership(
@@ -78,6 +88,7 @@ def evaluate_entry_position_guard(
         account_qty=float(account_qty or 0.0),
         strategy_qty=float(strategy_qty or 0.0),
         absolute_tolerance=absolute_tolerance,
+        shortfall_relative_tolerance=shortfall_ratio,
     )
     metadata = snapshot.metadata()
     if not snapshot.allowed:

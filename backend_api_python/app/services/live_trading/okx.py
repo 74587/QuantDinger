@@ -707,7 +707,7 @@ class OkxClient(BaseRestClient):
                 "side": sd,
                 "ordType": "limit",
                 "sz": self._dec_str(sz_dec, strict_precision=sz_precision),
-                "px": str(px),
+                "px": self._dec_str(self._to_dec(px)),
             }
         else:
             inst_id = to_okx_swap_inst_id(symbol)
@@ -728,7 +728,7 @@ class OkxClient(BaseRestClient):
                 "posSide": ps,
                 "ordType": "limit",
                 "sz": self._dec_str(sz_dec, strict_precision=sz_precision),
-                "px": str(px),
+                "px": self._dec_str(self._to_dec(px)),
             }
             if reduce_only and ps == "net":
                 body["reduceOnly"] = "true"

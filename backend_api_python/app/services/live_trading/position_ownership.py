@@ -31,6 +31,8 @@ COEXISTENCE_MARKET_TYPES = frozenset({"spot", "swap"})
 CRYPTO_COEXISTENCE_EXCHANGES = frozenset({
     "binance", "bitget", "bybit", "gate", "htx", "okx",
 })
+DEFAULT_DRIFT_RELATIVE_TOLERANCE = 0.001
+DEFAULT_SHORTFALL_RELATIVE_TOLERANCE = 0.005
 
 
 def normalize_market_type(value: str) -> str:
@@ -89,6 +91,7 @@ def calculate_position_ownership(
     previous_status: str = "",
     previous_reason: str = "",
     absolute_tolerance: float = 0.0,
+    shortfall_relative_tolerance: float = DEFAULT_SHORTFALL_RELATIVE_TOLERANCE,
 ) -> OwnershipSnapshot:
     """Pure ownership calculation used by execution, APIs, and tests."""
     account = max(0.0, float(account_qty or 0.0))
@@ -99,8 +102,26 @@ def calculate_position_ownership(
         # A stale protected value must never silently weaken strict mode.
         protected = 0.0
     expected = strategy + protected
-    tolerance = max(1e-8, expected * 0.001, max(0.0, float(absolute_tolerance or 0.0)))
     unknown = account - expected
+    # Extra inventory is not explained by trading fees, so keep the original
+    # strict 0.1% boundary.  A small account shortfall, however, is expected
+    # after base-asset fees and exchange lot rounding; tolerate up to 0.5% by
+    # default.  The quote-denominated absolute tolerance covers tiny positions
+    # where a percentage alone would be smaller than exchange dust.
+    relative_tolerance = DEFAULT_DRIFT_RELATIVE_TOLERANCE
+    if unknown < 0:
+        relative_tolerance = min(
+            0.02,
+            max(
+                DEFAULT_DRIFT_RELATIVE_TOLERANCE,
+                float(shortfall_relative_tolerance or 0.0),
+            ),
+        )
+    tolerance = max(
+        1e-8,
+        expected * relative_tolerance,
+        max(0.0, float(absolute_tolerance or 0.0)),
+    )
     if abs(unknown) <= tolerance:
         status = STATUS_OK
         reason = ""
@@ -176,6 +197,7 @@ def evaluate_and_record_ownership(
     strategy_qty: float,
     inst_id: str = "",
     absolute_tolerance: float = 0.0,
+    shortfall_relative_tolerance: float = DEFAULT_SHORTFALL_RELATIVE_TOLERANCE,
 ) -> OwnershipSnapshot:
     """Evaluate one leg and persist its block/recovery state atomically enough for workers."""
     row = _fetch_reservation(
@@ -195,6 +217,7 @@ def evaluate_and_record_ownership(
         previous_status=str(row.get("status") or ""),
         previous_reason=str(row.get("drift_reason") or ""),
         absolute_tolerance=float(absolute_tolerance or 0.0),
+        shortfall_relative_tolerance=float(shortfall_relative_tolerance or 0.0),
     )
     with get_db_connection() as db:
         cur = db.cursor()
