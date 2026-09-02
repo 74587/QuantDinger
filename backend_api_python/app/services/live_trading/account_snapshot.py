@@ -294,7 +294,147 @@ def _fetch_multi_crypto_snapshot(
     if not spot_pos and swap_client is not None and spot_client is not swap_client:
         spot_pos = _fetch_spot_wallet(swap_client, errors, label=f"{ex.upper()} 现货持仓")
 
+    if ex in ("gate", "gateio"):
+        orders.extend(_fetch_gate_open_orders(swap_client, spot_client, errors))
+
     return swap_pos, spot_pos, orders
+
+
+def _gate_symbol(raw: Any) -> str:
+    native = str(raw or "").strip().upper()
+    if not native:
+        return ""
+    symbol = native.replace("-", "/").replace("_", "/")
+    return normalize_strategy_symbol(symbol) or symbol
+
+
+def _parse_gate_spot_orders(payload: Any) -> List[Dict[str, Any]]:
+    """Flatten Gate's account-wide spot open-order groups."""
+    rows: List[Dict[str, Any]] = []
+    raw_groups = payload if isinstance(payload, list) else []
+    for group in raw_groups:
+        if not isinstance(group, dict):
+            continue
+        grouped_orders = group.get("orders")
+        if isinstance(grouped_orders, list):
+            native_pair = str(group.get("currency_pair") or "")
+            candidates = [
+                (order, native_pair)
+                for order in grouped_orders
+                if isinstance(order, dict)
+            ]
+        else:
+            candidates = [(group, str(group.get("currency_pair") or ""))]
+        for order, fallback_pair in candidates:
+            native_pair = str(order.get("currency_pair") or fallback_pair).strip()
+            symbol = _gate_symbol(native_pair)
+            if not symbol:
+                continue
+            try:
+                amount = abs(float(order.get("amount") or 0.0))
+                raw_left = order.get("left")
+                remaining = abs(
+                    float(amount if raw_left is None or raw_left == "" else raw_left)
+                )
+                price = float(order.get("price") or 0.0)
+            except (TypeError, ValueError):
+                amount, remaining, price = 0.0, 0.0, 0.0
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "side": str(order.get("side") or "").strip().lower(),
+                    "market_type": "spot",
+                    "order_type": str(order.get("type") or "limit").strip().lower(),
+                    "price": price,
+                    "amount": amount,
+                    "filled": max(0.0, amount - remaining),
+                    "exchange_order_id": str(order.get("id") or order.get("id_string") or ""),
+                    "status": str(order.get("status") or "open"),
+                    "inst_id": native_pair,
+                }
+            )
+    return rows
+
+
+def _parse_gate_futures_orders(payload: Any, *, client: Any = None) -> List[Dict[str, Any]]:
+    """Normalize Gate futures contracts to the account snapshot order schema."""
+    rows: List[Dict[str, Any]] = []
+    multiplier_cache: Dict[str, float] = {}
+    for order in payload if isinstance(payload, list) else []:
+        if not isinstance(order, dict):
+            continue
+        contract = str(order.get("contract") or "").strip()
+        symbol = _gate_symbol(contract)
+        if not symbol:
+            continue
+        try:
+            raw_size = order.get("amount")
+            if raw_size is None or raw_size == "":
+                raw_size = order.get("size")
+            signed_size = float(raw_size or 0.0)
+            raw_left = order.get("left")
+            signed_left = float(
+                signed_size if raw_left is None or raw_left == "" else raw_left
+            )
+            price = float(order.get("price") or 0.0)
+        except (TypeError, ValueError):
+            signed_size, signed_left, price = 0.0, 0.0, 0.0
+
+        multiplier = multiplier_cache.get(contract)
+        if multiplier is None:
+            multiplier = 1.0
+            if client is not None and hasattr(client, "get_contract"):
+                try:
+                    meta = client.get_contract(contract=contract) or {}
+                    multiplier = float(
+                        meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0
+                    ) or 1.0
+                except Exception:
+                    multiplier = 1.0
+            multiplier_cache[contract] = multiplier
+        amount = abs(signed_size) * multiplier
+        remaining = abs(signed_left) * multiplier
+        rows.append(
+            {
+                "symbol": symbol,
+                "side": "buy" if signed_size > 0 else "sell" if signed_size < 0 else "",
+                "market_type": "swap",
+                "order_type": "market" if price <= 0 else "limit",
+                "price": price,
+                "amount": amount,
+                "filled": max(0.0, amount - remaining),
+                "exchange_order_id": str(order.get("id_string") or order.get("id") or ""),
+                "status": str(order.get("status") or "open"),
+                "inst_id": contract,
+            }
+        )
+    return rows
+
+
+def _fetch_gate_open_orders(
+    swap_client: Any,
+    spot_client: Any,
+    errors: List[str],
+) -> List[Dict[str, Any]]:
+    from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+
+    orders: List[Dict[str, Any]] = []
+    if isinstance(swap_client, GateUsdtFuturesClient):
+        try:
+            orders.extend(
+                _parse_gate_futures_orders(
+                    swap_client.get_open_orders(limit=100),
+                    client=swap_client,
+                )
+            )
+        except Exception as e:
+            _append_snapshot_error(errors, e, context="GATE 合约挂单")
+    if isinstance(spot_client, GateSpotClient):
+        try:
+            orders.extend(_parse_gate_spot_orders(spot_client.get_open_orders(limit=100)))
+        except Exception as e:
+            _append_snapshot_error(errors, e, context="GATE 现货挂单")
+    return orders
 
 
 def _parse_binance_futures_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -563,7 +703,12 @@ def fetch_account_snapshot(*, user_id: int, credential_id: int) -> Dict[str, Any
     deduped_orders: List[Dict[str, Any]] = []
     for o in orders_all:
         oid = str(o.get("exchange_order_id") or "")
-        key = oid or f"{o.get('symbol')}-{o.get('side')}-{o.get('price')}"
+        market_type = str(o.get("market_type") or "").strip().lower()
+        key = (
+            f"{market_type}:{oid}"
+            if oid
+            else f"{market_type}:{o.get('symbol')}-{o.get('side')}-{o.get('price')}"
+        )
         if key in seen:
             continue
         seen.add(key)

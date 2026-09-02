@@ -182,6 +182,15 @@ class GateSpotClient(_GateBase):
     def get_accounts(self) -> Any:
         return self._signed_request("GET", "/api/v4/spot/accounts")
 
+    def get_open_orders(self, *, limit: int = 100) -> Any:
+        """Return current spot orders across every currency pair."""
+        page_limit = min(100, max(1, int(limit or 100)))
+        return self._signed_request(
+            "GET",
+            "/api/v4/spot/open_orders",
+            params={"page": 1, "limit": page_limit, "account": "spot"},
+        )
+
     def place_limit_order(self, *, symbol: str, side: str, size: float, price: float, client_order_id: Optional[str] = None) -> LiveOrderResult:
         sd = (side or "").strip().lower()
         if sd not in ("buy", "sell"):
@@ -713,6 +722,15 @@ class GateUsdtFuturesClient(_GateBase):
         if not order_id:
             raise LiveTradingError("Gate futures get_order requires order_id")
         return self._signed_request("GET", f"/api/v4/futures/usdt/orders/{str(order_id)}")
+
+    def get_open_orders(self, *, limit: int = 100) -> Any:
+        """Return current USDT-settled futures orders across every contract."""
+        page_limit = min(100, max(1, int(limit or 100)))
+        return self._signed_request(
+            "GET",
+            "/api/v4/futures/usdt/orders",
+            params={"status": "open", "limit": page_limit, "offset": 0},
+        )
 
     def get_futures_trades_for_order(self, *, order_id: str, contract: str) -> Tuple[float, str]:
         """Aggregate the actual fee from Gate USDT futures fill history.

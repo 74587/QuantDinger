@@ -55,3 +55,29 @@ def test_gate_futures_limit_order_serializes_small_price_without_exponent():
     body = mock_req.call_args.kwargs["json_body"]
     assert body["price"] == "0.00001"
     assert "e" not in body["price"].lower()
+
+
+def test_gate_spot_open_orders_uses_account_wide_endpoint():
+    client = GateSpotClient(api_key="k", secret_key="s")
+    with patch.object(client, "_signed_request", return_value=[]) as mock_req:
+        client.get_open_orders(limit=100)
+
+    assert mock_req.call_args.args == ("GET", "/api/v4/spot/open_orders")
+    assert mock_req.call_args.kwargs["params"] == {
+        "page": 1,
+        "limit": 100,
+        "account": "spot",
+    }
+
+
+def test_gate_futures_open_orders_requests_open_status():
+    client = GateUsdtFuturesClient(api_key="k", secret_key="s")
+    with patch.object(client, "_signed_request", return_value=[]) as mock_req:
+        client.get_open_orders(limit=100)
+
+    assert mock_req.call_args.args == ("GET", "/api/v4/futures/usdt/orders")
+    assert mock_req.call_args.kwargs["params"] == {
+        "status": "open",
+        "limit": 100,
+        "offset": 0,
+    }
