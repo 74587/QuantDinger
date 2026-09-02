@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 
 from app.services import mfa_service
+from app.services.execution_streams.repository import ExecutionEventRepository
 from app.services.strategy_command_repository import StrategyCommandRepository
 from app.utils import strategy_runtime_logs
 
@@ -104,3 +105,26 @@ def test_worker_heartbeat_returns_text_primary_key(monkeypatch):
     assert "RETURNING id" not in sql
     assert params[0:2] == ("worker-1", "trading")
     assert conn.committed
+
+
+def test_execution_stream_health_returns_stream_key(monkeypatch):
+    conn = _CaptureConn()
+    monkeypatch.setattr(
+        "app.services.execution_streams.repository.get_db_connection",
+        lambda: _capture_connection(conn),
+    )
+
+    ExecutionEventRepository().update_health(
+        stream_key="okx:9:all",
+        credential_id=9,
+        exchange_id="okx",
+        market_type="all",
+        state="connected",
+    )
+
+    sql, params = conn.cursor_obj.calls[0]
+    assert "RETURNING stream_key" in sql
+    assert "RETURNING id" not in sql
+    assert params[0] == "okx:9:all"
+    assert conn.committed
+    assert conn.cursor_obj.closed

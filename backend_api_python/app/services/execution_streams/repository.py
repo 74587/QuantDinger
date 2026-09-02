@@ -376,6 +376,7 @@ class ExecutionEventRepository:
                     rest_fallback = EXCLUDED.rest_fallback,
                     last_error = EXCLUDED.last_error,
                     updated_at = NOW()
+                RETURNING stream_key
                 """,
                 (
                     str(stream_key),
