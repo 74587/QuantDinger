@@ -46,8 +46,8 @@ flask-smorest>=0.47.0,<0.48
 marshmallow>=4.3.0,<5
 PyYAML>=6.0.3
 # Server-side PDF export for AI analysis reports
-# GHSA-fp3f-mc75-235c / GHSA-fwg2-594c-jp42 (unbounded PDF resource use); 6.15.0+
-pypdf>=6.15.0,<7
+# PDF resource exhaustion and malformed-stream advisories; 6.16.2+
+pypdf>=6.16.2,<7
 reportlab>=5.0.0
 # Password hashing
 bcrypt>=5.0.0
