@@ -130,6 +130,23 @@ class StrategyV2StorageCompatibilityTests(unittest.TestCase):
         self.assertEqual(compact["equityCurve"][0], rows[0])
         self.assertEqual(compact["equityCurve"][-1], rows[-1])
 
+    def test_trade_review_snapshots_keep_up_to_three_thousand_candles(self):
+        candles = [{"time": index, "close": index} for index in range(3500)]
+
+        compact = _compact_backtest_result({
+            "reviewCandles": {
+                "Crypto:ETH/USDT@swap": {
+                    "timeframe": "1H",
+                    "candles": candles,
+                },
+            },
+        })
+
+        snapshot = compact["reviewCandles"]["Crypto:ETH/USDT@swap"]
+        self.assertEqual(len(snapshot["candles"]), 3000)
+        self.assertEqual(snapshot["candles"][0], candles[500])
+        self.assertEqual(compact["historyStorage"]["limits"]["reviewCandlesPerSymbol"], 3000)
+
     def test_postgres_cursor_bulk_path_converts_placeholders_without_returning_ids(self):
         raw = _RawCursor()
         cursor = PostgresCursor(raw)

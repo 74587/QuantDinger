@@ -40,7 +40,7 @@ _LEGACY_BUILTIN_SAMPLE_NAMES = (
 #   * df = df.copy()  -> work on a private copy
 #   * output['signals'] is chart-only and never drives orders by itself
 #   * output dict contains plots / signals; every data list MUST have length == len(df)
-#   * # @param ... range=a:b:s  auto-detected by the structured parameter tuner
+#   * # @param ... range=a:b:s  exposes a validated parameter control in the IDE
 _SUPERTREND_CODE = r'''# ============================================================
 # [Sample] SuperTrend Trend-Following -- classic ATR channel flip
 # --- QuantDinger chart indicator contract ---
@@ -188,8 +188,8 @@ def _builtin_specs() -> List[Dict[str, str]]:
             "description": (
                 "Classic SuperTrend (ATR-channel direction flip): Wilder-smoothed ATR "
                 "drives adaptive upper / lower bands; opens on trend flip and closes "
-                "on the reverse flip. Tunable params are declared via @param so the "
-                "Smart Tuner can sweep them out-of-the-box."
+                "on the reverse flip. Runtime parameters are declared via @param so "
+                "users can adjust them from the IDE parameter panel."
             ),
             "code": _SUPERTREND_CODE,
         },

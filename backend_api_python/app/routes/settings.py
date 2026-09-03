@@ -1650,13 +1650,6 @@ CONFIG_SCHEMA = {
                 'description': 'Credits per AI conversion from a chart-only indicator into an executable script strategy'
             },
             {
-                'key': 'BILLING_COST_AI_TUNING',
-                'label': 'AI Parameter Tuning Cost',
-                'type': 'number',
-                'default': '50',
-                'description': 'Credits per AI parameter tuning run (multi-round model calls plus backtests)'
-            },
-            {
                 'key': 'BILLING_COST_AI_COPILOT_CHAT',
                 'label': 'AI Copilot Chat Cost',
                 'type': 'number',

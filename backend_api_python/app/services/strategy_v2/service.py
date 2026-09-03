@@ -718,7 +718,7 @@ def _build_review_candle_snapshots(
     source_frequency: str,
     start_date: datetime | None = None,
     end_date: datetime | None = None,
-    max_bars: int = 1000,
+    max_bars: int = 3000,
     max_symbols: int = 12,
 ) -> dict[str, dict[str, Any]]:
     """Persist bounded OHLCV-only snapshots for fast, reproducible trade review."""

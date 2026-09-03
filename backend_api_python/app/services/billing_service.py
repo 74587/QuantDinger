@@ -410,7 +410,7 @@ class BillingService:
         
         Args:
             user_id: User id.
-            feature: Billing feature key, for example ai_analysis, ai_code_gen, or ai_tuning.
+            feature: Billing feature key, for example ai_analysis or ai_code_gen.
             reference_id: Optional related entity id.
         
         Returns:
@@ -717,7 +717,6 @@ class BillingService:
                 'ai_analysis': config.get('cost_ai_analysis', 0),
                 'ai_code_gen': config.get('cost_ai_code_gen', 0),
                 'ai_indicator_to_strategy': config.get('cost_ai_indicator_to_strategy', 0),
-                'ai_tuning': config.get('cost_ai_tuning', 0),
                 'ai_copilot_chat': config.get('cost_ai_copilot_chat', 0),
                 'ai_copilot_image': config.get('cost_ai_copilot_image', 0),
                 'ai_copilot_radar': config.get('cost_ai_copilot_radar', 0),

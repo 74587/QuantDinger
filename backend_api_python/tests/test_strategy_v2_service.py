@@ -123,7 +123,7 @@ def test_benchmark_alignment_covers_the_full_final_intraday_bar():
     assert result["benchmarkCoverageEnd"] == "2026-08-29T23:59:59.999999Z"
 
 
-def test_trade_review_snapshot_aggregates_month_of_minutes_and_keeps_only_ohlcv():
+def test_trade_review_snapshot_uses_the_finest_bounded_timeframe_and_keeps_only_ohlcv():
     index = pd.date_range("2026-07-31", periods=30 * 24 * 60, freq="min")
     frame = pd.DataFrame({
         "open": range(len(index)),
@@ -148,8 +148,8 @@ def test_trade_review_snapshot_aggregates_month_of_minutes_and_keeps_only_ohlcv(
     )
 
     snapshot = snapshots[symbol]
-    assert snapshot["timeframe"] == "1H"
-    assert 600 < len(snapshot["candles"]) <= 1000
+    assert snapshot["timeframe"] == "15m"
+    assert 2000 < len(snapshot["candles"]) <= 3000
     assert set(snapshot["candles"][0]) == {"time", "open", "high", "low", "close", "volume"}
     assert max(item["volume"] for item in snapshot["candles"]) > 3
     first_time = pd.to_datetime(snapshot["candles"][0]["time"], unit="s", utc=True)
@@ -191,6 +191,26 @@ def test_month_of_minutes_uses_a_complete_coarser_benchmark_frequency():
     )
 
     assert timeframe == "15m"
+
+
+def test_year_of_hourly_review_uses_four_hours_instead_of_daily_candles():
+    timeframe, _rule, _seconds = _review_frequency_for_window(
+        "1H",
+        365 * 24 * 60 * 60,
+        max_bars=3000,
+    )
+
+    assert timeframe == "4H"
+
+
+def test_short_hourly_review_keeps_the_strategy_timeframe():
+    timeframe, _rule, _seconds = _review_frequency_for_window(
+        "1H",
+        90 * 24 * 60 * 60,
+        max_bars=3000,
+    )
+
+    assert timeframe == "1H"
 
 
 def _frame(*_args, **_kwargs):

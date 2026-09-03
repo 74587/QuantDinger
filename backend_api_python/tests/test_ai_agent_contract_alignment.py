@@ -15,6 +15,7 @@ from app.services.ai_skill_registry import (
     render_prompt_template,
 )
 from app.services.ai_tool_registry import MCP_AGENT_TOOLS, TOOLS
+from app.services.billing_config import DEFAULT_BILLING_CONFIG, FEATURE_NAMES
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -101,6 +102,17 @@ def test_builtin_skill_registry_does_not_advertise_retired_experiments():
     assert "experiment" not in by_id["job_monitor"]["description"].lower()
     assert "symbol" not in by_id["backtest_runner"]["requires"]
     assert "timeframe" not in by_id["backtest_runner"]["requires"]
+
+
+def test_retired_parameter_tuning_is_not_exposed_or_billable(app):
+    assert "/api/backtest/tune" not in {rule.rule for rule in app.url_map.iter_rules()}
+    assert "cost_ai_tuning" not in DEFAULT_BILLING_CONFIG
+    assert "ai_tuning" not in FEATURE_NAMES
+
+    human_paths = yaml.safe_load(
+        (BACKEND_ROOT / "docs" / "api" / "openapi.yaml").read_text(encoding="utf-8")
+    )["paths"]
+    assert "/api/backtest/tune" not in human_paths
 
 
 def test_prompt_skill_manifest_rejects_executable_or_action_fields():

@@ -384,7 +384,7 @@ def _compact_backtest_result(result: dict[str, Any]) -> dict[str, Any]:
     compact["reviewCandles"] = {
         str(symbol): {
             "timeframe": str((snapshot or {}).get("timeframe") or ""),
-            "candles": list((snapshot or {}).get("candles") or [])[-1000:],
+            "candles": list((snapshot or {}).get("candles") or [])[-3000:],
         }
         for symbol, snapshot in list(snapshots.items())[:12]
         if isinstance(snapshot, dict)
@@ -401,7 +401,7 @@ def _compact_backtest_result(result: dict[str, Any]) -> dict[str, Any]:
             "closedTrades": 5000,
             "executions": 5000,
             "reviewCandleSymbols": 12,
-            "reviewCandlesPerSymbol": 1000,
+            "reviewCandlesPerSymbol": 3000,
         },
     }
     return compact

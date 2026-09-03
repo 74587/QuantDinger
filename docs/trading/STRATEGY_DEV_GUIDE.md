@@ -849,7 +849,7 @@ Inspect:
 - Live trading uses venue-reported fill fees and, where available, funding/account-ledger records. A fee may be charged in quote, base, or a discount token, so conversion and reconciliation can lag the fill.
 - Test a range of commission and slippage assumptions. A strategy whose edge disappears under a small cost increase is not robust.
 
-The backtest center also supports factor research and parameter tuning. Tuning accepts grid or random parameter spaces, caps a request at 500 variants, and reports out-of-sample validation for the selected result. Backtests may consume a system-configured credit amount; a failed execution is refunded automatically. UI request timeouts do not prove the server job failed—check backtest history before submitting a duplicate run.
+The backtest center also supports factor research. Backtests may consume a system-configured credit amount; a failed execution is refunded automatically. UI request timeouts do not prove the server job failed—check backtest history before submitting a duplicate run.
 
 Zero executions can be valid: insufficient history, conditions never met, poor parameters, missing data, or rejected orders. Read logs and the order ledger before treating it as an engine failure.
 
