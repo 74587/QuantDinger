@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS qd_users (
     role VARCHAR(20) DEFAULT 'user',       -- admin/manager/user/viewer
     credits DECIMAL(20,2) DEFAULT 0,
     vip_expires_at TIMESTAMP,              -- VIP杩囨湡鏃堕棿
-    vip_plan VARCHAR(20) DEFAULT '',
+    vip_plan VARCHAR(64) DEFAULT '',
     vip_is_lifetime BOOLEAN DEFAULT FALSE,
     vip_monthly_credits_last_grant TIMESTAMP,
     email_verified BOOLEAN DEFAULT FALSE,
@@ -64,7 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_credits_log_created_at ON qd_credits_log(created_
 CREATE TABLE IF NOT EXISTS qd_membership_orders (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
-    plan VARCHAR(20) NOT NULL,             -- monthly/yearly/lifetime
+    plan VARCHAR(64) NOT NULL,
     price_usd DECIMAL(10,2) DEFAULT 0,
     status VARCHAR(20) DEFAULT 'paid',
     created_at TIMESTAMP DEFAULT NOW(),
@@ -72,6 +72,43 @@ CREATE TABLE IF NOT EXISTS qd_membership_orders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_membership_orders_user_id ON qd_membership_orders(user_id);
+
+CREATE TABLE IF NOT EXISTS qd_billing_plans (
+    code VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(120) NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    price_usd DECIMAL(12,2) NOT NULL DEFAULT 0,
+    duration_days INTEGER NOT NULL DEFAULT 0,
+    credits_once INTEGER NOT NULL DEFAULT 0,
+    credits_monthly INTEGER NOT NULL DEFAULT 0,
+    is_lifetime BOOLEAN NOT NULL DEFAULT FALSE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_popular BOOLEAN NOT NULL DEFAULT FALSE,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    stripe_price_id VARCHAR(255) NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS qd_membership_fulfillments (
+    provider_ref VARCHAR(255) PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    plan VARCHAR(64) NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS qd_stripe_orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    plan VARCHAR(64) NOT NULL,
+    stripe_session_id VARCHAR(255) UNIQUE,
+    amount_usd DECIMAL(12,2) NOT NULL DEFAULT 0,
+    currency VARCHAR(10) NOT NULL DEFAULT 'usd',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    paid_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
 
 -- =============================================================================
 -- 1.56. USDT Orders (multi-chain single-receiving-address + amount-suffix model)
@@ -89,7 +126,7 @@ CREATE INDEX IF NOT EXISTS idx_membership_orders_user_id ON qd_membership_orders
 CREATE TABLE IF NOT EXISTS qd_usdt_orders (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
-    plan VARCHAR(20) NOT NULL,                                  -- monthly/yearly/lifetime
+    plan VARCHAR(64) NOT NULL,
     chain VARCHAR(20) NOT NULL DEFAULT 'TRC20',                 -- TRC20/BEP20/ERC20/SOL
     currency VARCHAR(10) NOT NULL DEFAULT 'USDT',
     amount_usdt DECIMAL(20,8) NOT NULL DEFAULT 0,               -- final amount = base + suffix (6 dp typical)
@@ -117,8 +154,13 @@ CREATE INDEX IF NOT EXISTS idx_usdt_orders_status ON qd_usdt_orders(status);
 DROP INDEX IF EXISTS idx_usdt_orders_address_unique;
 -- Prevent two active orders on the same chain from claiming the same amount,
 -- which is the foundation of the amount-suffix matching scheme.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_usdt_orders_amount_active
-  ON qd_usdt_orders(chain, amount_usdt)
+-- Existing installations must gain the discriminator before the new index
+-- references it; CREATE TABLE IF NOT EXISTS above does not alter old tables.
+ALTER TABLE qd_usdt_orders
+    ADD COLUMN IF NOT EXISTS currency VARCHAR(10) NOT NULL DEFAULT 'USDT';
+DROP INDEX IF EXISTS idx_usdt_orders_amount_active;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crypto_orders_amount_active
+  ON qd_usdt_orders(currency, chain, amount_usdt)
   WHERE status IN ('pending', 'paid');
 
 -- One-shot cleanup for installs that pre-date v3.0.6. address_index is no
@@ -163,6 +205,12 @@ BEGIN
     -- widen address (TRC20 base58 ~34, Solana ~44; old col was 80)
     BEGIN
         ALTER TABLE qd_usdt_orders ALTER COLUMN address TYPE VARCHAR(120);
+    EXCEPTION WHEN others THEN NULL;
+    END;
+    BEGIN
+        ALTER TABLE qd_usdt_orders ALTER COLUMN plan TYPE VARCHAR(64);
+        ALTER TABLE qd_membership_orders ALTER COLUMN plan TYPE VARCHAR(64);
+        ALTER TABLE qd_users ALTER COLUMN vip_plan TYPE VARCHAR(64);
     EXCEPTION WHEN others THEN NULL;
     END;
 END

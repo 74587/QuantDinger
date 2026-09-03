@@ -69,8 +69,9 @@ ADVANCED_KEYS = {
     # AI reflection / calibration
     'REFLECTION_WORKER_INTERVAL_SEC', 'REFLECTION_MIN_AGE_DAYS', 'REFLECTION_VALIDATE_LIMIT',
     'AI_CALIBRATION_MARKETS', 'AI_CALIBRATION_LOOKBACK_DAYS', 'AI_CALIBRATION_MIN_SAMPLES',
-    # USDT pay internals
+    # Stablecoin pay internals
     'USDT_TRC20_CONTRACT', 'USDT_BEP20_CONTRACT', 'USDT_ERC20_CONTRACT', 'USDT_SOL_MINT',
+    'USDC_ERC20_CONTRACT', 'USDC_SOL_MINT',
     'TRONGRID_BASE_URL', 'ETHERSCAN_V2_BASE_URL', 'BSC_RPC_URLS', 'ETH_RPC_URLS',
     'SOLANA_RPC_URL', 'BEP20_PREFER_EXPLORER', 'ERC20_PREFER_EXPLORER',
     'USDT_PAY_CONFIRM_SECONDS', 'USDT_PAY_EXPIRE_MINUTES',
@@ -1480,50 +1481,6 @@ CONFIG_SCHEMA = {
                 'description': 'Enable billing system. Users need credits to use certain features'
             },
 
-            # ===== Membership Plans (3 tiers) =====
-            {
-                'key': 'MEMBERSHIP_MONTHLY_PRICE_USD',
-                'label': 'Monthly Membership Price (USD)',
-                'type': 'number',
-                'default': '19.9',
-                'description': 'Monthly membership price in USD (USDT checkout uses equivalent amount in USDT)'
-            },
-            {
-                'key': 'MEMBERSHIP_MONTHLY_CREDITS',
-                'label': 'Monthly Membership Bonus Credits',
-                'type': 'number',
-                'default': '500',
-                'description': 'Credits granted immediately after purchasing monthly membership'
-            },
-            {
-                'key': 'MEMBERSHIP_YEARLY_PRICE_USD',
-                'label': 'Yearly Membership Price (USD)',
-                'type': 'number',
-                'default': '199',
-                'description': 'Yearly membership price in USD (USDT checkout uses equivalent amount in USDT)'
-            },
-            {
-                'key': 'MEMBERSHIP_YEARLY_CREDITS',
-                'label': 'Yearly Membership Bonus Credits',
-                'type': 'number',
-                'default': '8000',
-                'description': 'Credits granted immediately after purchasing yearly membership'
-            },
-            {
-                'key': 'MEMBERSHIP_LIFETIME_PRICE_USD',
-                'label': 'Lifetime Membership Price (USD)',
-                'type': 'number',
-                'default': '499',
-                'description': 'Lifetime membership price in USD (USDT checkout uses equivalent amount in USDT)'
-            },
-            {
-                'key': 'MEMBERSHIP_LIFETIME_MONTHLY_CREDITS',
-                'label': 'Lifetime Membership Monthly Credits',
-                'type': 'number',
-                'default': '800',
-                'description': 'Credits granted every 30 days for lifetime members'
-            },
-
             # ===== USDT Pay (v3.0.6+: one fixed address per chain + amount-suffix matching) =====
             # Model: each chain has a single receiving address. Orders are
             # disambiguated by a unique amount suffix in the low decimals
@@ -1571,6 +1528,125 @@ CONFIG_SCHEMA = {
                 'type': 'text',
                 'required': False,
                 'description': 'Your Solana wallet address (base58). The SPL USDT mint ATA is derived on-chain by the sender wallet.'
+            },
+            {
+                'key': 'USDT_TRC20_CONTRACT',
+                'label': 'USDT TRC20 Contract',
+                'type': 'text',
+                'default': 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+                'required': False,
+                'description': 'Advanced: USDT token contract on TRON. Keep the default unless the network changes.'
+            },
+            {
+                'key': 'USDT_BEP20_CONTRACT',
+                'label': 'USDT BEP20 Contract',
+                'type': 'text',
+                'default': '0x55d398326f99059fF775485246999027B3197955',
+                'required': False,
+                'description': 'Advanced: USDT token contract on BSC.'
+            },
+            {
+                'key': 'USDT_ERC20_CONTRACT',
+                'label': 'USDT ERC20 Contract',
+                'type': 'text',
+                'default': '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+                'required': False,
+                'description': 'Advanced: USDT token contract on Ethereum.'
+            },
+            {
+                'key': 'USDT_SOL_MINT',
+                'label': 'USDT Solana Mint',
+                'type': 'text',
+                'default': 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+                'required': False,
+                'description': 'Advanced: SPL USDT mint on Solana.'
+            },
+            {
+                'key': 'USDC_PAY_ENABLED',
+                'label': 'Enable USDC Pay',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Enable Circle-issued native USDC checkout on Ethereum and Solana.'
+            },
+            {
+                'key': 'USDC_PAY_ENABLED_CHAINS',
+                'label': 'USDC Enabled Chains',
+                'type': 'text',
+                'default': 'ERC20,SOL',
+                'description': 'Comma-separated official USDC chain whitelist: ERC20 / SOL.'
+            },
+            {
+                'key': 'USDC_ERC20_ADDRESS',
+                'label': 'USDC ERC20 Receiving Address',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional dedicated USDC address. Leave blank to reuse the USDT ERC20 receiving address.'
+            },
+            {
+                'key': 'USDC_SOL_ADDRESS',
+                'label': 'USDC Solana Receiving Address',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional dedicated USDC address. Leave blank to reuse the USDT Solana receiving address.'
+            },
+            {
+                'key': 'USDC_ERC20_CONTRACT',
+                'label': 'USDC ERC20 Contract',
+                'type': 'text',
+                'default': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+                'required': False,
+                'description': 'Advanced: USDC token contract on Ethereum.'
+            },
+            {
+                'key': 'USDC_SOL_MINT',
+                'label': 'USDC Solana Mint',
+                'type': 'text',
+                'default': 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+                'required': False,
+                'description': 'Advanced: SPL USDC mint on Solana.'
+            },
+            {
+                'key': 'STRIPE_PAY_ENABLED',
+                'label': 'Enable Stripe Pay',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Enable card checkout through server-created Stripe Checkout Sessions.'
+            },
+            {
+                'key': 'STRIPE_SECRET_KEY',
+                'label': 'Stripe Secret Key',
+                'type': 'password',
+                'required': False,
+                'description': 'Get the sk_live_... or sk_test_... key from Stripe Dashboard > Developers > API keys. The current server-side Checkout flow does not need the pk_ public key.'
+            },
+            {
+                'key': 'STRIPE_WEBHOOK_SECRET',
+                'label': 'Stripe Webhook Signing Secret',
+                'type': 'password',
+                'required': False,
+                'description': 'Create a Stripe Webhook endpoint for POST /api/billing/stripe/webhook, then reveal and paste its whsec_... signing secret. This value is not shown on the API keys page.'
+            },
+            {
+                'key': 'STRIPE_PRODUCT_TAX_CODE',
+                'label': 'Stripe Product Tax Code',
+                'type': 'text',
+                'default': 'txcd_10103000',
+                'required': False,
+                'description': 'Stripe product tax category used for inline Checkout products. Defaults to SaaS for personal use (txcd_10103000).'
+            },
+            {
+                'key': 'STRIPE_SUCCESS_URL',
+                'label': 'Stripe Success URL',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional Checkout success URL. Leave blank to use FRONTEND_URL/billing automatically.'
+            },
+            {
+                'key': 'STRIPE_CANCEL_URL',
+                'label': 'Stripe Cancel URL',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional Checkout cancel URL. Leave blank to return to the billing page automatically.'
             },
             {
                 'key': 'TRONGRID_API_KEY',

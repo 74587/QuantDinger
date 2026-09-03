@@ -217,6 +217,7 @@ def _scan_explorer(
     address: str,
     amount: Decimal,
     created_at: Optional[datetime],
+    token_meta=None,
 ) -> Tuple[WatcherResult, bool]:
     """Hit the Etherscan-style HTTP API.
 
@@ -226,7 +227,8 @@ def _scan_explorer(
     """
     spec = CHAIN_SPECS[chain]
     url, api_key, is_v2 = _resolve_endpoint(chain)
-    contract = _resolve_contract(chain)
+    token_meta = token_meta or {}
+    contract = token_meta.get("contract") or _resolve_contract(chain)
 
     if not api_key:
         # Both V2 and v1 hosts technically accept anonymous traffic but
@@ -234,7 +236,8 @@ def _scan_explorer(
         # so we still surface a clear "empty_result" downstream.
         logger.debug("%s watcher: no API key configured, using anonymous quota", chain)
 
-    target = int((amount * (Decimal(10) ** spec.decimals)).to_integral_value())
+    decimals = int(token_meta.get("decimals") or spec.decimals)
+    target = int((amount * (Decimal(10) ** decimals)).to_integral_value())
     ct = _parse_created_at(created_at)
     min_ts = int(ct.timestamp()) - 60 if ct else None  # explorers use seconds, not ms
 
@@ -365,6 +368,7 @@ def _scan_rpc(
     address: str,
     amount: Decimal,
     created_at: Optional[datetime],
+    token_meta=None,
 ) -> WatcherResult:
     """Search USDT Transfer logs on a public RPC.
 
@@ -381,12 +385,14 @@ def _scan_rpc(
          further back without losing reach.
     """
     spec = CHAIN_SPECS[chain]
-    contract = _resolve_contract(chain)
+    token_meta = token_meta or {}
+    contract = token_meta.get("contract") or _resolve_contract(chain)
     urls = _rpc_endpoints(chain)
     if not urls:
         return None, f"{chain.lower()}_rpc_no_endpoints"
 
-    target = int((amount * (Decimal(10) ** spec.decimals)).to_integral_value())
+    decimals = int(token_meta.get("decimals") or spec.decimals)
+    target = int((amount * (Decimal(10) ** decimals)).to_integral_value())
 
     # 1) latest block
     blk_hex, _, err = _try_rpcs(urls, "eth_blockNumber", [])
@@ -502,7 +508,7 @@ def _scan_rpc(
 
 
 def _make_finder(chain: str):
-    def find_incoming(address: str, amount: Decimal, created_at: Optional[datetime]) -> WatcherResult:
+    def find_incoming(address: str, amount: Decimal, created_at: Optional[datetime], token_meta=None) -> WatcherResult:
         address = (address or "").strip()
         if not address or amount <= 0:
             return None, "bad_args"
@@ -511,7 +517,7 @@ def _make_finder(chain: str):
         # friends) go straight to RPC. This avoids one wasted round-trip
         # per scan and keeps reconcile logs free of noisy paid-tier errors.
         if _prefer_rpc(chain):
-            return _scan_rpc(chain, address, amount, created_at)
+            return _scan_rpc(chain, address, amount, created_at, token_meta)
 
         # Explorer-first path (ERC20 by default; or BEP20 when the
         # operator opted in via BEP20_PREFER_EXPLORER=true).
@@ -519,7 +525,7 @@ def _make_finder(chain: str):
         explorer_result: WatcherResult = (None, "")
         paid_blocked = False
         if api_key:
-            explorer_result, paid_blocked = _scan_explorer(chain, address, amount, created_at)
+            explorer_result, paid_blocked = _scan_explorer(chain, address, amount, created_at, token_meta)
             tx, note = explorer_result
             if tx is not None:
                 return tx, note
@@ -532,7 +538,7 @@ def _make_finder(chain: str):
         # RPC fallback when the explorer is unreachable or rejected our
         # request (paid-tier / V2-only). Also covers the "no API key
         # configured" path.
-        rpc_tx, rpc_note = _scan_rpc(chain, address, amount, created_at)
+        rpc_tx, rpc_note = _scan_rpc(chain, address, amount, created_at, token_meta)
         if rpc_tx is not None:
             return rpc_tx, rpc_note
         if api_key and explorer_result[1]:

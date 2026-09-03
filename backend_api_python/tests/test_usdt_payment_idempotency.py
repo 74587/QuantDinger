@@ -59,13 +59,14 @@ class _MemCursor:
             self._last_result = []
             return
         if "FROM QD_USDT_ORDERS" in sql_norm and "WHERE USER_ID" in sql_norm and "STATUS = 'PENDING'" in sql_norm:
-            # idempotency probe: (user_id, plan, chain, now)
-            user_id, plan, chain, now = params
+            # idempotency probe: (user_id, plan, chain, currency, now)
+            user_id, plan, chain, currency, now = params
             matches = [
                 r for r in self.db.rows
                 if r.get("user_id") == user_id
                 and r.get("plan") == plan
                 and r.get("chain") == chain
+                and r.get("currency") == currency
                 and r.get("status") == "pending"
                 and (r.get("expires_at") is None or r.get("expires_at") > now)
             ]
@@ -74,14 +75,14 @@ class _MemCursor:
             return
         if sql_norm.startswith("INSERT INTO QD_USDT_ORDERS"):
             (
-                user_id, plan, chain, final_amount, suffix, address, expires_at
+                user_id, plan, chain, currency, final_amount, suffix, address, expires_at
             ) = params
             row = _MemRow(
                 id=self.db._next_id(),
                 user_id=user_id,
                 plan=plan,
                 chain=chain,
-                currency="USDT",
+                currency=currency,
                 amount_usdt=final_amount,
                 amount_suffix=suffix,
                 address=address,
@@ -157,7 +158,9 @@ def isolate_chain_env(monkeypatch):
     from app.services.usdt_payment.chains import CHAIN_SPECS as _SPECS
     for code, spec in _SPECS.items():
         monkeypatch.delenv(spec.address_env, raising=False)
+        monkeypatch.delenv(f"USDC_{code}_ADDRESS", raising=False)
     monkeypatch.delenv("USDT_PAY_ENABLED_CHAINS", raising=False)
+    monkeypatch.delenv("USDC_PAY_ENABLED_CHAINS", raising=False)
     yield monkeypatch
 
 

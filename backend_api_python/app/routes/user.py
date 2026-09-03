@@ -1698,131 +1698,186 @@ def _ensure_usdt_admin_columns():
         logger.debug("ensure_usdt_admin_columns skipped: %s", exc)
 
 
+_ADMIN_ORDERS_CTE = """
+    WITH unified_orders AS (
+        SELECT
+            o.id,
+            LOWER(COALESCE(NULLIF(o.currency, ''), 'USDT')) AS payment_method,
+            o.user_id,
+            o.plan,
+            o.amount_usdt AS amount,
+            UPPER(COALESCE(NULLIF(o.currency, ''), 'USDT')) AS currency,
+            o.chain,
+            o.address,
+            COALESCE(o.tx_hash, '') AS tx_hash,
+            ''::TEXT AS provider_reference,
+            o.status,
+            COALESCE(o.matched_via, '') AS matched_via,
+            COALESCE(o.admin_note, '') AS admin_note,
+            o.manual_confirmed_by,
+            o.created_at,
+            o.paid_at,
+            o.confirmed_at,
+            o.expires_at
+        FROM qd_usdt_orders o
+
+        UNION ALL
+
+        SELECT
+            o.id,
+            'stripe' AS payment_method,
+            o.user_id,
+            o.plan,
+            o.amount_usd AS amount,
+            UPPER(COALESCE(NULLIF(o.currency, ''), 'USD')) AS currency,
+            ''::TEXT AS chain,
+            ''::TEXT AS address,
+            ''::TEXT AS tx_hash,
+            COALESCE(o.stripe_session_id, '') AS provider_reference,
+            o.status,
+            CASE WHEN o.status = 'paid' THEN 'stripe_webhook' ELSE '' END AS matched_via,
+            ''::TEXT AS admin_note,
+            NULL::INTEGER AS manual_confirmed_by,
+            o.created_at,
+            o.paid_at,
+            NULL::TIMESTAMP AS confirmed_at,
+            NULL::TIMESTAMP AS expires_at
+        FROM qd_stripe_orders o
+    )
+"""
+
+
+def _admin_order_filters(status_filter: str, payment_method: str, plan_filter: str, search: str):
+    """Build the shared, parameterized filter used by count/list/summary."""
+    conditions = []
+    params = []
+    if status_filter and status_filter != 'all':
+        conditions.append("o.status = ?")
+        params.append(status_filter)
+    if payment_method and payment_method != 'all':
+        conditions.append("o.payment_method = ?")
+        params.append(payment_method)
+    if plan_filter and plan_filter != 'all':
+        conditions.append("o.plan = ?")
+        params.append(plan_filter)
+    if search:
+        like_value = f"%{search}%"
+        conditions.append(
+            "(u.username ILIKE ? OR u.email ILIKE ? OR u.nickname ILIKE ? "
+            "OR CAST(o.id AS TEXT) ILIKE ? OR (o.payment_method || '-' || CAST(o.id AS TEXT)) ILIKE ? "
+            "OR o.plan ILIKE ? OR o.tx_hash ILIKE ? OR o.provider_reference ILIKE ? OR o.address ILIKE ?)"
+        )
+        params.extend([like_value] * 9)
+    return ("WHERE " + " AND ".join(conditions)) if conditions else "", params
+
+
 @user_blp.route('/admin-orders', methods=['GET'])
 @login_required
 @admin_required
 def get_admin_orders():
-    """
-    Get all orders across the system (admin only).
-    Lists USDT on-chain membership orders only (qd_usdt_orders).
-
-    Query params:
-        page: int (default 1)
-        page_size: int (default 20, max 100)
-        status: str (optional, filter by status: paid/pending/confirmed/expired/all)
-        search: str (optional, search by username/email)
-    """
+    """Return one paginated admin view for USDT, USDC and Stripe orders."""
     try:
-        page = request.args.get('page', 1, type=int)
-        page_size = request.args.get('page_size', 20, type=int)
+        page = max(1, request.args.get('page', 1, type=int))
+        page_size = min(100, max(1, request.args.get('page_size', 20, type=int)))
         status_filter = request.args.get('status', '', type=str).strip().lower()
+        payment_method = request.args.get('payment_method', '', type=str).strip().lower()
+        plan_filter = request.args.get('plan', '', type=str).strip().lower()
         search = request.args.get('search', '', type=str).strip()
-        page_size = min(100, max(1, page_size))
         offset = (page - 1) * page_size
 
         _ensure_usdt_admin_columns()
+        where_sql, filter_params = _admin_order_filters(
+            status_filter, payment_method, plan_filter, search,
+        )
+        joined_source = """
+            FROM unified_orders o
+            LEFT JOIN qd_users u ON u.id = o.user_id
+            LEFT JOIN qd_membership_plans p ON p.code = o.plan
+        """
 
         with get_db_connection() as db:
             cur = db.cursor()
-
-            usdt_conditions = []
-            usdt_params = []
-
-            if status_filter and status_filter != 'all':
-                usdt_conditions.append("o.status = ?")
-                usdt_params.append(status_filter)
-
-            if search:
-                usdt_conditions.append("(u.username ILIKE ? OR u.email ILIKE ? OR u.nickname ILIKE ?)")
-                like_val = f"%{search}%"
-                usdt_params.extend([like_val, like_val, like_val])
-
-            usdt_where = ""
-            if usdt_conditions:
-                usdt_where = "WHERE " + " AND ".join(usdt_conditions)
+            cur.execute(
+                f"{_ADMIN_ORDERS_CTE} SELECT COUNT(*) AS cnt {joined_source} {where_sql}",
+                tuple(filter_params),
+            )
+            total = int((cur.fetchone() or {}).get('cnt') or 0)
 
             cur.execute(
-                f"SELECT COUNT(*) as cnt FROM qd_usdt_orders o LEFT JOIN qd_users u ON u.id = o.user_id {usdt_where}",
-                tuple(usdt_params)
-            )
-            total = cur.fetchone()['cnt']
-
-            list_sql = f"""
+                f"""
+                {_ADMIN_ORDERS_CTE}
                 SELECT
-                    o.id,
-                    'usdt' AS order_type,
-                    o.user_id,
+                    o.*,
                     u.username,
                     u.nickname,
                     u.email AS user_email,
-                    o.plan,
-                    o.amount_usdt AS amount,
-                    'USDT' AS currency,
-                    o.chain,
-                    o.address,
-                    o.tx_hash,
-                    o.status,
-                    o.matched_via,
-                    o.admin_note,
-                    o.manual_confirmed_by,
-                    o.created_at,
-                    o.paid_at,
-                    o.confirmed_at,
-                    o.expires_at
-                FROM qd_usdt_orders o
-                LEFT JOIN qd_users u ON u.id = o.user_id
-                {usdt_where}
-                ORDER BY o.created_at DESC
+                    COALESCE(NULLIF(p.name, ''), o.plan) AS plan_name
+                {joined_source}
+                {where_sql}
+                ORDER BY o.created_at DESC, o.payment_method ASC, o.id DESC
                 LIMIT ? OFFSET ?
-            """
-            all_params = list(usdt_params) + [page_size, offset]
-            cur.execute(list_sql, tuple(all_params))
+                """,
+                tuple(list(filter_params) + [page_size, offset]),
+            )
             rows = cur.fetchall() or []
 
-            # Summary stats
             cur.execute(
-                f"""SELECT
+                f"""
+                {_ADMIN_ORDERS_CTE}
+                SELECT
                     COUNT(*) AS total_orders,
-                    COALESCE(SUM(CASE WHEN status IN ('paid','confirmed') THEN 1 ELSE 0 END), 0) AS paid_orders,
-                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_orders,
-                    COALESCE(SUM(CASE WHEN status IN ('expired','cancelled','failed') THEN 1 ELSE 0 END), 0) AS failed_orders,
-                    COALESCE(SUM(CASE WHEN status IN ('paid','confirmed') THEN amount_usdt ELSE 0 END), 0) AS total_revenue
-                FROM qd_usdt_orders"""
+                    COALESCE(SUM(CASE WHEN o.status IN ('paid','confirmed') THEN 1 ELSE 0 END), 0) AS paid_orders,
+                    COALESCE(SUM(CASE WHEN o.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_orders,
+                    COALESCE(SUM(CASE WHEN o.status IN ('expired','cancelled','failed') THEN 1 ELSE 0 END), 0) AS failed_orders,
+                    COALESCE(SUM(CASE WHEN o.status IN ('paid','confirmed') THEN o.amount ELSE 0 END), 0) AS total_revenue
+                {joined_source}
+                {where_sql}
+                """,
+                tuple(filter_params),
             )
             summary_row = cur.fetchone() or {}
 
+            cur.execute(
+                f"""
+                {_ADMIN_ORDERS_CTE}
+                SELECT DISTINCT o.plan, COALESCE(NULLIF(p.name, ''), o.plan) AS plan_name
+                {joined_source}
+                WHERE o.plan <> ''
+                ORDER BY plan_name ASC
+                """
+            )
+            plan_rows = cur.fetchall() or []
             cur.close()
 
         items = []
         for row in rows:
-            # SafeJSONProvider normalizes datetimes to UTC ISO; no manual
-            # conversion needed.
-            created_at = row.get('created_at')
-            paid_at = row.get('paid_at')
-            confirmed_at = row.get('confirmed_at')
-            expires_at = row.get('expires_at')
-
+            method = str(row.get('payment_method') or '').lower()
             items.append({
                 'id': row['id'],
-                'order_type': row.get('order_type') or '',
+                'order_no': f"{method.upper()}-{row['id']}",
+                'order_type': method,
+                'payment_method': method,
                 'user_id': row.get('user_id'),
                 'username': row.get('username') or '',
                 'nickname': row.get('nickname') or '',
                 'user_email': row.get('user_email') or '',
                 'plan': row.get('plan') or '',
+                'plan_name': row.get('plan_name') or row.get('plan') or '',
                 'amount': float(row.get('amount') or 0),
                 'currency': row.get('currency') or '',
                 'chain': row.get('chain') or '',
                 'address': row.get('address') or '',
                 'tx_hash': row.get('tx_hash') or '',
+                'provider_reference': row.get('provider_reference') or '',
+                'payment_reference': row.get('tx_hash') or row.get('provider_reference') or '',
                 'status': row.get('status') or '',
                 'matched_via': row.get('matched_via') or '',
                 'admin_note': row.get('admin_note') or '',
                 'manual_confirmed_by': row.get('manual_confirmed_by'),
-                'created_at': created_at,
-                'paid_at': paid_at,
-                'confirmed_at': confirmed_at,
-                'expires_at': expires_at
+                'created_at': row.get('created_at'),
+                'paid_at': row.get('paid_at'),
+                'confirmed_at': row.get('confirmed_at'),
+                'expires_at': row.get('expires_at'),
             })
 
         return jsonify({
@@ -1838,8 +1893,16 @@ def get_admin_orders():
                     'paid_orders': int(summary_row.get('paid_orders') or 0),
                     'pending_orders': int(summary_row.get('pending_orders') or 0),
                     'failed_orders': int(summary_row.get('failed_orders') or 0),
-                    'total_revenue': round(float(summary_row.get('total_revenue') or 0), 2)
-                }
+                    'total_revenue': round(float(summary_row.get('total_revenue') or 0), 2),
+                    'revenue_currency': 'USD',
+                },
+                'filter_options': {
+                    'payment_methods': ['usdt', 'usdc', 'stripe'],
+                    'plans': [
+                        {'code': row.get('plan') or '', 'name': row.get('plan_name') or row.get('plan') or ''}
+                        for row in plan_rows
+                    ],
+                },
             }
         })
     except Exception as e:

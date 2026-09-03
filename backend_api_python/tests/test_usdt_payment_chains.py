@@ -20,6 +20,7 @@ import pytest
 
 from app.services.usdt_payment.chains import (
     CHAIN_SPECS,
+    USDC_TOKEN_DEFAULTS,
     build_amount_with_suffix,
     build_payment_uri,
     chain_metadata,
@@ -192,7 +193,13 @@ def isolate_chain_env(monkeypatch):
     """Wipe every USDT_*_ADDRESS so each test starts from a clean slate."""
     for code, spec in CHAIN_SPECS.items():
         monkeypatch.delenv(spec.address_env, raising=False)
+        monkeypatch.delenv(f"USDC_{code}_ADDRESS", raising=False)
+        monkeypatch.delenv(
+            f"USDC_{code}_CONTRACT" if code != "SOL" else "USDC_SOL_MINT",
+            raising=False,
+        )
     monkeypatch.delenv("USDT_PAY_ENABLED_CHAINS", raising=False)
+    monkeypatch.delenv("USDC_PAY_ENABLED_CHAINS", raising=False)
     yield monkeypatch
 
 
@@ -230,6 +237,53 @@ def test_chain_metadata_returns_none_when_disabled(isolate_chain_env):
 def test_chain_metadata_returns_none_for_unknown_chain():
     assert chain_metadata("DOGE") is None
     assert chain_metadata("") is None
+
+
+def test_usdc_reuses_supported_chain_registry_and_receiving_wallet(isolate_chain_env):
+    isolate_chain_env.setenv("USDC_PAY_ENABLED_CHAINS", "ERC20")
+    isolate_chain_env.setenv("USDT_ERC20_ADDRESS", "0xSharedWallet")
+    meta = chain_metadata("ERC20", "USDC")
+    assert meta is not None
+    assert meta["currency"] == "USDC"
+    assert meta["address"] == "0xSharedWallet"
+    assert meta["contract"] == USDC_TOKEN_DEFAULTS["ERC20"][0]
+    assert meta["decimals"] == 6
+    assert [item["code"] for item in list_enabled_chains("USDC")] == ["ERC20"]
+
+    uri = build_payment_uri(
+        "ERC20",
+        meta["address"],
+        Decimal("19.991234"),
+        currency="USDC",
+        contract=meta["contract"],
+        decimals=meta["decimals"],
+    )
+    assert "uint256=19991234" in uri
+
+
+@pytest.mark.parametrize("code", ["ERC20", "SOL"])
+def test_usdc_has_built_in_contracts_for_every_supported_chain(isolate_chain_env, code):
+    spec = CHAIN_SPECS[code]
+    receiving_address = "TSharedWallet" if code == "TRC20" else "shared-wallet"
+    isolate_chain_env.setenv("USDC_PAY_ENABLED_CHAINS", code)
+    isolate_chain_env.setenv(spec.address_env, receiving_address)
+
+    meta = chain_metadata(code, "USDC")
+
+    assert meta is not None
+    assert meta["address"] == receiving_address
+    assert meta["contract"] == USDC_TOKEN_DEFAULTS[code][0]
+    assert meta["decimals"] == USDC_TOKEN_DEFAULTS[code][1]
+
+
+@pytest.mark.parametrize("code", ["TRC20", "BEP20"])
+def test_usdc_rejects_non_circle_native_or_discontinued_chains(isolate_chain_env, code):
+    spec = CHAIN_SPECS[code]
+    isolate_chain_env.setenv("USDC_PAY_ENABLED_CHAINS", code)
+    isolate_chain_env.setenv(spec.address_env, "configured-wallet")
+
+    assert chain_metadata(code, "USDC") is None
+    assert list_enabled_chains("USDC") == []
 
 
 # ---------------------------------------------------------------------------

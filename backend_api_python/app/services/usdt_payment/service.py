@@ -53,18 +53,22 @@ class UsdtPaymentService:
 
     # ---------------------------------------------------------------- config
 
-    def _get_cfg(self) -> Dict[str, Any]:
+    def _get_cfg(self, currency: str = "USDT") -> Dict[str, Any]:
+        currency = (currency or "USDT").strip().upper()
         return {
-            "enabled": str(os.getenv("USDT_PAY_ENABLED", "False")).lower() in ("1", "true", "yes"),
-            "confirm_seconds": int(float(os.getenv("USDT_PAY_CONFIRM_SECONDS", "30") or 30)),
-            "order_expire_minutes": int(float(os.getenv("USDT_PAY_EXPIRE_MINUTES", "30") or 30)),
+            "enabled": str(os.getenv(f"{currency}_PAY_ENABLED", "False")).lower() in ("1", "true", "yes"),
+            "confirm_seconds": int(float(os.getenv(f"{currency}_PAY_CONFIRM_SECONDS", os.getenv("USDT_PAY_CONFIRM_SECONDS", "30")) or 30)),
+            "order_expire_minutes": int(float(os.getenv(f"{currency}_PAY_EXPIRE_MINUTES", os.getenv("USDT_PAY_EXPIRE_MINUTES", "30")) or 30)),
             "debug_reconcile_log": str(os.getenv("USDT_PAY_DEBUG_LOG", "true")).lower() in ("1", "true", "yes"),
         }
 
-    def list_chains(self) -> List[Dict[str, Any]]:
+    def list_chains(self, currency: str = "USDT") -> List[Dict[str, Any]]:
         """Frontend uses this to render the chain picker (hides chains
         whose receiving address is not configured)."""
-        return list_enabled_chains()
+        currency = (currency or "USDT").strip().upper()
+        if currency not in ("USDT", "USDC") or not self._get_cfg(currency)["enabled"]:
+            return []
+        return list_enabled_chains(currency)
 
     # ---------------------------------------------------------------- schema
 
@@ -80,7 +84,7 @@ class UsdtPaymentService:
                 CREATE TABLE IF NOT EXISTS qd_usdt_orders (
                     id SERIAL PRIMARY KEY,
                     user_id INTEGER NOT NULL,
-                    plan VARCHAR(20) NOT NULL,
+                    plan VARCHAR(64) NOT NULL,
                     chain VARCHAR(20) NOT NULL DEFAULT 'TRC20',
                     currency VARCHAR(10) NOT NULL DEFAULT 'USDT',
                     amount_usdt DECIMAL(20,8) NOT NULL DEFAULT 0,
@@ -98,6 +102,14 @@ class UsdtPaymentService:
                 )
                 """
             )
+            # Existing installations already have this table. CREATE TABLE IF
+            # NOT EXISTS does not add new columns, so add the currency
+            # discriminator before creating the cross-token unique index.
+            cur.execute(
+                "ALTER TABLE qd_usdt_orders ADD COLUMN IF NOT EXISTS currency "
+                "VARCHAR(10) NOT NULL DEFAULT 'USDT'"
+            )
+            cur.execute("ALTER TABLE qd_usdt_orders ALTER COLUMN plan TYPE VARCHAR(64)")
             # v3.0.6 cleanup: drop the legacy unique index on (chain, address)
             # that came from the pre-v3.0.6 per-order xpub-derived address
             # scheme. Under the current "single fixed receiving address per
@@ -110,9 +122,10 @@ class UsdtPaymentService:
                 cur.execute("DROP INDEX IF EXISTS idx_usdt_orders_address_unique")
             except Exception as drop_exc:
                 logger.debug("USDT drop legacy address index skipped: %s", drop_exc)
+            cur.execute("DROP INDEX IF EXISTS idx_usdt_orders_amount_active")
             cur.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_usdt_orders_amount_active "
-                "ON qd_usdt_orders(chain, amount_usdt) WHERE status IN ('pending','paid')"
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_crypto_orders_amount_active "
+                "ON qd_usdt_orders(currency, chain, amount_usdt) WHERE status IN ('pending','paid')"
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_usdt_orders_user_id ON qd_usdt_orders(user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_usdt_orders_status ON qd_usdt_orders(status)")
@@ -127,27 +140,31 @@ class UsdtPaymentService:
         user_id: int,
         plan: str,
         chain: Optional[str] = None,
+        currency: str = "USDT",
     ) -> Tuple[bool, str, Dict[str, Any]]:
-        cfg = self._get_cfg()
+        currency = (currency or "USDT").strip().upper()
+        if currency not in ("USDT", "USDC"):
+            return False, "unsupported_currency", {}
+        cfg = self._get_cfg(currency)
         if not cfg["enabled"]:
-            return False, "usdt_pay_disabled", {}
+            return False, f"{currency.lower()}_pay_disabled", {}
 
         plan = (plan or "").strip().lower()
-        if plan not in ("monthly", "yearly", "lifetime"):
+        plans = self.billing.get_membership_plans()
+        if plan not in plans:
             return False, "invalid_plan", {}
 
         # Default to the first enabled chain when caller didn't specify one.
-        enabled = self.list_chains()
+        enabled = self.list_chains(currency)
         if not enabled:
             return False, "no_chain_configured", {}
         if not chain:
             chain = enabled[0]["code"]
         chain = chain.strip().upper()
-        meta = chain_metadata(chain)
+        meta = chain_metadata(chain, currency)
         if meta is None:
             return False, "chain_not_available", {"chain": chain}
 
-        plans = self.billing.get_membership_plans()
         base_amount = Decimal(str(plans.get(plan, {}).get("price_usd") or 0))
         if base_amount <= 0:
             return False, "invalid_amount", {}
@@ -159,7 +176,7 @@ class UsdtPaymentService:
         # a new one. This is the "user closed the payment modal and is
         # reopening it" path — otherwise we'd leak rows in the DB and the
         # user would see a fresh amount suffix every time the modal opens.
-        existing = self._find_active_order(user_id, plan, chain, now)
+        existing = self._find_active_order(user_id, plan, chain, currency, now)
         if existing is not None:
             out = self._row_to_dict(existing)
             out["reused"] = True
@@ -184,13 +201,14 @@ class UsdtPaymentService:
                           (user_id, plan, chain, currency, amount_usdt, amount_suffix,
                            address, payment_uri, matched_via, status,
                            expires_at, created_at, updated_at)
-                        VALUES (?, ?, ?, 'USDT', ?, ?, ?, '', 'amount_suffix', 'pending', ?, NOW(), NOW())
+                        VALUES (?, ?, ?, ?, ?, ?, ?, '', 'amount_suffix', 'pending', ?, NOW(), NOW())
                         RETURNING id
                         """,
                         (
                             user_id,
                             plan,
                             chain,
+                            currency,
                             final_amount,
                             suffix,
                             meta["address"],
@@ -209,6 +227,8 @@ class UsdtPaymentService:
                         meta["address"],
                         final_amount,
                         contract=meta["contract"],
+                        currency=currency,
+                        decimals=meta["decimals"],
                         order_id=int(order_id),
                     )
                     cur.execute(
@@ -222,7 +242,8 @@ class UsdtPaymentService:
                     "order_id": order_id,
                     "plan": plan,
                     "chain": chain,
-                    "currency": "USDT",
+                    "currency": currency,
+                    "amount": format_amount_display(final_amount),
                     "amount_usdt": format_amount_display(final_amount),
                     "amount_suffix": format_amount_display(suffix),
                     "address": meta["address"],
@@ -254,7 +275,7 @@ class UsdtPaymentService:
                         "Run: DROP INDEX IF EXISTS idx_usdt_orders_address_unique;"
                     )
                     return False, "legacy_address_index", {}
-                if "idx_usdt_orders_amount_active" in msg or "UNIQUE" in msg.upper():
+                if "idx_crypto_orders_amount_active" in msg or "idx_usdt_orders_amount_active" in msg or "UNIQUE" in msg.upper():
                     logger.info(
                         "USDT create_order suffix collision (attempt=%s chain=%s amount=%s); retrying",
                         attempt, chain, final_amount,
@@ -272,6 +293,7 @@ class UsdtPaymentService:
         user_id: int,
         plan: str,
         chain: str,
+        currency: str,
         now: datetime,
     ) -> Optional[Dict[str, Any]]:
         """Return the user's open (pending + not yet expired) order for
@@ -288,13 +310,13 @@ class UsdtPaymentService:
                            address, payment_uri, status, tx_hash, matched_via,
                            paid_at, confirmed_at, expires_at, created_at, updated_at
                     FROM qd_usdt_orders
-                    WHERE user_id = ? AND plan = ? AND chain = ?
+                    WHERE user_id = ? AND plan = ? AND chain = ? AND currency = ?
                       AND status = 'pending'
                       AND (expires_at IS NULL OR expires_at > ?)
                     ORDER BY created_at DESC
                     LIMIT 1
                     """,
-                    (user_id, plan, chain, now),
+                    (user_id, plan, chain, currency, now),
                 )
                 row = cur.fetchone()
                 cur.close()
@@ -370,8 +392,7 @@ class UsdtPaymentService:
         the connection before any HTTP work, so a slow explorer never
         keeps a DB connection in `idle in transaction`.
         """
-        cfg = self._get_cfg()
-        if not cfg["enabled"]:
+        if not (self._get_cfg("USDT")["enabled"] or self._get_cfg("USDC")["enabled"]):
             return 0
         updated = 0
         try:
@@ -420,7 +441,10 @@ class UsdtPaymentService:
     def _refresh_one_order(self, row: Dict[str, Any]) -> None:
         """HTTP-out-of-txn refresh of a single order. Writes happen in short
         txns. Used by both the worker and ``get_order(refresh=True)``."""
-        cfg = self._get_cfg()
+        currency = (row.get("currency") or "USDT").strip().upper()
+        cfg = self._get_cfg(currency)
+        if not cfg["enabled"]:
+            return
         status = (row.get("status") or "").lower()
         chain = (row.get("chain") or "").upper()
         order_id = row.get("id")
@@ -455,12 +479,16 @@ class UsdtPaymentService:
         if watcher is None:
             logger.warning("USDT refresh: no watcher for chain=%s", chain)
             return
-        tx, note = watcher(address, amount, row.get("created_at"))
+        meta = chain_metadata(chain, currency)
+        if meta is None:
+            logger.warning("%s refresh: token or chain is not configured for %s", currency, chain)
+            return
+        tx, note = watcher(address, amount, row.get("created_at"), meta)
 
         if cfg.get("debug_reconcile_log"):
             logger.info(
-                "USDT reconcile chain=%s order_id=%s user_id=%s status=%s amount=%s addr=%s note=%s",
-                chain, order_id, row.get("user_id"), status, amount, address,
+                "%s reconcile chain=%s order_id=%s user_id=%s status=%s amount=%s addr=%s note=%s",
+                currency, chain, order_id, row.get("user_id"), status, amount, address,
                 note if tx is None else f"matched_tx={tx.tx_hash}",
             )
 
@@ -512,11 +540,23 @@ class UsdtPaymentService:
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                cur.execute("SELECT status FROM qd_usdt_orders WHERE id = ?", (order_id,))
-                cur_row = cur.fetchone() or {}
-                if (cur_row.get("status") or "").lower() == "confirmed":
-                    cur.close()
-                    return
+                cur.execute("SELECT status, currency FROM qd_usdt_orders WHERE id = ?", (order_id,))
+                current = cur.fetchone() or {}
+                cur.close()
+            if (current.get("status") or "").lower() == "confirmed":
+                return
+            currency = (current.get("currency") or "USDT").lower()
+            ok, msg, _ = self.billing.purchase_membership(
+                int(user_id),
+                str(plan),
+                record_membership_order=False,
+                fulfillment_ref=f"{currency}_order:{order_id}",
+            )
+            if not ok:
+                logger.error("%s activate membership failed: order=%s user=%s plan=%s msg=%s", currency, order_id, user_id, plan, msg)
+                return
+            with get_db_connection() as db:
+                cur = db.cursor()
                 cur.execute(
                     "UPDATE qd_usdt_orders SET status='confirmed', confirmed_at=NOW(), updated_at=NOW() "
                     "WHERE id=? AND status IN ('paid','pending')",
@@ -524,18 +564,7 @@ class UsdtPaymentService:
                 )
                 db.commit()
                 cur.close()
-        except Exception as exc:
-            logger.error("USDT confirm UPDATE failed order_id=%s: %s", order_id, exc)
-            return
-
-        try:
-            ok, msg, _ = self.billing.purchase_membership(
-                int(user_id),
-                str(plan),
-                record_membership_order=False,
-                fulfillment_ref=f"usdt_order:{order_id}",
-            )
-            logger.info("USDT activate membership: order=%s user=%s plan=%s ok=%s msg=%s", order_id, user_id, plan, ok, msg)
+            logger.info("%s activate membership: order=%s user=%s plan=%s ok=%s", currency, order_id, user_id, plan, ok)
         except Exception as exc:
             logger.error("USDT activate membership failed order=%s err=%s", order_id, exc, exc_info=True)
 
@@ -552,6 +581,7 @@ class UsdtPaymentService:
             "plan": row.get("plan"),
             "chain": row.get("chain"),
             "currency": row.get("currency") or "USDT",
+            "amount": format_amount_display(row.get("amount_usdt")),
             # NUMERIC(20,8) round-trips with trailing zero padding; the
             # display formatter quantizes back to suffix_decimals() places
             # so the UI never has to deal with two amounts that look
@@ -563,7 +593,7 @@ class UsdtPaymentService:
             "status": row.get("status") or "",
             "tx_hash": row.get("tx_hash") or "",
             "matched_via": row.get("matched_via") or "",
-            "decimals": spec.decimals if spec else 6,
+            "decimals": (chain_metadata(chain_code, row.get("currency") or "USDT") or {}).get("decimals", spec.decimals if spec else 6),
             "paid_at": row.get("paid_at").isoformat() if row.get("paid_at") else None,
             "confirmed_at": row.get("confirmed_at").isoformat() if row.get("confirmed_at") else None,
             "expires_at": row.get("expires_at").isoformat() if row.get("expires_at") else None,
@@ -647,9 +677,9 @@ class UsdtOrderWorker:
             tick += 1
             try:
                 svc = get_usdt_payment_service()
-                cfg = svc._get_cfg()
+                enabled = svc._get_cfg("USDT")["enabled"] or svc._get_cfg("USDC")["enabled"]
                 billing_enabled = get_billing_service().is_billing_enabled()
-                if cfg["enabled"] and billing_enabled:
+                if enabled and billing_enabled:
                     updated = svc.refresh_all_active_orders()
                     if updated > 0:
                         logger.info("UsdtOrderWorker tick #%s: %s orders changed state", tick, updated)
@@ -664,7 +694,7 @@ class UsdtOrderWorker:
                 elif not self._pay_disabled_logged:
                     logger.info(
                         "UsdtOrderWorker idle; enable both BILLING_ENABLED and "
-                        "USDT_PAY_ENABLED to scan orders."
+                        "USDT_PAY_ENABLED or USDC_PAY_ENABLED to scan orders."
                     )
                     self._pay_disabled_logged = True
             except Exception as exc:

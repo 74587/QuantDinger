@@ -6,6 +6,7 @@ credit deductions. Marketplace VIP/free pricing is handled in community purchase
 flows, not in this global usage-metering layer.
 """
 import time
+import re
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Dict, Any, Optional, Tuple
@@ -108,16 +109,165 @@ class BillingService:
 
     # ==================== Membership Plans (VIP) ====================
 
-    def get_membership_plans(self) -> Dict[str, Any]:
-        """
-        Get membership plans from .env (configured via Settings UI).
+    def get_membership_plans(self, include_inactive: bool = False) -> Dict[str, Any]:
+        """Return the database-backed plan catalogue, seeding legacy defaults once."""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                self._ensure_plan_schema(cur)
+                self._seed_default_plans(cur)
+                sql = """
+                    SELECT code, name, description, price_usd, duration_days,
+                           credits_once, credits_monthly, is_lifetime, is_active,
+                           is_popular, sort_order, stripe_price_id
+                    FROM qd_billing_plans
+                """
+                if not include_inactive:
+                    sql += " WHERE is_active = TRUE"
+                sql += " ORDER BY sort_order ASC, code ASC"
+                cur.execute(sql)
+                rows = cur.fetchall() or []
+                db.commit()
+                cur.close()
+            return {str(r["code"]): self._serialize_plan(r) for r in rows}
+        except Exception as exc:
+            logger.warning("Falling back to legacy membership plans: %s", exc)
+            return load_membership_plans()
 
-        Plan keys:
-          - monthly: price_usd, credits_once, duration_days
-          - yearly: price_usd, credits_once, duration_days
-          - lifetime: price_usd, credits_monthly (granted every 30 days)
-        """
-        return load_membership_plans()
+    def save_membership_plans(self, items) -> Tuple[bool, str, Dict[str, Any]]:
+        """Upsert plans and deactivate omitted records. Intended for the admin UI."""
+        if not isinstance(items, list) or not items:
+            return False, "at_least_one_plan_required", {}
+        normalized = []
+        seen = set()
+        for raw in items:
+            raw = raw if isinstance(raw, dict) else {}
+            code = str(raw.get("code") or raw.get("plan") or "").strip().lower()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", code) or code in seen:
+                return False, "invalid_or_duplicate_plan_code", {}
+            seen.add(code)
+            try:
+                row = {
+                    "code": code,
+                    "name": str(raw.get("name") or code).strip()[:120],
+                    "description": str(raw.get("description") or "").strip()[:500],
+                    "price_usd": max(0.0, float(raw.get("price_usd") or 0)),
+                    "duration_days": max(0, int(raw.get("duration_days") or 0)),
+                    "credits_once": max(0, int(raw.get("credits_once") or 0)),
+                    "credits_monthly": max(0, int(raw.get("credits_monthly") or 0)),
+                    "is_lifetime": bool(raw.get("is_lifetime")),
+                    "is_active": bool(raw.get("is_active", True)),
+                    "is_popular": bool(raw.get("is_popular")),
+                    "sort_order": int(raw.get("sort_order") or 0),
+                    "stripe_price_id": str(raw.get("stripe_price_id") or "").strip()[:255],
+                }
+            except (TypeError, ValueError):
+                return False, "invalid_plan_values", {}
+            if row["is_active"] and row["price_usd"] <= 0:
+                return False, "active_plan_price_must_be_positive", {}
+            if not row["is_lifetime"] and row["duration_days"] <= 0:
+                return False, "duration_required_for_fixed_term_plan", {}
+            normalized.append(row)
+        if not any(row["is_active"] for row in normalized):
+            return False, "at_least_one_active_plan_required", {}
+
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                self._ensure_plan_schema(cur)
+                for row in normalized:
+                    cur.execute(
+                        """
+                        INSERT INTO qd_billing_plans
+                          (code, name, description, price_usd, duration_days,
+                           credits_once, credits_monthly, is_lifetime, is_active,
+                           is_popular, sort_order, stripe_price_id, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                        ON CONFLICT (code) DO UPDATE SET
+                          name=EXCLUDED.name, description=EXCLUDED.description,
+                          price_usd=EXCLUDED.price_usd, duration_days=EXCLUDED.duration_days,
+                          credits_once=EXCLUDED.credits_once, credits_monthly=EXCLUDED.credits_monthly,
+                          is_lifetime=EXCLUDED.is_lifetime, is_active=EXCLUDED.is_active,
+                          is_popular=EXCLUDED.is_popular, sort_order=EXCLUDED.sort_order,
+                          stripe_price_id=EXCLUDED.stripe_price_id, updated_at=NOW()
+                        """,
+                        tuple(row[k] for k in (
+                            "code", "name", "description", "price_usd", "duration_days",
+                            "credits_once", "credits_monthly", "is_lifetime", "is_active",
+                            "is_popular", "sort_order", "stripe_price_id",
+                        )),
+                    )
+                placeholders = ",".join("?" for _ in seen)
+                cur.execute(
+                    f"UPDATE qd_billing_plans SET is_active=FALSE, updated_at=NOW() WHERE code NOT IN ({placeholders})",
+                    tuple(sorted(seen)),
+                )
+                db.commit()
+                cur.close()
+            return True, "success", self.get_membership_plans(include_inactive=True)
+        except Exception as exc:
+            logger.error("save_membership_plans failed: %s", exc, exc_info=True)
+            return False, f"error:{exc}", {}
+
+    @staticmethod
+    def _serialize_plan(row: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "plan": str(row.get("code") or ""),
+            "code": str(row.get("code") or ""),
+            "name": row.get("name") or row.get("code") or "",
+            "description": row.get("description") or "",
+            "price_usd": float(row.get("price_usd") or 0),
+            "duration_days": int(row.get("duration_days") or 0),
+            "credits_once": int(row.get("credits_once") or 0),
+            "credits_monthly": int(row.get("credits_monthly") or 0),
+            "is_lifetime": bool(row.get("is_lifetime")),
+            "is_active": bool(row.get("is_active", True)),
+            "is_popular": bool(row.get("is_popular")),
+            "sort_order": int(row.get("sort_order") or 0),
+            "stripe_price_id": row.get("stripe_price_id") or "",
+        }
+
+    def _ensure_plan_schema(self, cur) -> None:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qd_billing_plans (
+              code VARCHAR(64) PRIMARY KEY,
+              name VARCHAR(120) NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              price_usd DECIMAL(12,2) NOT NULL DEFAULT 0,
+              duration_days INTEGER NOT NULL DEFAULT 0,
+              credits_once INTEGER NOT NULL DEFAULT 0,
+              credits_monthly INTEGER NOT NULL DEFAULT 0,
+              is_lifetime BOOLEAN NOT NULL DEFAULT FALSE,
+              is_active BOOLEAN NOT NULL DEFAULT TRUE,
+              is_popular BOOLEAN NOT NULL DEFAULT FALSE,
+              sort_order INTEGER NOT NULL DEFAULT 0,
+              stripe_price_id VARCHAR(255) NOT NULL DEFAULT '',
+              created_at TIMESTAMP DEFAULT NOW(),
+              updated_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+
+    def _seed_default_plans(self, cur) -> None:
+        cur.execute("SELECT COUNT(*) AS count FROM qd_billing_plans")
+        if int((cur.fetchone() or {}).get("count") or 0) > 0:
+            return
+        for code, plan in load_membership_plans().items():
+            cur.execute(
+                """
+                INSERT INTO qd_billing_plans
+                  (code, name, description, price_usd, duration_days, credits_once,
+                   credits_monthly, is_lifetime, is_active, is_popular, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?)
+                ON CONFLICT (code) DO NOTHING
+                """,
+                (code, plan.get("name") or code, plan.get("description") or "",
+                 plan.get("price_usd") or 0, plan.get("duration_days") or 0,
+                 plan.get("credits_once") or 0, plan.get("credits_monthly") or 0,
+                 bool(plan.get("is_lifetime")), bool(plan.get("is_popular")),
+                 plan.get("sort_order") or 0),
+            )
 
     def purchase_membership(
         self,
@@ -145,6 +295,22 @@ class BillingService:
                 if record_membership_order:
                     self._ensure_membership_orders_table_best_effort(cur)
 
+                fulfillment_ref = (fulfillment_ref or "").strip()
+                if fulfillment_ref:
+                    self._ensure_fulfillment_schema(cur)
+                    cur.execute(
+                        """
+                        INSERT INTO qd_membership_fulfillments (provider_ref, user_id, plan, created_at)
+                        VALUES (?, ?, ?, NOW()) ON CONFLICT (provider_ref) DO NOTHING
+                        RETURNING provider_ref
+                        """,
+                        (fulfillment_ref, user_id, plan),
+                    )
+                    if not cur.fetchone():
+                        db.rollback()
+                        cur.close()
+                        return True, "already_fulfilled", {"plan": plan, "already_fulfilled": True}
+
                 now = datetime.now(timezone.utc)
 
                 # Read current VIP state to support
@@ -152,11 +318,12 @@ class BillingService:
                 #   (b) lifetime members buying monthly/yearly as a pure
                 #       credit top-up without losing their lifetime status.
                 cur.execute(
-                    "SELECT vip_expires_at, vip_is_lifetime FROM qd_users WHERE id = ?",
+                    "SELECT vip_expires_at, vip_plan, vip_is_lifetime FROM qd_users WHERE id = ?",
                     (user_id,),
                 )
                 row = cur.fetchone() or {}
                 current_expires = row.get("vip_expires_at")
+                current_plan = str(row.get("vip_plan") or "").strip().lower()
                 existing_is_lifetime = bool(row.get("vip_is_lifetime") or False)
                 if isinstance(current_expires, str) and current_expires:
                     try:
@@ -173,7 +340,9 @@ class BillingService:
                 # Operators rely on this so heavy users can top up credits
                 # mid-cycle without "downgrading" themselves to a fixed-term
                 # plan.
-                preserve_lifetime = existing_is_lifetime and plan in ("monthly", "yearly")
+                selected = plans[plan]
+                selected_is_lifetime = bool(selected.get("is_lifetime"))
+                preserve_lifetime = existing_is_lifetime and not selected_is_lifetime
 
                 vip_expires_at = None
                 vip_plan = plan
@@ -182,10 +351,12 @@ class BillingService:
                 if preserve_lifetime:
                     # Keep whatever the lifetime user already has on file.
                     vip_expires_at = current_expires
-                    vip_plan = "lifetime"
+                    # Custom lifetime plans are supported, so do not rewrite
+                    # their code back to the legacy ``lifetime`` identifier.
+                    vip_plan = current_plan or "lifetime"
                     vip_is_lifetime = True
-                elif plan in ("monthly", "yearly"):
-                    days = int(plans[plan].get("duration_days") or (30 if plan == "monthly" else 365))
+                elif not selected_is_lifetime:
+                    days = int(selected.get("duration_days") or 0)
                     vip_expires_at = base_time + timedelta(days=days)
                 else:
                     # Lifetime upgrade (or first lifetime purchase): set very
@@ -242,8 +413,8 @@ class BillingService:
                     )
 
                 # Credits grants
-                if plan in ("monthly", "yearly"):
-                    credits_once = int(plans[plan].get("credits_once") or 0)
+                if not selected_is_lifetime:
+                    credits_once = int(selected.get("credits_once") or 0)
                     if credits_once > 0:
                         remark = (
                             f"Lifetime top-up via {plan}"
@@ -256,7 +427,7 @@ class BillingService:
                                                 remark=remark, reference_id=order_ref)
                 else:
                     # Lifetime: grant first month's credits immediately and set last grant time
-                    monthly_credits = int(plans["lifetime"].get("credits_monthly") or 0)
+                    monthly_credits = int(selected.get("credits_monthly") or 0)
                     if monthly_credits > 0:
                         self._add_credits_in_tx(cur, user_id, monthly_credits, action="membership_monthly",
                                                 remark="Lifetime membership monthly credits", reference_id=order_ref)
@@ -294,7 +465,8 @@ class BillingService:
         """Best-effort schema upgrade for membership fields on qd_users."""
         try:
             # vip_plan / vip_is_lifetime / vip_monthly_credits_last_grant
-            cur.execute("ALTER TABLE qd_users ADD COLUMN IF NOT EXISTS vip_plan VARCHAR(20) DEFAULT ''")
+            cur.execute("ALTER TABLE qd_users ADD COLUMN IF NOT EXISTS vip_plan VARCHAR(64) DEFAULT ''")
+            cur.execute("ALTER TABLE qd_users ALTER COLUMN vip_plan TYPE VARCHAR(64)")
             cur.execute("ALTER TABLE qd_users ADD COLUMN IF NOT EXISTS vip_is_lifetime BOOLEAN DEFAULT FALSE")
             cur.execute("ALTER TABLE qd_users ADD COLUMN IF NOT EXISTS vip_monthly_credits_last_grant TIMESTAMP")
         except Exception:
@@ -309,7 +481,7 @@ class BillingService:
                 CREATE TABLE IF NOT EXISTS qd_membership_orders (
                   id SERIAL PRIMARY KEY,
                   user_id INTEGER NOT NULL,
-                  plan VARCHAR(20) NOT NULL,
+                  plan VARCHAR(64) NOT NULL,
                   price_usd DECIMAL(10,2) DEFAULT 0,
                   status VARCHAR(20) DEFAULT 'paid',
                   created_at TIMESTAMP DEFAULT NOW(),
@@ -319,6 +491,18 @@ class BillingService:
             )
         except Exception:
             pass
+
+    def _ensure_fulfillment_schema(self, cur):
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qd_membership_fulfillments (
+              provider_ref VARCHAR(255) PRIMARY KEY,
+              user_id INTEGER NOT NULL,
+              plan VARCHAR(64) NOT NULL,
+              created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
 
     def _add_credits_in_tx(self, cur, user_id: int, amount: int, action: str, remark: str, reference_id: str = ''):
         """Add credits within an existing DB transaction and write qd_credits_log."""
@@ -343,17 +527,24 @@ class BillingService:
     def _grant_lifetime_monthly_credits_best_effort(self, cur, user_id: int):
         """Grant lifetime monthly credits if due (best-effort)."""
         try:
-            plans = self.get_membership_plans()
-            monthly_credits = int(plans.get("lifetime", {}).get("credits_monthly") or 0)
-            if monthly_credits <= 0:
-                return
-
             cur.execute(
-                "SELECT vip_is_lifetime, vip_expires_at, vip_monthly_credits_last_grant FROM qd_users WHERE id = ?",
+                "SELECT vip_plan, vip_is_lifetime, vip_expires_at, vip_monthly_credits_last_grant FROM qd_users WHERE id = ?",
                 (user_id,),
             )
             row = cur.fetchone() or {}
             if not row.get("vip_is_lifetime"):
+                return
+            # Reuse the caller's transaction. Opening another pooled connection
+            # here can deadlock a small deployment when all connections are busy.
+            self._ensure_plan_schema(cur)
+            self._seed_default_plans(cur)
+            cur.execute(
+                "SELECT credits_monthly FROM qd_billing_plans WHERE code = ?",
+                (str(row.get("vip_plan") or "lifetime"),),
+            )
+            plan_row = cur.fetchone() or {}
+            monthly_credits = int(plan_row.get("credits_monthly") or 0)
+            if monthly_credits <= 0:
                 return
 
             expires_at = row.get("vip_expires_at")

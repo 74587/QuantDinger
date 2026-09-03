@@ -109,18 +109,34 @@ CHAIN_SPECS: Dict[str, ChainSpec] = {
     ),
 }
 
+# Only Circle-issued native USDC networks supported by the scanners in this
+# service are exposed. TRON USDC has been discontinued by Circle, while the
+# commonly used BSC token is Binance-Peg USDC rather than native USDC.
+USDC_SUPPORTED_CODES: Tuple[str, ...] = ("ERC20", "SOL")
+USDC_TOKEN_DEFAULTS: Dict[str, Tuple[str, int]] = {
+    "ERC20": ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6),
+    "SOL": ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 6),
+}
 
-def _enabled_codes() -> List[str]:
-    raw = os.getenv("USDT_PAY_ENABLED_CHAINS", "TRC20,BEP20,ERC20,SOL") or ""
+
+def _enabled_codes(currency: str = "USDT") -> List[str]:
+    currency = (currency or "USDT").strip().upper()
+    if currency == "USDC":
+        supported = set(USDC_SUPPORTED_CODES)
+        default_codes = ",".join(USDC_SUPPORTED_CODES)
+    else:
+        supported = set(CHAIN_SPECS)
+        default_codes = "TRC20,BEP20,ERC20,SOL"
+    raw = os.getenv(f"{currency}_PAY_ENABLED_CHAINS", default_codes) or ""
     out: List[str] = []
     for tok in raw.upper().split(","):
         tok = tok.strip()
-        if tok in CHAIN_SPECS and tok not in out:
+        if tok in supported and tok not in out:
             out.append(tok)
     return out
 
 
-def chain_metadata(code: str) -> Optional[Dict]:
+def chain_metadata(code: str, currency: str = "USDT") -> Optional[Dict]:
     """Return runtime metadata for one chain, or None if the chain is not
     enabled or no receiving address is configured.
 
@@ -128,22 +144,37 @@ def chain_metadata(code: str) -> Optional[Dict]:
     NOT include API keys or RPC URLs.
     """
     code = (code or "").strip().upper()
+    currency = (currency or "USDT").strip().upper()
+    if currency not in ("USDT", "USDC"):
+        return None
     spec = CHAIN_SPECS.get(code)
     if spec is None:
         return None
-    if code not in _enabled_codes():
+    if code not in _enabled_codes(currency):
         return None
-    address = (os.getenv(spec.address_env, "") or "").strip()
+    # By default USDC goes to the same operator wallet as USDT. A dedicated
+    # USDC address may still be configured for accounting separation.
+    address_env = f"{currency}_{code}_ADDRESS" if code != "SOL" else f"{currency}_SOL_ADDRESS"
+    address = (os.getenv(address_env, "") or "").strip()
+    if not address and currency == "USDC":
+        address = (os.getenv(spec.address_env, "") or "").strip()
     if not address:
         return None
-    contract = (os.getenv(spec.contract_env, "") or "").strip() or spec.contract_default
+    if currency == "USDC":
+        default_contract, decimals = USDC_TOKEN_DEFAULTS[code]
+        contract_env = f"USDC_{code}_CONTRACT" if code != "SOL" else "USDC_SOL_MINT"
+        contract = (os.getenv(contract_env, "") or "").strip() or default_contract
+    else:
+        decimals = spec.decimals
+        contract = (os.getenv(spec.contract_env, "") or "").strip() or spec.contract_default
     return {
         "code": spec.code,
         "label": spec.label,
         "network_kind": spec.network_kind,
         "address": address,
         "contract": contract,
-        "decimals": spec.decimals,
+        "decimals": decimals,
+        "currency": currency,
         "chain_id": spec.chain_id,
         "typical_fee_usdt": spec.typical_fee_usdt,
         "recommended": spec.recommended,
@@ -151,13 +182,13 @@ def chain_metadata(code: str) -> Optional[Dict]:
     }
 
 
-def list_enabled_chains() -> List[Dict]:
+def list_enabled_chains(currency: str = "USDT") -> List[Dict]:
     """Return runtime metadata for every chain that is both enabled and has
     a receiving address configured. UI uses this to render the chain picker.
     """
     out: List[Dict] = []
-    for code in _enabled_codes():
-        meta = chain_metadata(code)
+    for code in _enabled_codes(currency):
+        meta = chain_metadata(code, currency)
         if meta is not None:
             out.append(meta)
     return out
@@ -264,6 +295,8 @@ def build_payment_uri(
     amount: Decimal,
     *,
     contract: Optional[str] = None,
+    currency: str = "USDT",
+    decimals: Optional[int] = None,
     order_id: Optional[int] = None,
     label: str = "QuantDinger",
 ) -> str:
@@ -300,9 +333,11 @@ def build_payment_uri(
     # the caller passed a Decimal that round-tripped through a wider DB
     # column (NUMERIC(20,8)) or came straight from the suffix generator.
     human_amount = format_amount_display(amount)
+    currency = (currency or "USDT").strip().upper()
+    token_decimals = spec.decimals if decimals is None else int(decimals)
 
     if spec.network_kind == "evm":
-        raw = _to_smallest_unit(amount, spec.decimals)
+        raw = _to_smallest_unit(amount, token_decimals)
         return (
             f"ethereum:{used_contract}@{spec.chain_id}/transfer"
             f"?address={address}&uint256={raw}"
@@ -311,7 +346,7 @@ def build_payment_uri(
         # No formal spec for TRON; in practice imToken / TokenPocket /
         # MetaMask (with the TRON snap) recognise this form, and wallets
         # that don't still pull the recipient out of the URI body.
-        return f"tron:{address}?asset=USDT&amount={human_amount}"
+        return f"tron:{address}?asset={currency}&amount={human_amount}"
     if spec.network_kind == "solana":
         msg = f"Order #{order_id}" if order_id else "Membership payment"
         params = (

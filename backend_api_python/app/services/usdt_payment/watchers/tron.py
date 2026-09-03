@@ -41,7 +41,7 @@ def _parse_created_at(raw: Any) -> Optional[datetime]:
     return None
 
 
-def find_incoming(address: str, amount: Decimal, created_at: Optional[datetime]) -> WatcherResult:
+def find_incoming(address: str, amount: Decimal, created_at: Optional[datetime], token_meta=None) -> WatcherResult:
     """Look for a TRC20 USDT transfer that *exactly* matches the order
     amount and lands at ``address`` after ``created_at``.
 
@@ -50,14 +50,16 @@ def find_incoming(address: str, amount: Decimal, created_at: Optional[datetime])
     want to accept an over-payment as a different order's match.
     """
     base = _resolve_endpoint()
-    contract = _resolve_contract()
+    token_meta = token_meta or {}
+    contract = token_meta.get("contract") or _resolve_contract()
+    decimals = int(token_meta.get("decimals") or 6)
     address = (address or "").strip()
     if not address or amount <= 0:
         return None, "bad_args"
 
     page_limit = int(os.getenv("USDT_TRC20_PAGE_LIMIT", "100") or 100)
     max_pages = int(os.getenv("USDT_TRC20_MAX_PAGES", "5") or 5)
-    target = int((amount * Decimal(10 ** 6)).to_integral_value())
+    target = int((amount * Decimal(10 ** decimals)).to_integral_value())
 
     ct = _parse_created_at(created_at)
     min_ts = int(ct.timestamp() * 1000) - 60_000 if ct else None

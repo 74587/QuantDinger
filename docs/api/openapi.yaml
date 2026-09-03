@@ -450,10 +450,14 @@ components:
       properties:
         plan:
           type: string
+          minLength: 1
+          maxLength: 64
+        currency:
+          type: string
+          default: USDT
           enum:
-          - monthly
-          - yearly
-          - lifetime
+          - USDT
+          - USDC
         chain:
           type: string
           default: null
@@ -1884,14 +1888,19 @@ paths:
 
         page_size: int (default 20, max 100)
 
-        status: str (optional, filter by status: paid/pending/confirmed/expired/all)
+        status: str (optional, filter by status: paid/pending/confirmed/expired/failed/cancelled/all)
 
-        search: str (optional, search by username/email)
+        payment_method: str (optional: usdt/usdc/stripe/all)
+
+        plan: str (optional membership plan code)
+
+        search: str (optional, search by user, email, order id, transaction hash,
+        receiving address, or Stripe Checkout session id)
 
 
         Get all orders across the system (admin only).
 
-        Lists USDT on-chain membership orders only (qd_usdt_orders).'
+        Lists USDT, USDC, and Stripe membership orders in one paginated view.'
       tags:
       - Users
       operationId: getApiUsersAdminOrders
@@ -1911,7 +1920,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
-      summary: Admin-only "rescue" lever for USDT orders.
+      summary: Admin-only "rescue" lever for USDT and USDC on-chain orders.
       description: "Use case: the buyer paid the correct amount to the correct receiving\n\
         address, but the on-chain reconciler missed the transaction (RPC\noutage,\
         \ exotic wallet, chain-specific edge case, off-chain mistake\nwhere the customer\
@@ -7327,6 +7336,87 @@ paths:
       - Billing
       operationId: getApiBillingPlans
       x-visibility: private
+  /api/billing/crypto/chains:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Billing
+      operationId: getApiBillingCryptoChains
+      summary: Get Api Billing Crypto Chains
+      x-visibility: private
+  /api/billing/crypto/create:
+    post:
+      responses:
+        '422':
+          $ref: '#/components/responses/UNPROCESSABLE_ENTITY'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingOrderRequest'
+      tags:
+      - Billing
+      operationId: postApiBillingCryptoCreate
+      summary: Post Api Billing Crypto Create
+      x-visibility: private
+  /api/billing/crypto/order/{order_id}:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Billing
+      operationId: getApiBillingCryptoOrderOrderId
+      summary: Get Api Billing Crypto Order Order Id
+      parameters:
+      - name: order_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: private
+    parameters:
+    - in: path
+      name: order_id
+      required: true
+      schema:
+        type: integer
+        minimum: 0
   /api/billing/usdt/chains:
     get:
       responses:
@@ -7376,7 +7466,7 @@ paths:
             schema:
               $ref: '#/components/schemas/BillingOrderRequest'
       summary: Create a USDT membership order.
-      description: "Body:\n{\n  plan:  \"monthly\" | \"yearly\" | \"lifetime\",\n\
+      description: "Body:\n{\n  plan:  dynamic plan code returned by GET /plans,\n\
         \  chain: \"TRC20\" | \"BEP20\" | \"ERC20\" | \"SOL\"   # optional; defaults\
         \ to\n                                               # the first enabled chain\n\
         }"
@@ -7417,6 +7507,85 @@ paths:
       schema:
         type: integer
         minimum: 0
+  /api/billing/stripe/create:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Billing
+      operationId: postApiBillingStripeCreate
+      summary: Post Api Billing Stripe Create
+      x-visibility: private
+  /api/billing/stripe/webhook:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Billing
+      operationId: postApiBillingStripeWebhook
+      summary: Post Api Billing Stripe Webhook
+      x-visibility: private
+  /api/billing/admin/plans:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Billing
+      operationId: getApiBillingAdminPlans
+      summary: Get Api Billing Admin Plans
+      x-visibility: private
+    put:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Billing
+      operationId: putApiBillingAdminPlans
+      summary: Put Api Billing Admin Plans
+      x-visibility: private
   /api/quick-trade/place-order:
     post:
       responses:

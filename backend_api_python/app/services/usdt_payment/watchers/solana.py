@@ -168,13 +168,15 @@ def _delta_for_watched_account(
     return amount_at(post) - amount_at(pre)
 
 
-def find_incoming(address: str, amount: Decimal, created_at: Optional[datetime]) -> WatcherResult:
+def find_incoming(address: str, amount: Decimal, created_at: Optional[datetime], token_meta=None) -> WatcherResult:
     address = (address or "").strip()
     if not address or amount <= 0:
         return None, "bad_args"
 
-    mint = _usdt_mint()
-    target = int((amount * Decimal(10 ** _SPEC.decimals)).to_integral_value())
+    token_meta = token_meta or {}
+    mint = token_meta.get("contract") or _usdt_mint()
+    decimals = int(token_meta.get("decimals") or _SPEC.decimals)
+    target = int((amount * Decimal(10 ** decimals)).to_integral_value())
     ct = _parse_created_at(created_at)
     min_ts = int(ct.timestamp()) - 60 if ct else None
 
