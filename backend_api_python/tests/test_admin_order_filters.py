@@ -6,6 +6,7 @@ def test_admin_orders_unify_crypto_and_stripe_sources():
     assert "FROM qd_stripe_orders" in _ADMIN_ORDERS_CTE
     assert "AS payment_method" in _ADMIN_ORDERS_CTE
     assert "stripe_session_id" in _ADMIN_ORDERS_CTE
+    assert "o.expires_at <= NOW()" in _ADMIN_ORDERS_CTE
 
 
 def test_admin_orders_join_the_database_backed_billing_plan_table():

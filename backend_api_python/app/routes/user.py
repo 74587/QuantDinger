@@ -1734,14 +1734,17 @@ _ADMIN_ORDERS_CTE = """
             ''::TEXT AS address,
             ''::TEXT AS tx_hash,
             COALESCE(o.stripe_session_id, '') AS provider_reference,
-            o.status,
+            CASE
+                WHEN o.status = 'pending' AND o.expires_at IS NOT NULL AND o.expires_at <= NOW() THEN 'expired'
+                ELSE o.status
+            END AS status,
             CASE WHEN o.status = 'paid' THEN 'stripe_webhook' ELSE '' END AS matched_via,
             ''::TEXT AS admin_note,
             NULL::INTEGER AS manual_confirmed_by,
             o.created_at,
             o.paid_at,
             NULL::TIMESTAMP AS confirmed_at,
-            NULL::TIMESTAMP AS expires_at
+            o.expires_at
         FROM qd_stripe_orders o
     )
 """

@@ -106,9 +106,12 @@ CREATE TABLE IF NOT EXISTS qd_stripe_orders (
     currency VARCHAR(10) NOT NULL DEFAULT 'usd',
     status VARCHAR(20) NOT NULL DEFAULT 'pending',
     paid_at TIMESTAMP,
+    expires_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE qd_stripe_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;
 
 -- =============================================================================
 -- 1.56. USDT Orders (multi-chain single-receiving-address + amount-suffix model)

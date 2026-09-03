@@ -13,6 +13,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, Tuple
 
@@ -27,6 +28,7 @@ logger = get_logger(__name__)
 
 class StripePaymentService:
     DEFAULT_TAX_CODE = "txcd_10103000"
+    CHECKOUT_SESSION_TTL_SECONDS = 60 * 60
 
     def __init__(self) -> None:
         self.billing = get_billing_service()
@@ -57,11 +59,13 @@ class StripePaymentService:
               currency VARCHAR(10) NOT NULL DEFAULT 'usd',
               status VARCHAR(20) NOT NULL DEFAULT 'pending',
               paid_at TIMESTAMP,
+              expires_at TIMESTAMP,
               created_at TIMESTAMP DEFAULT NOW(),
               updated_at TIMESTAMP DEFAULT NOW()
             )
             """
         )
+        cur.execute("ALTER TABLE qd_stripe_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
 
     @staticmethod
     def _checkout_line_item(plan: Dict[str, Any], plan_code: str) -> Dict[str, str]:
@@ -105,15 +109,18 @@ class StripePaymentService:
         except ValueError as exc:
             return False, str(exc), {}
 
+        checkout_expires_at = int(time.time()) + self.CHECKOUT_SESSION_TTL_SECONDS
+        expires_at = datetime.fromtimestamp(checkout_expires_at, tz=timezone.utc).replace(tzinfo=None)
         with get_db_connection() as db:
             cur = db.cursor()
             self._ensure_schema(cur)
             cur.execute(
                 """
-                INSERT INTO qd_stripe_orders (user_id, plan, amount_usd, status, created_at, updated_at)
-                VALUES (?, ?, ?, 'pending', NOW(), NOW()) RETURNING id
+                INSERT INTO qd_stripe_orders
+                    (user_id, plan, amount_usd, status, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, 'pending', ?, NOW(), NOW()) RETURNING id
                 """,
-                (user_id, plan_code, float(plan.get("price_usd") or 0)),
+                (user_id, plan_code, float(plan.get("price_usd") or 0), expires_at),
             )
             order_id = (cur.fetchone() or {}).get("id")
             db.commit()
@@ -126,6 +133,7 @@ class StripePaymentService:
         cancel_url = (os.getenv("STRIPE_CANCEL_URL", "") or "").strip() or f"{base}{return_path}?payment=stripe_cancelled"
         payload = {
             "mode": "payment",
+            "expires_at": str(checkout_expires_at),
             "success_url": success_url,
             "cancel_url": cancel_url,
             "client_reference_id": str(order_id),
@@ -197,16 +205,36 @@ class StripePaymentService:
             event = json.loads(payload.decode("utf-8"))
         except Exception:
             return False, "invalid_payload"
-        if event.get("type") != "checkout.session.completed":
+        event_type = event.get("type")
+        if event_type not in ("checkout.session.completed", "checkout.session.expired"):
             return True, "ignored"
         session = ((event.get("data") or {}).get("object") or {})
-        if session.get("payment_status") not in ("paid", "no_payment_required"):
-            return True, "not_paid"
         metadata = session.get("metadata") or {}
         try:
             order_id = int(metadata.get("order_id") or session.get("client_reference_id") or 0)
         except (TypeError, ValueError):
             return False, "invalid_order"
+        if not order_id:
+            return False, "invalid_order"
+
+        if event_type == "checkout.session.expired":
+            with get_db_connection() as db:
+                cur = db.cursor()
+                self._ensure_schema(cur)
+                cur.execute(
+                    """
+                    UPDATE qd_stripe_orders
+                    SET status='expired', updated_at=NOW(), stripe_session_id=?
+                    WHERE id=? AND status='pending'
+                    """,
+                    (session.get("id") or "", order_id),
+                )
+                db.commit()
+                cur.close()
+            return True, "expired"
+
+        if session.get("payment_status") not in ("paid", "no_payment_required"):
+            return True, "not_paid"
         with get_db_connection() as db:
             cur = db.cursor()
             self._ensure_schema(cur)
