@@ -1771,6 +1771,9 @@ def _admin_order_filters(status_filter: str, payment_method: str, plan_filter: s
     return ("WHERE " + " AND ".join(conditions)) if conditions else "", params
 
 
+_ADMIN_PLAN_TABLE = "qd_billing_plans"
+
+
 @user_blp.route('/admin-orders', methods=['GET'])
 @login_required
 @admin_required
@@ -1789,10 +1792,10 @@ def get_admin_orders():
         where_sql, filter_params = _admin_order_filters(
             status_filter, payment_method, plan_filter, search,
         )
-        joined_source = """
+        joined_source = f"""
             FROM unified_orders o
             LEFT JOIN qd_users u ON u.id = o.user_id
-            LEFT JOIN qd_membership_plans p ON p.code = o.plan
+            LEFT JOIN {_ADMIN_PLAN_TABLE} p ON p.code = o.plan
         """
 
         with get_db_connection() as db:

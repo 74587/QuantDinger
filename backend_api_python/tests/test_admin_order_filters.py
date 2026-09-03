@@ -1,4 +1,4 @@
-from app.routes.user import _ADMIN_ORDERS_CTE, _admin_order_filters
+from app.routes.user import _ADMIN_ORDERS_CTE, _ADMIN_PLAN_TABLE, _admin_order_filters
 
 
 def test_admin_orders_unify_crypto_and_stripe_sources():
@@ -6,6 +6,10 @@ def test_admin_orders_unify_crypto_and_stripe_sources():
     assert "FROM qd_stripe_orders" in _ADMIN_ORDERS_CTE
     assert "AS payment_method" in _ADMIN_ORDERS_CTE
     assert "stripe_session_id" in _ADMIN_ORDERS_CTE
+
+
+def test_admin_orders_join_the_database_backed_billing_plan_table():
+    assert _ADMIN_PLAN_TABLE == "qd_billing_plans"
 
 
 def test_admin_order_filters_cover_method_plan_status_and_search():
