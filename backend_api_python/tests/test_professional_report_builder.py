@@ -75,7 +75,7 @@ def _analysis(payload, evidence_claims=None):
         "language": "zh-CN",
         "decision": "BUY",
         "confidence": 88,
-        "summary": "趋势改善â€”但仍需确认�",
+        "summary": "趋势改善\u00e2\u20ac\u201d但仍需确认\ufffd",
         "timeframe": "medium",
         "detailed_analysis": {"technical": "动量改善", "fundamental": "数据可用", "sentiment": "中性"},
         "scores": {"technical": 68, "fundamental": 60, "sentiment": 52},
@@ -102,8 +102,8 @@ def test_professional_builder_produces_valid_contract_for_supported_markets(mark
     assert report["contract_validation"]["valid"] is True
     assert report["instrument"]["market"] == market
     assert report["claims"][0]["evidence_refs"] == [ref]
-    assert "â€”" not in report["executive_summary"]
-    assert "�" not in report["executive_summary"]
+    assert "\u00e2\u20ac\u201d" not in report["executive_summary"]
+    assert "\ufffd" not in report["executive_summary"]
     assert report["data_quality"]["coverage_ratio"] == 1
 
 

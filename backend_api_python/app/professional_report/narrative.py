@@ -7,17 +7,29 @@ import unicodedata
 from typing import Any, Iterable, Mapping
 
 
-_MOJIBAKE = ("ï¿½", "â€”", "â€“", "â€™", "锟斤拷", "�")
+_MOJIBAKE = (
+    "\u00ef\u00bf\u00bd",
+    "\u00e2\u20ac\u201d",
+    "\u00e2\u20ac\u201c",
+    "\u00e2\u20ac\u2122",
+    "\u951f\u65a4\u62f7",
+    "\ufffd",
+)
 
 
 def normalize_report_text(value: Any) -> Any:
     """Normalize Unicode and replace known mojibake without changing numbers."""
     if isinstance(value, str):
         text = unicodedata.normalize("NFKC", value).replace("\x00", "")
-        replacements = {"â€”": "—", "â€“": "–", "â€™": "’", "ï¿½": ""}
+        replacements = {
+            "\u00e2\u20ac\u201d": "—",
+            "\u00e2\u20ac\u201c": "–",
+            "\u00e2\u20ac\u2122": "’",
+            "\u00ef\u00bf\u00bd": "",
+        }
         for broken, fixed in replacements.items():
             text = text.replace(broken, fixed)
-        return text.replace("�", "").strip()
+        return text.replace("\ufffd", "").strip()
     if isinstance(value, dict):
         return {key: normalize_report_text(item) for key, item in value.items()}
     if isinstance(value, list):
