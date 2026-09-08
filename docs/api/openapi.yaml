@@ -1881,26 +1881,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
-      summary: Get all orders across the system (admin only).
-      description: 'Query params:
-
-        page: int (default 1)
-
-        page_size: int (default 20, max 100)
-
-        status: str (optional, filter by status: paid/pending/confirmed/expired/failed/cancelled/all)
-
-        payment_method: str (optional: usdt/usdc/stripe/all)
-
-        plan: str (optional membership plan code)
-
-        search: str (optional, search by user, email, order id, transaction hash,
-        receiving address, or Stripe Checkout session id)
-
-
-        Get all orders across the system (admin only).
-
-        Lists USDT, USDC, and Stripe membership orders in one paginated view.'
+      summary: Return one paginated admin view for USDT, USDC and Stripe orders.
       tags:
       - Users
       operationId: getApiUsersAdminOrders
@@ -1920,7 +1901,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
-      summary: Admin-only "rescue" lever for USDT and USDC on-chain orders.
+      summary: Admin-only "rescue" lever for USDT orders.
       description: "Use case: the buyer paid the correct amount to the correct receiving\n\
         address, but the on-chain reconciler missed the transaction (RPC\noutage,\
         \ exotic wallet, chain-specific edge case, off-chain mistake\nwhere the customer\
@@ -3368,6 +3349,60 @@ paths:
       operationId: postApiAiChatReportPdf
       summary: Post Api Ai Chat Report Pdf
       x-visibility: internal
+  /api/ai/chat/report/share:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Create a public, read-only snapshot link for a report owned by the
+        user.
+      tags:
+      - AIChat
+      operationId: postApiAiChatReportShare
+      x-visibility: internal
+  /api/ai/chat/report/share/{token}:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Public endpoint for a capability-linked report snapshot; no login required.
+      tags:
+      - AIChat
+      operationId: getApiAiChatReportShareToken
+      parameters:
+      - name: token
+        in: path
+        required: true
+        schema:
+          type: string
+      x-visibility: internal
+    parameters:
+    - in: path
+      name: token
+      required: true
+      schema:
+        type: string
+        minLength: 1
   /api/ai/chat/history/save:
     post:
       responses:
@@ -3428,8 +3463,8 @@ paths:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
       summary: Create or update an indicator for the current user.
       description: "Request (frontend sends many extra fields; we store only the essentials):\n\
-        {\n  id: number (0 for create),\n  name: string,\n  code: string,\n  allowEmptyDraft?: boolean,\n  description?:\
-        \ string,\n  ...\n}"
+        {\n  id: number (0 for create),\n  name: string,\n  code: string,\n  allowEmptyDraft?:\
+        \ boolean,\n  description?: string,\n  ...\n}"
       tags:
       - Indicator
       operationId: postApiIndicatorSaveIndicator
@@ -7156,22 +7191,36 @@ paths:
               schema:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
       summary: Fast AI analysis for any symbol.
-      description: 'Request body:
-
-        market (required): Crypto, USStock, Forex, etc.
-
-        symbol (required): e.g. BTC/USDT, AAPL
-
-        language (optional, default en-US): Response language
-
-        model (optional): LLM model id, e.g. openai/gpt-5.4
-
-        timeframe (optional, default 1D): Analysis timeframe
-
-        async_submit (optional): Submit as background task'
+      description: "Request body:\nmarket (required): Crypto, USStock, Forex, etc.\n\
+        symbol (required): e.g. BTC/USDT, AAPL\nlanguage (optional, default en-US):\
+        \ Response language\nmodel (optional): LLM model id, e.g. openai/gpt-5.4\n\
+        timeframe (optional, default 1D): Analysis timeframe\nasync_submit (optional):\
+        \ Submit as background task\nresponse_contract (optional): professional_report_v1\
+        \ returns only the\n    versioned report artifact plus runtime and billing\
+        \ metadata."
       tags:
       - FastAnalysis
       operationId: postApiFastAnalysisAnalyze
+      x-visibility: public
+  /api/fast-analysis/data-sources:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: List community and professional report providers without secrets.
+      tags:
+      - FastAnalysis
+      operationId: getApiFastAnalysisDataSources
       x-visibility: public
   /api/fast-analysis/history:
     get:
