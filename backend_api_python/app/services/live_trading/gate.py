@@ -565,12 +565,12 @@ class GateUsdtFuturesClient(_GateBase):
         return None
 
     def get_positions(self) -> Any:
-        mode = self.get_position_mode()
-        path = (
-            "/api/v4/futures/usdt/dual_comp/positions"
-            if mode == "dual"
-            else "/api/v4/futures/usdt/positions"
-        )
+        # Gate exposes one collection endpoint for every supported position
+        # mode.  In dual mode the response contains separate ``dual_long`` and
+        # ``dual_short`` rows.  ``dual_comp/positions`` is not a collection
+        # endpoint: Gate only defines ``dual_comp/positions/{contract}``, so
+        # routing a dual account there without a contract produces a bare 404.
+        path = "/api/v4/futures/usdt/positions"
         return self._signed_request(
             "GET", path,
             extra_headers={"X-Gate-Size-Decimal": "1"},

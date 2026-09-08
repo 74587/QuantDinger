@@ -124,29 +124,66 @@ def test_binance_margin_timeout_fails_when_readback_differs():
         )
 
 
-def test_gate_uses_dual_comp_endpoints_and_rejects_dynamic_maximum():
+def test_gate_lists_dual_mode_positions_through_standard_collection_endpoint():
     client = GateUsdtFuturesClient.__new__(GateUsdtFuturesClient)
-    client._position_mode_cache = (0.0, "")
-    client._position_mode_cache_ttl_sec = 30.0
     calls = []
+    positions = [
+        {"contract": "BTC_USDT", "mode": "dual_long", "size": "2"},
+        {"contract": "BTC_USDT", "mode": "dual_short", "size": "-1"},
+    ]
 
     def signed(method, path, **kwargs):
         calls.append((method, path, kwargs))
-        if path.endswith("/accounts"):
-            return {"position_mode": "dual"}
-        if path.endswith("/dual_comp/positions"):
-            return []
-        return {"cross_leverage_limit": "5"}
+        return positions
 
     client._signed_request = signed
-    client.get_contract = lambda **_kwargs: {"leverage_max": "10"}
 
-    assert client.is_hedge_position_mode(symbol="BTC/USDT") is True
-    assert client.get_positions() == []
-    assert calls[-1][1].endswith("/dual_comp/positions")
+    assert client.get_positions() == positions
+    assert calls == [(
+        "GET",
+        "/api/v4/futures/usdt/positions",
+        {"extra_headers": {"X-Gate-Size-Decimal": "1"}},
+    )]
+
+
+def test_gate_rejects_leverage_above_dynamic_maximum():
+    client = GateUsdtFuturesClient.__new__(GateUsdtFuturesClient)
+    client.get_contract = lambda **_kwargs: {"leverage_max": "10"}
+    client._signed_request = lambda *_args, **_kwargs: pytest.fail("request must not be sent")
 
     with pytest.raises(LiveTradingError, match="maximum 10x"):
         client.set_leverage(contract="BTC_USDT", leverage=11, margin_mode="cross")
+
+
+@pytest.mark.parametrize(
+    ("position_mode", "expected_path"),
+    [
+        ("single", "/api/v4/futures/usdt/positions/BTC_USDT/leverage"),
+        ("dual", "/api/v4/futures/usdt/dual_comp/positions/BTC_USDT/leverage"),
+    ],
+)
+def test_gate_uses_documented_leverage_endpoint_for_position_mode(
+    position_mode, expected_path
+):
+    client = GateUsdtFuturesClient.__new__(GateUsdtFuturesClient)
+    calls = []
+    client.get_position_mode = lambda: position_mode
+    client.get_contract = lambda **_kwargs: {"leverage_max": "100"}
+    client._signed_request = lambda method, path, **kwargs: (
+        calls.append((method, path, kwargs)) or {"cross_leverage_limit": "5"}
+    )
+
+    assert client.set_leverage(
+        contract="BTC_USDT", leverage=5, margin_mode="cross"
+    ) is True
+    assert calls == [(
+        "POST",
+        expected_path,
+        {
+            "params": {"leverage": "0", "cross_leverage_limit": "5"},
+            "json_body": None,
+        },
+    )]
 
 
 def test_gate_rejects_effective_leverage_mismatch():
