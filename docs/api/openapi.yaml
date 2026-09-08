@@ -3428,7 +3428,7 @@ paths:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
       summary: Create or update an indicator for the current user.
       description: "Request (frontend sends many extra fields; we store only the essentials):\n\
-        {\n  id: number (0 for create),\n  name: string,\n  code: string,\n  description?:\
+        {\n  id: number (0 for create),\n  name: string,\n  code: string,\n  allowEmptyDraft?: boolean,\n  description?:\
         \ string,\n  ...\n}"
       tags:
       - Indicator

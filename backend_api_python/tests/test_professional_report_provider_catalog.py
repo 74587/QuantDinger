@@ -60,9 +60,9 @@ def test_catalog_distinguishes_active_adapters_from_planned_sources():
     active = {provider.key for provider in PROVIDER_CATALOG if provider.integration_status == "active"}
     assert {
         "yahoo_finance", "finnhub", "twelve_data", "alpha_vantage",
-        "fred", "ccxt_public", "coingecko", "coinglass", "cryptoquant",
+        "fred", "sec_edgar", "gate_public", "okx_public", "ccxt_public",
+        "coingecko", "coinglass", "cryptoquant",
     }.issubset(active)
-    assert "sec_edgar" not in active
     assert "hkex_data_marketplace" not in active
 
 

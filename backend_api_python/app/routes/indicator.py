@@ -388,6 +388,7 @@ def save_indicator():
         id: number (0 for create),
         name: string,
         code: string,
+        allowEmptyDraft?: boolean,
         description?: string,
         ...
       }
@@ -400,6 +401,10 @@ def save_indicator():
         name = (data.get("name") or "").strip()
         description = (data.get("description") or "").strip()
         publish_to_community = 1 if data.get("publishToCommunity") or data.get("publish_to_community") else 0
+        allow_empty_draft = (
+            data.get("allowEmptyDraft") is True
+            or data.get("allow_empty_draft") is True
+        )
         pricing_type = (data.get("pricingType") or data.get("pricing_type") or "free").strip() or "free"
         vip_free = bool(data.get("vipFree") or data.get("vip_free"))
         code_hidden = bool(data.get("hideCode") or data.get("hide_code") or data.get("codeHidden") or data.get("code_hidden"))
@@ -410,18 +415,20 @@ def save_indicator():
         preview_image = (data.get("previewImage") or data.get("preview_image") or "").strip()
         asset_type = "indicator"
 
-        if not code or not str(code).strip():
+        is_empty_code = not str(code).strip()
+        if is_empty_code and (not allow_empty_draft or publish_to_community):
             return jsonify({"code": 0, "msg": "code is required", "data": None}), 400
 
-        from app.utils.safe_exec import validate_code_safety
+        if not is_empty_code:
+            from app.utils.safe_exec import validate_code_safety
 
-        is_safe_code, unsafe_reason = validate_code_safety(code)
-        if not is_safe_code:
-            return jsonify({
-                "code": 0,
-                "msg": f"Unsafe indicator code: {unsafe_reason}",
-                "data": None,
-            }), 400
+            is_safe_code, unsafe_reason = validate_code_safety(code)
+            if not is_safe_code:
+                return jsonify({
+                    "code": 0,
+                    "msg": f"Unsafe indicator code: {unsafe_reason}",
+                    "data": None,
+                }), 400
 
         # Local dev UX: if name/description not provided, derive from code variables.
         if not name or not description:

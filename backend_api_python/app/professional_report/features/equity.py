@@ -102,6 +102,15 @@ def build_equity_features(
             if not value
         ]
     elif market == "HKStock":
+        security_profile = payload.get("hk_security_profile") or {}
+        # A/H premium is meaningful only for an H-share with a corresponding
+        # mainland listing. Treating it as mandatory for Tencent and every
+        # other non-H-share incorrectly depresses report coverage.
+        ah_premium_applicable = bool(
+            security_profile.get("is_h_share")
+            or payload.get("ah_pair")
+            or payload.get("ah_premium")
+        )
         market_specific = {
             "hkex_announcements": payload.get("hkex_announcements") or [],
             "southbound_flow": payload.get("southbound_flow") or {},
@@ -110,7 +119,22 @@ def build_equity_features(
             "ah_premium": payload.get("ah_premium") or {},
             "analyst_expectations": payload.get("analyst_expectations") or {},
         }
-        missing = [key for key, value in market_specific.items() if not value]
+        applicable = {
+            "hkex_announcements": True,
+            "southbound_flow": bool(
+                security_profile.get("southbound_eligible_sh")
+                or security_profile.get("southbound_eligible_sz")
+                or not security_profile
+            ),
+            "short_selling": True,
+            "ccass": True,
+            "ah_premium": ah_premium_applicable,
+            "analyst_expectations": True,
+        }
+        missing = [
+            key for key, value in market_specific.items()
+            if applicable.get(key, True) and not value
+        ]
     else:
         raise ValueError(f"unsupported equity market: {market}")
 
@@ -130,6 +154,7 @@ def build_equity_features(
             "latest_annual": latest_annual,
         },
         "market_specific": market_specific,
+        "applicability": applicable if market == "HKStock" else {},
         "missing_capabilities": missing,
         "warnings": warnings,
         "evidence_refs": sorted({ref for item in metrics.values() for ref in item["evidence_refs"]}),

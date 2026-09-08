@@ -187,6 +187,139 @@ def test_requested_professional_tier_downgrades_without_professional_evidence():
     assert "professional_tier_requested_but_no_professional_evidence" in report["warnings"]
 
 
+def test_macro_dimension_has_deterministic_narrative_and_evidence():
+    payload = _collector_payload("HKStock")
+    payload["macro"] = {
+        "DXY": {"price": 98.87, "change": 0, "changePercent": 0},
+        "FEAR_GREED": {"price": 71, "change": 0, "changePercent": 0},
+    }
+    report = build_professional_report(payload, _analysis(payload))
+    macro = next(item for item in report["dimensions"] if item["key"] == "macro")
+
+    assert macro["status"] == "available"
+    assert "美元指数" in macro["narrative"]
+    assert "不应单独作为买卖依据" in macro["narrative"]
+    assert macro["evidence_refs"]
+
+
+def test_macro_dimension_uses_market_specific_context():
+    payload = _collector_payload("USStock")
+    payload["macro"] = {"VIX": {"price": 16.2}}
+
+    report = build_professional_report(payload, _analysis(payload))
+    macro = next(item for item in report["dimensions"] if item["key"] == "macro")
+
+    assert "美国风险资产环境" in macro["narrative"]
+    assert "香港资金环境" not in macro["narrative"]
+
+
+def test_compact_provider_timestamp_is_normalized_before_contract_validation():
+    payload = _collector_payload("USStock")
+    payload["news"] = [{
+        "title": "Confirmed filing update",
+        "source": "GDELT",
+        "published_at": "20260907T230000Z",
+    }]
+
+    report = build_professional_report(payload, _analysis(payload))
+    news_rows = [
+        item for item in report["evidence_snapshot"]["observations"]
+        if item["category"] == "news"
+    ]
+
+    assert news_rows
+    assert news_rows[0]["as_of"] == "2026-09-07T23:00:00Z"
+
+
+def test_hk_dimension_uses_free_enrichment_and_skips_inapplicable_ah_premium():
+    payload = _collector_payload("HKStock")
+    payload["hk_security_profile"] = {
+        "security_type": "非H股",
+        "is_h_share": False,
+        "southbound_eligible_sh": True,
+        "source": "eastmoney_hk_via_akshare",
+    }
+    payload["southbound_flow"] = {
+        "holding_change_pct_1d": 1.25,
+        "scope": "stock_connect_holdings_change_proxy",
+        "source": "eastmoney_hsgt_via_akshare",
+        "source_url": "https://example.test/holdings",
+        "as_of": payload["collected_at"],
+    }
+    payload["analyst_expectations"] = {
+        "rating_direction": "买入",
+        "target_price_median_hkd": 520,
+        "source": "etnet_hk_via_akshare",
+        "as_of": payload["collected_at"],
+    }
+    report = build_professional_report(payload, _analysis(payload))
+    dimension = next(item for item in report["dimensions"] if item["key"] == "market_specific")
+
+    assert "ah_premium" not in report["market_features"]["missing_capabilities"]
+    assert "南向持股一日变化" in dimension["narrative"]
+    assert "目标价中位数" in dimension["narrative"]
+    assert dimension["evidence_refs"]
+    southbound_evidence = next(
+        item for item in report["evidence_snapshot"]["observations"]
+        if item["metric"] == "southbound_flow.snapshot"
+    )
+    assert "source_url" not in southbound_evidence["value"]
+    assert southbound_evidence["source_url"] == "https://example.test/holdings"
+
+
+def test_hk_holdings_proxy_cannot_be_reported_as_net_flow():
+    payload = _collector_payload("HKStock")
+    payload["southbound_flow"] = {
+        "holding_change_pct_1d": 1.25,
+        "scope": "stock_connect_holdings_change_proxy",
+        "source": "eastmoney_hsgt_via_akshare",
+        "as_of": payload["collected_at"],
+    }
+    analysis = _analysis(payload)
+    analysis["summary"] = "南向资金小幅净流入。"
+    analysis["detailed_analysis"]["sentiment"] = "南向资金净买入支持股价。"
+    report = build_professional_report(payload, analysis)
+
+    assert "净流入" not in report["executive_summary"]
+    assert "南向持股" in report["executive_summary"]
+    sentiment = next(item for item in report["dimensions"] if item["key"] == "news_sentiment")
+    assert "净买入" not in sentiment["narrative"]
+    assert "持仓变化代理" in sentiment["narrative"]
+
+
+def test_us_market_dimension_describes_scope_instead_of_overclaiming():
+    payload = _collector_payload("USStock")
+    payload.update({
+        "sec_filings": [{"form": "10-Q", "filing_date": "2026-08-01", "source": "sec_edgar"}],
+        "analyst_expectations": {
+            "rating_direction": "buy", "analyst_count": 30,
+            "target_price_median_usd": 120, "source": "yahoo_finance",
+        },
+        "options": {
+            "expiry": "2026-09-18", "put_call_open_interest_ratio": 0.8,
+            "nearest_atm_implied_volatility_pct": 25, "scope": "nearest_expiry_snapshot",
+            "source": "yahoo_finance",
+        },
+        "short_interest": {
+            "short_percent_of_float_pct": 1.2, "short_ratio_days": 1.5,
+            "scope": "reported_short_interest_not_daily_short_volume", "source": "yahoo_finance",
+        },
+        "insider_activity": {
+            "recent_form4_filing_count": 4,
+            "scope": "form4_filing_activity_not_trade_direction", "source": "sec_edgar",
+        },
+    })
+
+    report = build_professional_report(payload, _analysis(payload))
+    dimension = next(item for item in report["dimensions"] if item["key"] == "market_specific")
+
+    assert dimension["status"] == "available"
+    assert "SEC披露" in dimension["narrative"]
+    assert "最近到期期权快照" in dimension["narrative"]
+    assert "不表示买卖方向" in dimension["narrative"]
+    assert dimension["evidence_refs"]
+
+
 def test_professional_crypto_source_marks_effective_professional_tier():
     payload = _collector_payload("Crypto")
     payload["crypto_factors"]["sources"]["derivatives"] = "coinglass"

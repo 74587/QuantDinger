@@ -474,7 +474,422 @@ def _report_pdf_labels(language: str = "") -> dict[str, str]:
     return labels
 
 
+def _build_professional_report_pdf(report: dict, target: dict | None, language: str) -> bytes:
+    """Render the professional contract directly instead of flattening it to legacy fields."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        KeepTogether,
+        LongTable,
+        PageBreak,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    target = target or {}
+    lang = _language_key(language)
+    is_zh = lang in {"zh-CN", "zh-TW"}
+    is_rtl = lang == "ar"
+    font_name = _register_report_pdf_font(
+        language=language,
+        prefer_cjk=is_zh or _has_cjk_text(report) or _has_cjk_text(target),
+    )
+    page_width, _ = A4
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
+        topMargin=18 * mm,
+        bottomMargin=17 * mm,
+        title="QuantDinger Professional Research Report",
+        author="QuantDinger",
+        subject="Evidence-backed market research",
+    )
+    content_width = page_width - doc.leftMargin - doc.rightMargin
+    palette = {
+        "navy": colors.HexColor("#0B1728"),
+        "navy2": colors.HexColor("#13263E"),
+        "green": colors.HexColor("#45B824"),
+        "green_soft": colors.HexColor("#EDF8E9"),
+        "ink": colors.HexColor("#172033"),
+        "muted": colors.HexColor("#667085"),
+        "line": colors.HexColor("#DCE4EA"),
+        "soft": colors.HexColor("#F5F8FA"),
+        "amber": colors.HexColor("#D97706"),
+        "amber_soft": colors.HexColor("#FFF7E6"),
+        "red": colors.HexColor("#C43D3D"),
+        "red_soft": colors.HexColor("#FFF1F0"),
+        "blue": colors.HexColor("#2563EB"),
+        "blue_soft": colors.HexColor("#EFF6FF"),
+        "white": colors.white,
+    }
+    base = getSampleStyleSheet()["Normal"]
+    align = TA_RIGHT if is_rtl else TA_LEFT
+    body = ParagraphStyle("ProBody", parent=base, fontName=font_name, fontSize=9, leading=14.5, textColor=palette["ink"], alignment=align)
+    muted = ParagraphStyle("ProMuted", parent=body, fontSize=7.5, leading=10.5, textColor=palette["muted"])
+    label_style = ParagraphStyle("ProLabel", parent=muted, fontSize=7, leading=9, textColor=palette["muted"], uppercase=True)
+    value_style = ParagraphStyle("ProValue", parent=body, fontSize=11, leading=14, textColor=palette["ink"])
+    title_style = ParagraphStyle("ProTitle", parent=body, fontSize=21, leading=26, textColor=palette["white"])
+    subtitle_style = ParagraphStyle("ProSubtitle", parent=body, fontSize=8, leading=12, textColor=colors.HexColor("#C4D2E3"))
+    section_style = ParagraphStyle("ProSection", parent=body, fontSize=12.5, leading=16, textColor=palette["navy"], keepWithNext=True)
+    card_title_style = ParagraphStyle("ProCardTitle", parent=body, fontSize=9.5, leading=13, textColor=palette["navy"])
+    centered_value = ParagraphStyle("ProCenteredValue", parent=value_style, alignment=TA_CENTER, fontSize=16, leading=20)
+    table_head = ParagraphStyle("ProTableHead", parent=muted, fontSize=7.5, leading=10, textColor=palette["navy"])
+    table_head_light = ParagraphStyle("ProTableHeadLight", parent=table_head, textColor=palette["white"])
+    table_body = ParagraphStyle("ProTableBody", parent=body, fontSize=7.7, leading=11.5)
+
+    copy = {
+        "title": "专业市场分析报告" if is_zh else "Professional Market Research",
+        "subtitle": "证据驱动 · 数据质量可审计 · 风险优先" if is_zh else "Evidence-backed · quality-audited · risk-first",
+        "outlook": "研究观点" if is_zh else "RESEARCH OUTLOOK",
+        "generated": "生成时间" if is_zh else "GENERATED",
+        "as_of": "数据截止" if is_zh else "DATA AS OF",
+        "tier": "数据等级" if is_zh else "DATA TIER",
+        "confidence": "模型强度" if is_zh else "MODEL STRENGTH",
+        "summary": "核心结论" if is_zh else "Executive conclusion",
+        "quality": "数据质量审计" if is_zh else "Data quality audit",
+        "quality_score": "综合质量" if is_zh else "Overall quality",
+        "coverage": "核心指标覆盖率" if is_zh else "Core coverage",
+        "freshness": "数据新鲜度" if is_zh else "Freshness",
+        "conflict": "证据冲突率" if is_zh else "Conflict rate",
+        "strength": "结论强度" if is_zh else "Conclusion strength",
+        "dimensions": "多维分析" if is_zh else "Multi-dimensional analysis",
+        "scenarios": "情景与触发条件" if is_zh else "Scenarios and triggers",
+        "scenario": "情景" if is_zh else "Case",
+        "probability": "权重" if is_zh else "Weight",
+        "target": "参考目标" if is_zh else "Reference target",
+        "trigger": "触发条件" if is_zh else "Trigger",
+        "invalidation": "失效条件" if is_zh else "Invalidation",
+        "risk": "风险与执行计划" if is_zh else "Risk and execution plan",
+        "entry": "参考入场" if is_zh else "Reference entry",
+        "stop": "止损" if is_zh else "Stop",
+        "take": "止盈" if is_zh else "Target",
+        "rr": "净风险收益比" if is_zh else "Net risk/reward",
+        "position": "建议仓位上限" if is_zh else "Position cap",
+        "risk_budget": "账户风险预算" if is_zh else "Risk budget",
+        "cost": "预估往返成本" if is_zh else "Est. round-trip cost",
+        "claims": "核心论据与反方证据" if is_zh else "Thesis, risks and counter-evidence",
+        "evidence": "证据附录" if is_zh else "Evidence appendix",
+        "metric": "指标" if is_zh else "Metric",
+        "observed": "观测值" if is_zh else "Observed value",
+        "provider": "数据源" if is_zh else "Provider",
+        "timestamp": "时间" if is_zh else "Timestamp",
+        "evidence_id": "证据编号" if is_zh else "Evidence ID",
+        "limitations": "数据缺口与限制" if is_zh else "Data gaps and limitations",
+        "method": "方法与版本" if is_zh else "Methodology and versions",
+        "disclaimer": "AI 辅助研究，仅供参考，不构成投资建议。请独立核验数据并评估风险。" if is_zh else "AI-assisted research only. Not investment advice. Verify data and assess risk independently.",
+        "page": "第 {page} 页" if is_zh else "Page {page}",
+    }
+
+    def esc(value: Any) -> str:
+        text = _plain_text(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    def para(value: Any, style: ParagraphStyle = body) -> Paragraph:
+        return Paragraph(esc(value).replace("\n", "<br/>"), style)
+
+    def pct(value: Any, *, ratio: bool = False) -> str:
+        try:
+            number = float(value)
+            if ratio or abs(number) <= 1:
+                number *= 100
+            return f"{number:.0f}%"
+        except (TypeError, ValueError):
+            return "—"
+
+    def number(value: Any, digits: int = 2, suffix: str = "") -> str:
+        try:
+            return f"{float(value):,.{digits}f}{suffix}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def short_timestamp(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "—"
+        return text[:19].replace("T", " ") + (" UTC" if "T" in text else "")
+
+    def dimension_name(value: Any) -> str:
+        key = str(value or "dimension")
+        if not is_zh:
+            return key.replace("_", " ").title()
+        return {
+            "technical": "技术结构",
+            "fundamental": "基本面",
+            "news_sentiment": "新闻与情绪",
+            "sentiment": "市场情绪",
+            "macro": "宏观环境",
+            "market_specific": "市场特有维度",
+            "crypto_market_structure": "加密市场结构",
+        }.get(key, key.replace("_", " "))
+
+    def section(title: str, note: str = "") -> list[Any]:
+        heading = Table(
+            [[[para(title, section_style), para(note, muted)]]],
+            colWidths=[content_width],
+        )
+        heading.setStyle(TableStyle([
+            ("LINEBEFORE", (0, 0), (0, 0), 3, palette["green"]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 9),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 1),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+        ]))
+        return [Spacer(1, 7 * mm), heading, Spacer(1, 3 * mm)]
+
+    def metric_cards(items: list[tuple[str, str]], columns: int = 3) -> Table:
+        cells = []
+        for label, value in items:
+            cells.append([para(label, label_style), para(value, centered_value)])
+        rows = [cells[index:index + columns] for index in range(0, len(cells), columns)]
+        if rows and len(rows[-1]) < columns:
+            rows[-1].extend([[para("", label_style), para("", value_style)]] * (columns - len(rows[-1])))
+        table = Table(rows, colWidths=[content_width / columns] * columns)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), palette["soft"]),
+            ("BOX", (0, 0), (-1, -1), 0.6, palette["line"]),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, palette["line"]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 9),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        return table
+
+    def draw_page(canvas: Any, document: Any) -> None:
+        canvas.saveState()
+        canvas.setStrokeColor(palette["line"])
+        canvas.line(doc.leftMargin, 13 * mm, page_width - doc.rightMargin, 13 * mm)
+        canvas.setFont(font_name, 6.8)
+        canvas.setFillColor(palette["muted"])
+        canvas.drawString(doc.leftMargin, 8.5 * mm, copy["disclaimer"])
+        canvas.drawRightString(page_width - doc.rightMargin, 8.5 * mm, copy["page"].format(page=document.page))
+        if document.page > 1:
+            canvas.setFillColor(palette["navy"])
+            canvas.rect(0, A4[1] - 8 * mm, page_width, 8 * mm, fill=1, stroke=0)
+            canvas.setFillColor(palette["white"])
+            canvas.drawString(doc.leftMargin, A4[1] - 5.3 * mm, "QUANTDINGER  /  PROFESSIONAL RESEARCH")
+        canvas.restoreState()
+
+    instrument = report.get("instrument") or {}
+    quality = report.get("data_quality") or {}
+    decision = report.get("decision_profile") or {}
+    risk = report.get("risk_plan") or {}
+    dimensions = [item for item in (report.get("dimensions") or []) if isinstance(item, dict)]
+    scenarios = [item for item in (report.get("scenarios") or []) if isinstance(item, dict)]
+    claims = [item for item in (report.get("claims") or []) if isinstance(item, dict)]
+    evidence = [item for item in ((report.get("evidence_snapshot") or {}).get("observations") or []) if isinstance(item, dict)]
+    symbol = instrument.get("canonical_symbol") or instrument.get("symbol") or target.get("symbol") or "—"
+    market = instrument.get("market") or target.get("market") or "—"
+    name = instrument.get("name") or symbol
+    outlook = str(decision.get("decision") or "HOLD").upper()
+    outlook_display = _outlook_labels(language).get(outlook, outlook)
+    outlook_color = palette["green"] if outlook == "BUY" else palette["red"] if outlook == "SELL" else palette["amber"]
+    overall_quality = quality.get("overall_score")
+    if overall_quality is None:
+        raw_quality = quality.get("quality_score")
+        try:
+            overall_quality = float(raw_quality) * 100 if float(raw_quality) <= 1 else float(raw_quality)
+        except (TypeError, ValueError):
+            overall_quality = None
+
+    story: list[Any] = []
+    hero = Table([
+        [
+            [para("QUANTDINGER", subtitle_style), para(copy["title"], title_style), para(copy["subtitle"], subtitle_style)],
+            [para(copy["outlook"], subtitle_style), para(outlook_display, ParagraphStyle("ProOutlook", parent=title_style, fontSize=18, leading=22, textColor=outlook_color)), para(f"{copy['confidence']}  {pct(decision.get('confidence'))}", subtitle_style)],
+        ]
+    ], colWidths=[content_width * 0.69, content_width * 0.31])
+    hero.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), palette["navy"]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 14),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+        ("TOPPADDING", (0, 0), (-1, -1), 13),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 13),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LINEBEFORE", (1, 0), (1, 0), 1, colors.HexColor("#30445C")),
+    ]))
+    story.extend([hero, Spacer(1, 4 * mm)])
+    instrument_table = Table([
+        [para(f"{market}:{symbol}", ParagraphStyle("Instrument", parent=value_style, fontSize=14, leading=18)), para(copy["generated"], label_style), para(copy["as_of"], label_style), para(copy["tier"], label_style)],
+        [para(name, muted), para(short_timestamp(report.get("generated_at")), table_body), para(short_timestamp(report.get("as_of")), table_body), para(report.get("data_tier") or "community", table_body)],
+    ], colWidths=[content_width * 0.37, content_width * 0.21, content_width * 0.25, content_width * 0.17])
+    instrument_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), palette["soft"]),
+        ("BOX", (0, 0), (-1, -1), 0.6, palette["line"]),
+        ("INNERGRID", (0, 0), (-1, -1), 0.4, palette["line"]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+        ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("SPAN", (0, 0), (0, 0)), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(instrument_table)
+
+    story.extend(section(copy["summary"]))
+    summary = report.get("executive_summary") or decision.get("rationale") or "—"
+    summary_box = Table([[para(summary, ParagraphStyle("Summary", parent=body, fontSize=10, leading=16))]], colWidths=[content_width])
+    summary_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), palette["green_soft"]),
+        ("BOX", (0, 0), (-1, -1), 0.7, colors.HexColor("#B8DCAA")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12), ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+        ("TOPPADDING", (0, 0), (-1, -1), 10), ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+    ]))
+    story.append(summary_box)
+
+    story.extend(section(copy["quality"], f"{copy['quality_score']}: {number(overall_quality, 0, '%') if overall_quality is not None else '—'}"))
+    story.append(metric_cards([
+        (copy["coverage"], pct(quality.get("coverage_ratio"), ratio=True)),
+        (copy["freshness"], pct(quality.get("freshness_ratio"), ratio=True)),
+        (copy["conflict"], pct(quality.get("conflict_ratio"), ratio=True)),
+        (copy["strength"], str(quality.get("max_conclusion_strength") or "—")),
+        (copy["as_of"], short_timestamp(report.get("as_of"))),
+        (copy["tier"], str(report.get("data_tier") or "community")),
+    ]))
+
+    if dimensions:
+        story.extend(section(copy["dimensions"]))
+        for item in dimensions:
+            status = str(item.get("status") or "")
+            score = number(item.get("score"), 0) if status == "available" else ("数据不足" if is_zh else "Insufficient")
+            missing = item.get("missing_data") or []
+            note = ("缺失：" if is_zh else "Missing: ") + ", ".join(map(str, missing)) if missing else ""
+            card = Table([
+                [para(dimension_name(item.get("key")), card_title_style), para(score, ParagraphStyle("DimensionScore", parent=value_style, alignment=TA_RIGHT, textColor=palette["green"] if status == "available" else palette["amber"]))],
+                [para(item.get("narrative") or ("暂无可由证据支持的分析。" if is_zh else "No evidence-backed narrative is available."), body), ""],
+                [para(note, muted), ""],
+            ], colWidths=[content_width * 0.82, content_width * 0.18])
+            card.setStyle(TableStyle([
+                ("SPAN", (0, 1), (1, 1)), ("SPAN", (0, 2), (1, 2)),
+                ("BACKGROUND", (0, 0), (-1, -1), colors.white), ("BOX", (0, 0), (-1, -1), 0.6, palette["line"]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10), ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LINEABOVE", (0, 0), (-1, 0), 2, palette["green"] if status == "available" else palette["amber"]),
+            ]))
+            story.extend([KeepTogether([card]), Spacer(1, 2.2 * mm)])
+
+    if scenarios:
+        story.extend(section(copy["scenarios"]))
+        scenario_rows = [[para(copy[k], table_head_light) for k in ("scenario", "probability", "target", "trigger", "invalidation")]]
+        for item in scenarios:
+            trigger = item.get("trigger") or item.get("triggers") or item.get("thesis") or "—"
+            invalidation = item.get("invalidation") or "—"
+            scenario_rows.append([
+                para(str(item.get("case") or "—").upper(), table_body),
+                para(pct(item.get("probability"), ratio=True), table_body),
+                para(number(item.get("target_price"), 2), table_body),
+                para(trigger, table_body),
+                para(invalidation, table_body),
+            ])
+        scenarios_table = Table(scenario_rows, colWidths=[content_width * x for x in (0.10, 0.09, 0.13, 0.42, 0.26)], repeatRows=1)
+        scenarios_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), palette["navy2"]), ("TEXTCOLOR", (0, 0), (-1, 0), palette["white"]),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, palette["soft"]]),
+            ("BOX", (0, 0), (-1, -1), 0.6, palette["line"]), ("INNERGRID", (0, 0), (-1, -1), 0.35, palette["line"]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6), ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(scenarios_table)
+
+    if risk:
+        story.extend(section(copy["risk"]))
+        story.append(metric_cards([
+            (copy["entry"], number(risk.get("entry_price"))),
+            (copy["stop"], number(risk.get("stop_loss"))),
+            (copy["take"], number(risk.get("take_profit"))),
+            (copy["rr"], number(risk.get("net_risk_reward"))),
+            (copy["position"], number(risk.get("recommended_position_pct"), 1, "%")),
+            (copy["risk_budget"], number(risk.get("risk_budget_pct"), 1, "%")),
+        ]))
+        warnings = [str(item) for item in (risk.get("warnings") or [])]
+        invalidations = [str(item) for item in (risk.get("invalidation_conditions") or [])]
+        if warnings or invalidations:
+            story.append(Spacer(1, 2 * mm))
+            warning_box = Table([[para(" · ".join(warnings + invalidations), muted)]], colWidths=[content_width])
+            warning_box.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), palette["amber_soft"]), ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#F2C078")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+                ("TOPPADDING", (0, 0), (-1, -1), 7), ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+            ]))
+            story.append(warning_box)
+
+    if claims:
+        story.extend(section(copy["claims"]))
+        for item in claims:
+            kind = str(item.get("kind") or "claim").replace("_", " ").upper()
+            refs = ", ".join(map(str, item.get("evidence_refs") or []))
+            claim_table = Table([
+                [para(kind, ParagraphStyle("ClaimKind", parent=table_head, textColor=palette["blue"])), para(item.get("text") or "—", body)],
+                ["", para(f"{copy['evidence_id']}: {refs or '—'}", muted)],
+            ], colWidths=[content_width * 0.16, content_width * 0.84])
+            claim_table.setStyle(TableStyle([
+                ("SPAN", (0, 0), (0, 1)), ("BACKGROUND", (0, 0), (0, -1), palette["blue_soft"]),
+                ("BOX", (0, 0), (-1, -1), 0.5, palette["line"]),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8), ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]))
+            story.extend([KeepTogether([claim_table]), Spacer(1, 1.5 * mm)])
+
+    missing = list(dict.fromkeys((quality.get("missing_metrics") or []) + ((report.get("market_features") or {}).get("missing_capabilities") or [])))
+    warnings = list(dict.fromkeys((report.get("warnings") or []) + (quality.get("warnings") or [])))
+    if missing or warnings:
+        story.extend(section(copy["limitations"]))
+        for item in missing + warnings:
+            story.append(para(f"• {item}", body))
+
+    if evidence:
+        story.extend([PageBreak(), *section(copy["evidence"], f"{len(evidence)} observations")])
+        evidence_rows = [[para(copy[key], table_head_light) for key in ("metric", "observed", "provider", "timestamp", "evidence_id")]]
+        for item in evidence:
+            value = item.get("value")
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            evidence_rows.append([
+                para(item.get("metric") or "—", table_body),
+                para(value if value not in (None, "") else "—", table_body),
+                para(item.get("source") or "—", table_body),
+                para(short_timestamp(item.get("as_of")), table_body),
+                para(item.get("evidence_id") or "—", muted),
+            ])
+        evidence_table = LongTable(evidence_rows, colWidths=[content_width * x for x in (0.25, 0.22, 0.16, 0.19, 0.18)], repeatRows=1)
+        evidence_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), palette["navy2"]), ("TEXTCOLOR", (0, 0), (-1, 0), palette["white"]),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, palette["soft"]]),
+            ("BOX", (0, 0), (-1, -1), 0.5, palette["line"]), ("INNERGRID", (0, 0), (-1, -1), 0.3, palette["line"]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5), ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(evidence_table)
+
+    methodology = report.get("methodology") or {}
+    versions = [
+        f"Report ID: {report.get('report_id') or '—'}",
+        f"Model: {report.get('model_version') or '—'}",
+        f"Prompt: {report.get('prompt_version') or '—'}",
+        f"Scoring: {report.get('scoring_version') or methodology.get('scoring_version') or '—'}",
+        f"Builder: {methodology.get('report_builder_version') or '—'}",
+    ]
+    story.extend(section(copy["method"]))
+    story.append(para(" · ".join(versions), muted))
+    story.append(Spacer(1, 4 * mm))
+    story.append(para(copy["disclaimer"], ParagraphStyle("FinalDisclaimer", parent=body, fontSize=8, leading=12, textColor=palette["muted"], alignment=TA_CENTER)))
+
+    doc.build(story, onFirstPage=draw_page, onLaterPages=draw_page)
+    return buffer.getvalue()
+
+
 def build_ai_report_pdf(report: dict, target: dict | None = None, language: str = "en-US") -> bytes:
+    professional = _professional_report_artifact(report)
+    if professional:
+        return _build_professional_report_pdf(professional, target, language)
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_LEFT, TA_RIGHT
     from reportlab.lib.pagesizes import A4

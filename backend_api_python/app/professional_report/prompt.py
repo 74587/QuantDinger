@@ -20,12 +20,17 @@ _MARKET_RULES = {
         "For US equities, distinguish reported filings from provider estimates. Use the latest "
         "quarter for current operations, TTM for earnings/cash-flow durability, and annual data "
         "for structural context. Assess expectations, options, short interest and insider activity "
-        "only when supplied. Explicitly disclose missing inputs."
+        "only when supplied. A Form 4 filing count is filing activity, not evidence of insider buying "
+        "or selling. A nearest-expiry option snapshot is not the full volatility surface, and reported "
+        "short interest is not daily short-sale volume. Explicitly disclose missing inputs."
     ),
     "HKStock": (
         "For Hong Kong equities, distinguish issuer/HKEX disclosures from provider estimates. "
-        "Assess latest financials, valuation, HKEX announcements, Southbound flow, short selling, "
-        "CCASS concentration and A/H premium only when supplied. Explicitly disclose missing inputs."
+        "Assess latest financials, valuation, HKEX announcements, Southbound activity, short selling, "
+        "CCASS concentration and A/H premium only when supplied. When Southbound evidence is labelled "
+        "stock_connect_holdings_change_proxy, describe only a holdings increase/decrease: never call it "
+        "net inflow, net outflow, net buying or net selling. A/H premium is not applicable when the "
+        "security profile says is_h_share=false. Explicitly disclose genuinely missing inputs."
     ),
     "Crypto": (
         "For crypto, distinguish spot from perpetual data and name the venue or aggregation scope. "

@@ -88,7 +88,10 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         name="Yahoo Finance",
         tier="community",
         markets=frozenset({"USStock", "HKStock"}),
-        capabilities=frozenset({"market_data", "corporate_actions", "fundamentals"}),
+        capabilities=frozenset({
+            "market_data", "corporate_actions", "fundamentals", "options",
+            "analyst_estimates", "short_data",
+        }),
         keyless=True,
         cost_level="free",
         license_warning=(
@@ -147,6 +150,7 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
             "individual filing exhibits can carry third-party rights."
         ),
         default_priority=5,
+        integration_status="active",
     ),
     ProviderSpec(
         key="fred",
@@ -192,6 +196,36 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         default_priority=5,
     ),
     ProviderSpec(
+        key="eastmoney_hk",
+        name="Eastmoney Hong Kong via AkShare",
+        tier="community",
+        markets=frozenset({"HKStock"}),
+        capabilities=frozenset({"fundamentals", "fund_flows", "market_data"}),
+        keyless=True,
+        cost_level="free",
+        license_warning=(
+            "Best-effort community data intended for research and source verification; "
+            "confirm display and redistribution rights before commercial use."
+        ),
+        default_priority=8,
+        integration_status="active",
+    ),
+    ProviderSpec(
+        key="etnet_hk",
+        name="ET Net Hong Kong via AkShare",
+        tier="community",
+        markets=frozenset({"HKStock"}),
+        capabilities=frozenset({"analyst_estimates"}),
+        keyless=True,
+        cost_level="free",
+        license_warning=(
+            "Broker consensus is a secondary-source snapshot and may be delayed or incomplete; "
+            "do not redistribute raw records without confirming the applicable terms."
+        ),
+        default_priority=9,
+        integration_status="active",
+    ),
+    ProviderSpec(
         key="hkma_open_api",
         name="HKMA Open API",
         tier="community",
@@ -201,6 +235,31 @@ PROVIDER_CATALOG: tuple[ProviderSpec, ...] = (
         cost_level="free",
         license_warning="Retain source attribution, observation dates, and revision timestamps.",
         default_priority=10,
+        integration_status="active",
+    ),
+    ProviderSpec(
+        key="gate_public",
+        name="Gate Public Futures API",
+        tier="community",
+        markets=frozenset({"Crypto"}),
+        capabilities=frozenset({"derivatives", "market_data"}),
+        keyless=True,
+        cost_level="free",
+        license_warning="Public endpoints remain subject to Gate rate limits, availability and data-use terms.",
+        default_priority=4,
+        integration_status="active",
+    ),
+    ProviderSpec(
+        key="okx_public",
+        name="OKX Public Data API",
+        tier="community",
+        markets=frozenset({"Crypto"}),
+        capabilities=frozenset({"derivatives", "market_data"}),
+        keyless=True,
+        cost_level="free",
+        license_warning="Public endpoints remain subject to OKX regional availability, rate limits and data-use terms.",
+        default_priority=5,
+        integration_status="active",
     ),
     ProviderSpec(
         key="ccxt_public",

@@ -68,6 +68,7 @@ from app.services.ai_market_query import (
     snapshot_options_from_plan,
 )
 from app.services.ai_report_pdf import build_ai_report_pdf
+from app.services.ai_report_share import create_report_share, get_public_report_share
 from app.services.kline import KlineService
 from app.services.llm import LLMAPIError, LLMService
 from app.services.search import get_search_service
@@ -3979,6 +3980,58 @@ def export_chat_report_pdf():
             "Content-Length": str(len(pdf_bytes)),
         },
     )
+
+
+@ai_chat_blp.route("/chat/report/share", methods=["POST"])
+@login_required
+def create_chat_report_share():
+    """Create a public, read-only snapshot link for a report owned by the user."""
+    user_id = int(getattr(g, "user_id", 0) or 0)
+    data = request.get_json(silent=True) or {}
+    try:
+        message_id = int(data.get("message_id") or 0)
+    except (TypeError, ValueError):
+        message_id = 0
+    if message_id <= 0:
+        return jsonify({"code": 0, "msg": "Missing report message id", "data": None}), 400
+    language = str(data.get("language") or request.headers.get("X-App-Lang") or "en-US")
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            share = create_report_share(
+                cur,
+                owner_user_id=user_id,
+                source_message_id=message_id,
+                language=language,
+            )
+            db.commit()
+            cur.close()
+    except LookupError:
+        return jsonify({"code": 0, "msg": "Professional report not found", "data": None}), 404
+    except ValueError as exc:
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 400
+    except Exception as exc:
+        logger.error("create_chat_report_share failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": "Unable to create share link", "data": None}), 500
+    return jsonify({"code": 1, "msg": "success", "data": share})
+
+
+@ai_chat_blp.route("/chat/report/share/<token>", methods=["GET"])
+def get_chat_report_share(token: str):
+    """Public endpoint for a capability-linked report snapshot; no login required."""
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            share = get_public_report_share(cur, token)
+            if share:
+                db.commit()
+            cur.close()
+    except Exception as exc:
+        logger.error("get_chat_report_share failed: %s", exc, exc_info=True)
+        return jsonify({"code": 0, "msg": "Unable to load shared report", "data": None}), 500
+    if not share:
+        return jsonify({"code": 0, "msg": "Shared report not found", "data": None}), 404
+    return jsonify({"code": 1, "msg": "success", "data": share})
 
 
 @ai_chat_blp.route("/chat/history/save", methods=["POST"])

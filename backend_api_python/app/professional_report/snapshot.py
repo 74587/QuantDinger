@@ -32,14 +32,21 @@ def _iso_timestamp(value: Any, fallback: str | None = None) -> str:
             pass
     text = str(value or "").strip()
     if text:
-        if text.endswith("Z") or re.search(r"[+-]\d\d:\d\d$", text):
-            return text
-        if "T" in text:
-            return text + "Z"
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
-            return text + "T00:00:00Z"
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", text):
-            return text.replace(" ", "T") + "Z"
+        if re.fullmatch(r"\d+(?:\.\d+)?", text):
+            return _iso_timestamp(float(text), fallback)
+        for pattern in ("%Y%m%dT%H%M%SZ", "%Y%m%d%H%M%S", "%Y%m%d"):
+            try:
+                parsed = datetime.strptime(text, pattern).replace(tzinfo=timezone.utc)
+                return parsed.isoformat().replace("+00:00", "Z")
+            except ValueError:
+                continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            pass
     return fallback or _now_iso()
 
 
@@ -51,6 +58,20 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return str(value)
+
+
+def _structured_evidence_value(value: Any) -> Any:
+    """Remove provenance fields already represented by the observation itself."""
+    metadata_keys = {"source", "provider", "url", "source_url", "as_of"}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _structured_evidence_value(child)
+            for key, child in value.items()
+            if key not in metadata_keys and child not in (None, "")
+        }
+    if isinstance(value, (list, tuple)):
+        return [_structured_evidence_value(child) for child in value]
+    return _jsonable(value)
 
 
 def _evidence_id(market: str, symbol: str, metric: str, source: str, as_of: str, value: Any) -> str:
@@ -312,6 +333,7 @@ def build_evidence_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
         "short_selling": ("short_selling.snapshot", "hkex_public"),
         "ccass": ("ccass.snapshot", "hkex_public"),
         "ah_premium": ("ah_premium.snapshot", "market_provider"),
+        "hk_security_profile": ("security_profile.hk", "eastmoney_hk"),
     }
     for payload_key, (metric, default_source) in equity_datasets.items():
         value = payload.get(payload_key)
@@ -319,7 +341,7 @@ def build_evidence_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
             continue
         first = value[0] if isinstance(value, list) and value else value
         metadata = first if isinstance(first, Mapping) else {}
-        evidence_value = value[:20] if isinstance(value, list) else value
+        evidence_value = _structured_evidence_value(value[:20] if isinstance(value, list) else value)
         collector.add(
             metric,
             evidence_value,
@@ -330,9 +352,24 @@ def build_evidence_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
             unit=metadata.get("unit") or "structured_dataset",
         )
 
-    for metric, value in _flatten_numeric("macro", payload.get("macro") or {}):
-        source = "fred" if metric.lower().startswith("macro.fred") else "market_provider"
-        collector.add(metric, value, category="macro", source=source)
+    macro_payload = payload.get("macro") or {}
+    hkma_macro = macro_payload.get("HKMA") if isinstance(macro_payload, Mapping) else {}
+    for metric, value in _flatten_numeric("macro", macro_payload):
+        metric_lower = metric.lower()
+        if metric_lower.startswith("macro.fred"):
+            source = "fred"
+        elif metric_lower.startswith("macro.hkma"):
+            source = "hkma_open_api"
+        else:
+            source = "market_provider"
+        collector.add(
+            metric,
+            value,
+            category="macro",
+            source=source,
+            source_url=(hkma_macro or {}).get("source_url") if source == "hkma_open_api" else None,
+            as_of=(hkma_macro or {}).get("as_of") if source == "hkma_open_api" else None,
+        )
 
     crypto_factors = payload.get("crypto_factors") or {}
     crypto_sources = crypto_factors.get("sources") or {}

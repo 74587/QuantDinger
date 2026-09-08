@@ -148,6 +148,19 @@ class MarketDataCollector:
             "macro": {},
             "news": [],
             "sentiment": {},
+            # Optional market-specific evidence. These keys stay empty when a
+            # provider is unavailable; the report then exposes the exact gap.
+            "hk_security_profile": {},
+            "sec_filings": [],
+            "hkex_announcements": [],
+            "southbound_flow": {},
+            "short_selling": {},
+            "ccass": {},
+            "ah_premium": {},
+            "analyst_expectations": {},
+            "options": {},
+            "short_interest": {},
+            "insider_activity": {},
             "_meta": {
                 "success_items": [],
                 "failed_items": [],
@@ -155,7 +168,7 @@ class MarketDataCollector:
             }
         }
         
-        with NonBlockingThreadPoolExecutor(max_workers=4) as executor:
+        with NonBlockingThreadPoolExecutor(max_workers=5 if market in {'USStock', 'HKStock'} else 4) as executor:
             core_futures = {
                 executor.submit(self._get_price, market, symbol): "price",
                 executor.submit(self._get_kline, market, symbol, timeframe, 60): "kline",
@@ -164,6 +177,10 @@ class MarketDataCollector:
             if market in ('USStock', 'CNStock', 'HKStock'):
                 core_futures[executor.submit(self._get_fundamental, market, symbol)] = "fundamental"
                 core_futures[executor.submit(self._get_company, market, symbol)] = "company"
+                if market == 'USStock':
+                    core_futures[executor.submit(self._get_us_research, symbol)] = "us_research"
+                if market == 'HKStock':
+                    core_futures[executor.submit(self._get_hk_research, symbol)] = "hk_research"
             elif market == 'Crypto':
                 core_futures[executor.submit(self._get_crypto_info, symbol)] = "fundamental"
             
@@ -175,7 +192,25 @@ class MarketDataCollector:
                 try:
                     result = future.result()
                     if result:
-                        data[key] = result
+                        if key in {"us_research", "hk_research"}:
+                            research_keys = (
+                                (
+                                    "sec_filings", "analyst_expectations", "options",
+                                    "short_interest", "insider_activity",
+                                )
+                                if key == "us_research" else
+                                (
+                                    "hk_security_profile", "southbound_flow",
+                                    "analyst_expectations", "hk_macro",
+                                )
+                            )
+                            for research_key in research_keys:
+                                if result.get(research_key):
+                                    data[research_key] = result[research_key]
+                            status_key = "us_provider_status" if key == "us_research" else "hk_provider_status"
+                            data["_meta"][status_key] = result.get("_provider_status") or {}
+                        else:
+                            data[key] = result
                         if key not in data["_meta"]["success_items"]:
                             data["_meta"]["success_items"].append(key)
                     elif key not in data["_meta"]["failed_items"]:
@@ -244,6 +279,8 @@ class MarketDataCollector:
         if include_macro:
             try:
                 data["macro"] = self._get_macro_data(market, timeout=10)
+                if data.get("hk_macro"):
+                    data["macro"]["HKMA"] = data.pop("hk_macro")
                 if data["macro"]:
                     data["_meta"]["success_items"].append("macro")
             except Exception as e:
@@ -266,12 +303,36 @@ class MarketDataCollector:
                 logger.warning(f"News fetch failed: {e}")
                 data["_meta"]["failed_items"].append("news")
         
+        # The evidence snapshot's retrieval timestamp represents completion,
+        # so provider observations collected during this run can never appear
+        # to come from the future relative to the snapshot itself.
+        data["collected_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         data["_meta"]["duration_ms"] = int((time.time() - start_time) * 1000)
         logger.info(f"Market data collection completed for {market}:{symbol} in {data['_meta']['duration_ms']}ms")
         logger.info(f"  Success: {data['_meta']['success_items']}")
         logger.info(f"  Failed: {data['_meta']['failed_items']}")
         
         return data
+
+    def _get_us_research(self, symbol: str) -> Dict[str, Any]:
+        """Collect free US-specific evidence behind a bounded, cached adapter."""
+        try:
+            from app.data_providers.us_research import collect_us_research
+
+            return collect_us_research(symbol)
+        except Exception as exc:
+            logger.info("US research enrichment unavailable for %s: %s", symbol, exc)
+            return {}
+
+    def _get_hk_research(self, symbol: str) -> Dict[str, Any]:
+        """Collect free HK-specific evidence behind a bounded, cached adapter."""
+        try:
+            from app.data_providers.hk_research import collect_hk_research
+
+            return collect_hk_research(symbol)
+        except Exception as exc:
+            logger.info("HK research enrichment unavailable for %s: %s", symbol, exc)
+            return {}
     
     
     def _get_price(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
@@ -1438,9 +1499,164 @@ class MarketDataCollector:
                 "product_type": "perpetual",
             }
 
-        if result["funding_rate"] is None or result["open_interest"] is None or result["long_short_ratio"] is None:
-            pair = f"{symbol}USDT"
-            result = self._fill_crypto_derivatives_from_binance(pair, result)
+        # Never fill individual fields from unrelated venues.  A funding rate
+        # from one exchange and OI from another is not a coherent snapshot.
+        # Prefer a complete aggregate CoinGlass snapshot; otherwise choose one
+        # venue-specific public snapshot as a unit.
+        if result["funding_rate"] is not None and result["open_interest"] is not None:
+            return result
+
+        candidates = [result]
+        pair_gate = f"{symbol}_USDT"
+        gate = self._get_gate_public_derivatives(pair_gate)
+        candidates.append(gate)
+        if gate.get("funding_rate") is not None and gate.get("open_interest") is not None:
+            return gate
+
+        pair_okx = f"{symbol}-USDT-SWAP"
+        okx = self._get_okx_public_derivatives(pair_okx)
+        candidates.append(okx)
+        if okx.get("funding_rate") is not None and okx.get("open_interest") is not None:
+            return okx
+
+        pair_binance = f"{symbol}USDT"
+        empty = {
+            "funding_rate": None, "funding_rate_decimal": None,
+            "open_interest": None, "open_interest_change_24h": None,
+            "long_short_ratio": None, "source": "", "field_metadata": {},
+        }
+        candidates.append(self._fill_crypto_derivatives_from_binance(pair_binance, empty))
+        return max(
+            candidates,
+            key=lambda item: sum(
+                item.get(key) is not None
+                for key in ("funding_rate", "open_interest", "open_interest_change_24h", "long_short_ratio")
+            ),
+        )
+
+    def _get_gate_public_derivatives(self, contract: str) -> Dict[str, Any]:
+        """Fetch one coherent Gate USDT perpetual snapshot without credentials."""
+        cache_key = f"gate_public_derivatives|{contract}"
+        cached = self._cache_get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        result: Dict[str, Any] = {
+            "funding_rate": None, "funding_rate_decimal": None,
+            "open_interest": None, "open_interest_change_24h": None,
+            "long_short_ratio": None, "source": "", "field_metadata": {},
+        }
+        try:
+            contract_response = requests.get(
+                f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{contract}",
+                headers={"Accept": "application/json"},
+                timeout=6,
+            )
+            contract_response.raise_for_status()
+            contract_payload = contract_response.json() or {}
+            decimal_rate = self._safe_num(
+                contract_payload.get("funding_rate")
+                or contract_payload.get("funding_rate_indicative")
+            )
+            if decimal_rate is not None:
+                result["funding_rate_decimal"] = decimal_rate
+                result["funding_rate"] = decimal_rate * 100.0
+                result["field_metadata"]["funding_rate"] = {
+                    "unit": "percent", "source_unit": "decimal",
+                    "provider": "gate_public", "venue": "gate",
+                    "product_type": "perpetual",
+                }
+        except Exception as exc:
+            logger.debug("Gate public funding failed for %s: %s", contract, exc)
+
+        try:
+            stats_response = requests.get(
+                "https://api.gateio.ws/api/v4/futures/usdt/contract_stats",
+                params={"contract": contract, "interval": "1d", "limit": 2},
+                headers={"Accept": "application/json"},
+                timeout=6,
+            )
+            stats_response.raise_for_status()
+            stats = stats_response.json() or []
+            if stats:
+                latest = stats[-1]
+                result["open_interest"] = self._safe_num(latest.get("open_interest_usd"))
+                result["long_short_ratio"] = self._safe_num(latest.get("lsr_account"))
+                if len(stats) >= 2:
+                    previous_oi = self._safe_num(stats[-2].get("open_interest_usd"))
+                    latest_oi = result["open_interest"]
+                    if previous_oi and latest_oi is not None:
+                        result["open_interest_change_24h"] = (latest_oi - previous_oi) / previous_oi * 100.0
+                for key, unit in (
+                    ("open_interest", "usd"),
+                    ("open_interest_change_24h", "percent"),
+                    ("long_short_ratio", "ratio"),
+                ):
+                    if result.get(key) is not None:
+                        result["field_metadata"][key] = {
+                            "unit": unit,
+                            "currency": "USD" if unit == "usd" else None,
+                            "provider": "gate_public", "venue": "gate",
+                            "product_type": "perpetual",
+                        }
+        except Exception as exc:
+            logger.debug("Gate public derivatives failed for %s: %s", contract, exc)
+        if any(result.get(key) is not None for key in ("funding_rate", "open_interest", "long_short_ratio")):
+            result["source"] = "gate_public"
+            self._cache_set(cache_key, result, 120)
+        return result
+
+    def _get_okx_public_derivatives(self, instrument: str) -> Dict[str, Any]:
+        """Fetch one coherent OKX USDT perpetual snapshot without credentials."""
+        cache_key = f"okx_public_derivatives|{instrument}"
+        cached = self._cache_get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        result: Dict[str, Any] = {
+            "funding_rate": None, "funding_rate_decimal": None,
+            "open_interest": None, "open_interest_change_24h": None,
+            "long_short_ratio": None, "source": "", "field_metadata": {},
+        }
+        try:
+            funding_response = requests.get(
+                "https://www.okx.com/api/v5/public/funding-rate-history",
+                params={"instId": instrument, "limit": 2},
+                timeout=6,
+            )
+            funding_response.raise_for_status()
+            rows = (funding_response.json() or {}).get("data") or []
+            if rows:
+                decimal_rate = self._safe_num(rows[0].get("realizedRate") or rows[0].get("fundingRate"))
+                if decimal_rate is not None:
+                    result["funding_rate_decimal"] = decimal_rate
+                    result["funding_rate"] = decimal_rate * 100.0
+                    result["field_metadata"]["funding_rate"] = {
+                        "unit": "percent", "source_unit": "decimal",
+                        "provider": "okx_public", "venue": "okx",
+                        "product_type": "perpetual",
+                    }
+        except Exception as exc:
+            logger.debug("OKX public funding failed for %s: %s", instrument, exc)
+        try:
+            oi_response = requests.get(
+                "https://www.okx.com/api/v5/public/open-interest",
+                params={"instType": "SWAP", "instId": instrument},
+                timeout=6,
+            )
+            oi_response.raise_for_status()
+            rows = (oi_response.json() or {}).get("data") or []
+            if rows:
+                result["open_interest"] = self._safe_num(rows[0].get("oiUsd"))
+                if result["open_interest"] is not None:
+                    result["field_metadata"]["open_interest"] = {
+                        "unit": "usd", "currency": "USD",
+                        "provider": "okx_public", "venue": "okx",
+                        "product_type": "perpetual",
+                    }
+        except Exception as exc:
+            logger.debug("OKX public open interest failed for %s: %s", instrument, exc)
+        if result.get("funding_rate") is not None or result.get("open_interest") is not None:
+            result["source"] = "okx_public"
+            self._cache_set(cache_key, result, 120)
         return result
 
     def _fill_crypto_derivatives_from_binance(self, pair: str, result: Dict[str, Any]) -> Dict[str, Any]:
