@@ -2195,8 +2195,22 @@ class MarketDataCollector:
                     for item in raw_news[:10]:
                         if not item.get('headline'):
                             continue
+                        published_at = ""
+                        try:
+                            # Finnhub timestamps are Unix instants in UTC.  A
+                            # timezone-naive ``fromtimestamp`` converts them
+                            # through the container's local timezone (normally
+                            # Asia/Shanghai) and the evidence layer then reads
+                            # that wall clock as UTC, making recent news appear
+                            # eight hours in the future.
+                            published_at = datetime.fromtimestamp(
+                                float(item.get('datetime') or 0),
+                                tz=timezone.utc,
+                            ).isoformat().replace("+00:00", "Z")
+                        except (TypeError, ValueError, OverflowError, OSError):
+                            published_at = ""
                         news_list.append({
-                            "datetime": datetime.fromtimestamp(item.get('datetime', 0)).strftime('%Y-%m-%d %H:%M'),
+                            "datetime": published_at,
                             "headline": item.get('headline', ''),
                             "summary": item.get('summary', '')[:300] if item.get('summary') else '',
                             "source": item.get('source', 'Finnhub'),

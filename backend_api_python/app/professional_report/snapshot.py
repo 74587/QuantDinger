@@ -136,6 +136,8 @@ class _ObservationCollector:
         self.retrieved_at = _iso_timestamp(payload.get("collected_at"))
         self.currency = _quote_currency(self.market, self.symbol)
         self.items: list[dict[str, Any]] = []
+        self.quality_flags: set[str] = set()
+        self.excluded_future_timestamp_items = 0
 
     def add(
         self,
@@ -158,6 +160,17 @@ class _ObservationCollector:
             return
         source_name = str(source or "unknown")
         observed_at = _iso_timestamp(as_of or period_end, self.retrieved_at)
+        observed_datetime = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        retrieved_datetime = datetime.fromisoformat(
+            self.retrieved_at.replace("Z", "+00:00")
+        )
+        if observed_datetime > retrieved_datetime:
+            # Provider clocks and timezone bugs must not invalidate the whole
+            # report.  Exclude future-dated evidence from prompts, claims and
+            # scoring, while exposing the data-quality problem on the snapshot.
+            self.excluded_future_timestamp_items += 1
+            self.quality_flags.add("future_timestamp_evidence_excluded")
+            return
         freshness_default = {
             "market": 172_800,
             "technical": 172_800,
@@ -440,11 +453,12 @@ def build_evidence_snapshot(payload: Mapping[str, Any]) -> dict[str, Any]:
         "timeframe": str(payload.get("timeframe") or "1D"),
         "observations": collector.items,
         "required_metrics": required_by_market.get(collector.market, ["quote.price", "ohlcv.latest_bar"]),
-        "quality_flags": [],
+        "quality_flags": sorted(collector.quality_flags),
         "collection": {
             "success_items": list(meta.get("success_items") or []),
             "failed_items": list(meta.get("failed_items") or []),
             "duration_ms": int(meta.get("duration_ms") or 0),
+            "excluded_future_timestamp_items": collector.excluded_future_timestamp_items,
         },
     }
 

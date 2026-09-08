@@ -231,6 +231,35 @@ def test_compact_provider_timestamp_is_normalized_before_contract_validation():
     assert news_rows[0]["as_of"] == "2026-09-07T23:00:00Z"
 
 
+def test_future_dated_provider_evidence_is_excluded_without_failing_report():
+    payload = _collector_payload("USStock")
+    payload["collected_at"] = "2099-09-08T12:00:00Z"
+    payload["news"] = [
+        {
+            "title": "Valid confirmed update",
+            "source": "wire",
+            "published_at": "2099-09-08T11:55:00Z",
+        },
+        {
+            "title": "Provider timestamp in the future",
+            "source": "wire",
+            "published_at": "2099-09-08T20:00:00Z",
+        },
+    ]
+
+    report = build_professional_report(payload, _analysis(payload))
+    snapshot = report["evidence_snapshot"]
+    news_values = [
+        item["value"] for item in snapshot["observations"]
+        if item["category"] == "news"
+    ]
+
+    assert [item["title"] for item in news_values] == ["Valid confirmed update"]
+    assert "future_timestamp_evidence_excluded" in snapshot["quality_flags"]
+    assert snapshot["collection"]["excluded_future_timestamp_items"] == 1
+    assert report["contract_validation"]["valid"] is True
+
+
 def test_hk_dimension_uses_free_enrichment_and_skips_inapplicable_ah_premium():
     payload = _collector_payload("HKStock")
     payload["hk_security_profile"] = {
