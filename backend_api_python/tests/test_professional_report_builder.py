@@ -24,6 +24,10 @@ def _collector_payload(market="USStock"):
             "moving_averages": {"trend": "uptrend"},
             "macd": {"signal": "bullish"},
             "levels": {"support": 95, "resistance": 110},
+            "trading_levels": {
+                "suggested_stop_loss": 95,
+                "suggested_take_profit": 110,
+            },
             "volatility": {"atr": 3, "pct": 3},
         },
         "news": [{"title": "Confirmed product update", "source": "wire", "published_at": now}],
@@ -160,6 +164,53 @@ def test_risk_plan_is_cost_and_quality_aware():
     assert plan["net_risk_reward"] < plan["gross_risk_reward"]
     assert plan["recommended_position_pct"] <= 25
     assert "position_reduced_for_data_quality" in plan["warnings"]
+
+
+@pytest.mark.parametrize(
+    ("technical_score", "expected_bias", "expected_direction"),
+    [(-16, "BEARISH", "SELL"), (8, "BULLISH", "BUY")],
+)
+def test_hold_keeps_market_bias_and_non_actionable_candidate_geometry(
+    technical_score, expected_bias, expected_direction
+):
+    payload = _collector_payload("USStock")
+    analysis = _analysis(payload)
+    analysis["decision"] = "HOLD"
+    analysis["objective_score"]["technical_score"] = technical_score
+    analysis["trading_plan"] = {
+        "entry_price": 0,
+        "stop_loss": 0,
+        "take_profit": 0,
+    }
+
+    report = build_professional_report(payload, analysis)
+    profile = report["decision_profile"]
+    plan = report["risk_plan"]
+    candidate = plan["candidate_setup"]
+
+    assert report["contract_validation"]["valid"] is True
+    assert profile["decision"] == "HOLD"
+    assert profile["market_bias"] == expected_bias
+    assert profile["market_bias_score"] == technical_score
+    assert plan["entry_price"] is None
+    assert plan["recommended_position_pct"] == 0
+    assert plan["max_position_pct"] == 0
+    assert candidate["status"] == "watch_only"
+    assert candidate["direction"] == expected_direction
+    assert candidate["entry_price"] == 100
+    assert candidate["net_risk_reward"] > 0
+
+
+def test_neutral_hold_does_not_invent_candidate_geometry():
+    payload = _collector_payload("Crypto")
+    analysis = _analysis(payload)
+    analysis["decision"] = "HOLD"
+    analysis["objective_score"]["technical_score"] = 2
+
+    report = build_professional_report(payload, analysis)
+
+    assert report["decision_profile"]["market_bias"] == "NEUTRAL"
+    assert report["risk_plan"]["candidate_setup"] is None
 
 
 def test_invalid_price_geometry_blocks_actionable_decision():

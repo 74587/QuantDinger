@@ -22,6 +22,149 @@ def _plain_text(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False)
     return str(value)
 
+
+_EVIDENCE_METADATA_FIELDS = {
+    "currency", "source", "period_end", "period_start", "latest_date", "date",
+    "period_type", "timestamp", "time", "method", "kind", "name", "description",
+    "category", "scope", "symbol", "security_type", "isin",
+}
+_EVIDENCE_PERCENT_FIELDS = {
+    "change_percent", "revenue_growth", "profit_margin", "operating_margin",
+    "gross_margin", "dividend_yield", "roe", "holding_ratio_pct",
+    "holding_change_pct_1d", "short_percent_of_float_pct",
+    "nearest_atm_implied_volatility_pct", "open_interest_change_24h",
+    "volume_change_24h", "funding_rate",
+}
+_EVIDENCE_MONEY_FIELDS = {
+    "market_cap", "enterprise_value", "total_revenue", "revenue", "gross_profit",
+    "operating_income", "net_income", "operating_cash_flow", "financing_cash_flow",
+    "capital_expenditure", "free_cash_flow", "total_assets", "total_liabilities",
+    "total_equity", "current_assets", "current_liabilities", "cash", "debt",
+    "volume_24h", "open_interest", "exchange_netflow", "stablecoin_netflow",
+    "holding_market_value_hkd",
+}
+_EVIDENCE_PRICE_FIELDS = {
+    "price", "current_price", "previous_close", "open", "high", "low", "close",
+    "support", "resistance", "swing_low", "swing_high", "pivot", "bb_lower",
+    "bb_middle", "bb_upper", "suggested_stop_loss", "suggested_take_profit",
+    "target_price_median_hkd", "target_price_median_usd", "target_price_mean_usd",
+    "target_price_low_usd", "target_price_high_usd", "target_price_low_hkd",
+    "target_price_high_hkd",
+}
+_EVIDENCE_SHARE_FIELDS = {
+    "shares_outstanding", "shares_short", "shares_short_prior_month",
+    "holding_change_shares_1d", "holding_shares",
+}
+_EVIDENCE_CURRENCY_CODES = {
+    "USD", "HKD", "CNY", "CNH", "EUR", "GBP", "JPY", "AUD", "CAD",
+    "SGD", "KRW", "USDT", "USDC", "BTC", "ETH",
+}
+
+
+def _evidence_token(value: Any) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
+    return re.sub(r"[^a-z0-9%]+", "_", text.lower()).strip("_")
+
+
+def _evidence_metric_leaf(metric: Any) -> str:
+    return _evidence_token(str(metric or "").split(".")[-1])
+
+
+def _trimmed_number(value: float, *, maximum: int = 8, minimum: int = 0) -> str:
+    rendered = f"{value:,.{maximum}f}"
+    if maximum:
+        rendered = rendered.rstrip("0").rstrip(".")
+    if minimum:
+        integer, dot, decimal = rendered.partition(".")
+        rendered = f"{integer}.{decimal.ljust(minimum, '0')}" if dot else f"{integer}.{'0' * minimum}"
+    return rendered
+
+
+def _compact_evidence_number(value: float) -> str:
+    absolute = abs(value)
+    for threshold, suffix in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if absolute >= threshold:
+            return f"{_trimmed_number(value / threshold, maximum=2)}{suffix}"
+    maximum = 8 if absolute and absolute < 0.01 else 6 if absolute < 1 else 4 if absolute < 100 else 2
+    return _trimmed_number(value, maximum=maximum)
+
+
+def _evidence_currency(item: dict) -> str:
+    currency = str(item.get("currency") or "").strip().upper()
+    if currency:
+        return currency
+    raw_unit = str(item.get("unit") or "").strip().upper()
+    return raw_unit if raw_unit in _EVIDENCE_CURRENCY_CODES else ""
+
+
+def _format_evidence_observation(item: dict, *, is_zh: bool = False) -> str:
+    """Human-readable evidence value; the report artifact keeps the exact raw value."""
+    value = item.get("value")
+    if value in (None, ""):
+        return "—"
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, bool):
+        return ("是" if value else "否") if is_zh else ("Yes" if value else "No")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        # Textual metadata such as dates, provider names and currency codes must
+        # never inherit the parent financial statement's currency.
+        return str(value)
+    if not (number == number and abs(number) != float("inf")):
+        return str(value)
+
+    leaf = _evidence_metric_leaf(item.get("metric"))
+    unit = _evidence_token(item.get("unit"))
+    currency = _evidence_currency(item)
+    exact = _trimmed_number(number)
+    if leaf in _EVIDENCE_METADATA_FIELDS:
+        return exact
+    if re.search(r"(^|\.)rsi(\.|$)", str(item.get("metric") or ""), re.IGNORECASE):
+        return _compact_evidence_number(number) if abs(number) >= 10000 else exact
+    if unit in {"percent", "percentage", "pct", "%"} or leaf in _EVIDENCE_PERCENT_FIELDS or leaf.endswith("_pct"):
+        absolute = abs(number)
+        maximum = 6 if absolute and absolute < 0.01 else 4 if absolute < 1 else 2
+        return f"{_trimmed_number(number, maximum=maximum)}%"
+    if unit in {"bps", "basis_points"}:
+        return f"{_trimmed_number(number, maximum=2)} {'个基点' if is_zh else 'bps'}"
+    if unit == "currency_per_share" or leaf in {"eps", "book_value"}:
+        maximum = 6 if abs(number) < 0.01 else 3
+        suffix = f"{currency}/{'股' if is_zh else 'share'}" if currency else ("股" if is_zh else "share")
+        return f"{_trimmed_number(number, maximum=maximum, minimum=2 if abs(number) >= 1 else 0)} {suffix}"
+    if unit in {"multiple", "ratio"} or leaf.endswith("_ratio") or leaf in {"pe_ratio", "pb_ratio", "current_ratio", "quick_ratio", "debt_to_equity", "beta"}:
+        return f"{_trimmed_number(number, maximum=3)}×"
+    if unit in {"share", "shares"} or leaf in _EVIDENCE_SHARE_FIELDS:
+        return f"{_compact_evidence_number(number)} {'股' if is_zh else 'shares'}"
+    if unit in {"count", "items"} or leaf.endswith("_count") or leaf == "bar_count":
+        count = _compact_evidence_number(number) if abs(number) >= 10000 else _trimmed_number(number, maximum=0)
+        return f"{count} {'项' if is_zh else 'items'}"
+
+    unit_is_currency = bool(currency) and unit == currency.lower()
+    is_price = leaf in _EVIDENCE_PRICE_FIELDS
+    is_money = leaf in _EVIDENCE_MONEY_FIELDS or unit_is_currency or unit == "currency"
+    if is_price or is_money:
+        if is_money and not is_price and abs(number) >= 1000:
+            display = _compact_evidence_number(number)
+        elif is_price:
+            display = _trimmed_number(number, maximum=6 if abs(number) < 1 else 4, minimum=2)
+        else:
+            display = _compact_evidence_number(number)
+        raw_unit = str(item.get("unit") or "").strip()
+        amount_unit = raw_unit if not currency and unit not in {"", "currency", "price", "decimal"} else ""
+        suffix = f" {currency}" if currency else f" {amount_unit}" if amount_unit else ""
+        return f"{display}{suffix}"
+    return _compact_evidence_number(number) if abs(number) >= 10000 else exact
+
+
+def _format_evidence_provider(value: Any) -> str:
+    tokens = list(dict.fromkeys(_evidence_token(item) for item in str(value or "").split("+") if _evidence_token(item)))
+    if "yfinance_statements" in tokens:
+        tokens = [item for item in tokens if item != "yfinance"]
+    labels = {"yfinance": "Yahoo Finance", "yfinance_statements": "Yahoo Finance statements", "finnhub": "Finnhub"}
+    return " + ".join(labels.get(item, item.replace("_", " ")) for item in tokens) or "—"
+
 def _has_cjk_text(value: Any) -> bool:
     text = _plain_text(value)
     return bool(re.search(r"[\u2e80-\u9fff\uac00-\ud7af\u3040-\u30ff]", text))
@@ -41,6 +184,29 @@ def _professional_report_artifact(value: Any) -> dict | None:
     return None
 
 
+def _report_market_bias(decision: dict, dimensions: list[dict]) -> str:
+    explicit = str(decision.get("market_bias") or "").upper()
+    if explicit in {"BULLISH", "BEARISH", "NEUTRAL"}:
+        return explicit
+    raw_score = decision.get("market_bias_score")
+    if raw_score is not None:
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            score = 0.0
+    else:
+        technical = next((item for item in dimensions if item.get("key") == "technical"), {})
+        try:
+            score = (float(technical.get("score")) - 50.0) * 2.0
+        except (TypeError, ValueError):
+            score = 0.0
+    if score >= 5.0:
+        return "BULLISH"
+    if score <= -5.0:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
 def _professional_pdf_projection(value: dict) -> dict:
     """Project the v1 artifact into the generic PDF layout without legacy input data."""
     report = _professional_report_artifact(value)
@@ -49,6 +215,8 @@ def _professional_pdf_projection(value: dict) -> dict:
     instrument = report.get("instrument") or {}
     decision = report.get("decision_profile") or {}
     risk = report.get("risk_plan") or {}
+    candidate = risk.get("candidate_setup") or {}
+    displayed_plan = candidate or risk
     observations = ((report.get("evidence_snapshot") or {}).get("observations") or [])
     observation_by_metric = {
         str(item.get("metric")): item
@@ -58,6 +226,7 @@ def _professional_pdf_projection(value: dict) -> dict:
     quote = observation_by_metric.get("quote.price") or {}
     change = observation_by_metric.get("quote.changePercent") or {}
     dimensions = [item for item in (report.get("dimensions") or []) if isinstance(item, dict)]
+    market_bias = _report_market_bias(decision, dimensions)
     claims = [item for item in (report.get("claims") or []) if isinstance(item, dict)]
     scenarios = [item for item in (report.get("scenarios") or []) if isinstance(item, dict)]
     warnings = list(risk.get("warnings") or [])
@@ -65,6 +234,8 @@ def _professional_pdf_projection(value: dict) -> dict:
         "market": instrument.get("market"),
         "symbol": instrument.get("canonical_symbol") or instrument.get("symbol"),
         "decision": decision.get("decision") or "HOLD",
+        "market_bias": market_bias,
+        "market_bias_score": decision.get("market_bias_score"),
         "confidence": decision.get("confidence"),
         "summary": report.get("executive_summary") or decision.get("rationale"),
         "market_data": {
@@ -72,11 +243,15 @@ def _professional_pdf_projection(value: dict) -> dict:
             "change_24h": change.get("value"),
         },
         "trading_plan": {
-            "entry_price": risk.get("entry_price"),
-            "stop_loss": risk.get("stop_loss"),
-            "take_profit": risk.get("take_profit"),
-            "risk_reward_ratio": risk.get("net_risk_reward"),
-            "rr_warning": "net_risk_reward_below_one" in warnings,
+            "entry_price": displayed_plan.get("entry_price"),
+            "stop_loss": displayed_plan.get("stop_loss"),
+            "take_profit": displayed_plan.get("take_profit"),
+            "risk_reward_ratio": displayed_plan.get("net_risk_reward"),
+            "candidate_setup": bool(candidate),
+            "rr_warning": any(
+                item in {"net_risk_reward_below_one", "candidate_net_risk_reward_below_one"}
+                for item in [*warnings, *(candidate.get("warnings") or [])]
+            ),
         },
         "scores": {item.get("key", "dimension"): item.get("score") for item in dimensions},
         "detailed_analysis": {
@@ -184,17 +359,26 @@ def _language_key(language: str = "") -> str:
 
 def _outlook_labels(language: str = "") -> dict[str, str]:
     labels = {
-        "en": {"BUY": "Bullish", "SELL": "Bearish", "HOLD": "Neutral"},
-        "zh-CN": {"BUY": "利多", "SELL": "利空", "HOLD": "中性"},
-        "zh-TW": {"BUY": "利多", "SELL": "利空", "HOLD": "中性"},
-        "ja": {"BUY": "強気", "SELL": "弱気", "HOLD": "中立"},
-        "ko": {"BUY": "강세", "SELL": "약세", "HOLD": "중립"},
-        "de": {"BUY": "Bullisch", "SELL": "Bärisch", "HOLD": "Neutral"},
-        "fr": {"BUY": "Haussier", "SELL": "Baissier", "HOLD": "Neutre"},
-        "ru": {"BUY": "Бычий", "SELL": "Медвежий", "HOLD": "Нейтральный"},
-        "ar": {"BUY": "إيجابي", "SELL": "سلبي", "HOLD": "محايد"},
-        "th": {"BUY": "เชิงบวก", "SELL": "เชิงลบ", "HOLD": "เป็นกลาง"},
-        "vi": {"BUY": "Tích cực", "SELL": "Tiêu cực", "HOLD": "Trung lập"},
+        "en": {"BUY": "Buy", "SELL": "Sell", "HOLD": "Wait"},
+        "zh-CN": {"BUY": "做多", "SELL": "做空", "HOLD": "观望"},
+        "zh-TW": {"BUY": "做多", "SELL": "做空", "HOLD": "觀望"},
+        "ja": {"BUY": "買い", "SELL": "売り", "HOLD": "様子見"},
+        "ko": {"BUY": "매수", "SELL": "매도", "HOLD": "관망"},
+        "de": {"BUY": "Kaufen", "SELL": "Verkaufen", "HOLD": "Abwarten"},
+        "fr": {"BUY": "Acheter", "SELL": "Vendre", "HOLD": "Attendre"},
+        "ru": {"BUY": "Покупать", "SELL": "Продавать", "HOLD": "Ждать"},
+        "ar": {"BUY": "شراء", "SELL": "بيع", "HOLD": "انتظار"},
+        "th": {"BUY": "ซื้อ", "SELL": "ขาย", "HOLD": "รอดู"},
+        "vi": {"BUY": "Mua", "SELL": "Bán", "HOLD": "Chờ"},
+    }
+    return labels.get(_language_key(language), labels["en"])
+
+
+def _market_bias_labels(language: str = "") -> dict[str, str]:
+    labels = {
+        "en": {"BULLISH": "Bullish", "BEARISH": "Bearish", "NEUTRAL": "Neutral"},
+        "zh-CN": {"BULLISH": "偏多", "BEARISH": "偏空", "NEUTRAL": "中性"},
+        "zh-TW": {"BULLISH": "偏多", "BEARISH": "偏空", "NEUTRAL": "中性"},
     }
     return labels.get(_language_key(language), labels["en"])
 
@@ -550,10 +734,12 @@ def _build_professional_report_pdf(report: dict, target: dict | None, language: 
         "title": "专业市场分析报告" if is_zh else "Professional Market Research",
         "subtitle": "证据驱动 · 数据质量可审计 · 风险优先" if is_zh else "Evidence-backed · quality-audited · risk-first",
         "outlook": "研究观点" if is_zh else "RESEARCH OUTLOOK",
+        "market_bias": "市场方向" if is_zh else "MARKET BIAS",
+        "trade_action": "交易动作" if is_zh else "TRADE ACTION",
         "generated": "生成时间" if is_zh else "GENERATED",
         "as_of": "数据截止" if is_zh else "DATA AS OF",
         "tier": "数据等级" if is_zh else "DATA TIER",
-        "confidence": "模型强度" if is_zh else "MODEL STRENGTH",
+        "confidence": "动作判断强度" if is_zh else "ACTION CONFIDENCE",
         "summary": "核心结论" if is_zh else "Executive conclusion",
         "quality": "数据质量审计" if is_zh else "Data quality audit",
         "quality_score": "综合质量" if is_zh else "Overall quality",
@@ -569,6 +755,7 @@ def _build_professional_report_pdf(report: dict, target: dict | None, language: 
         "trigger": "触发条件" if is_zh else "Trigger",
         "invalidation": "失效条件" if is_zh else "Invalidation",
         "risk": "风险与执行计划" if is_zh else "Risk and execution plan",
+        "candidate_risk": "候选观察方案（非当前入场建议）" if is_zh else "Watch-only candidate setup (not an entry recommendation)",
         "entry": "参考入场" if is_zh else "Reference entry",
         "stop": "止损" if is_zh else "Stop",
         "take": "止盈" if is_zh else "Target",
@@ -693,7 +880,9 @@ def _build_professional_report_pdf(report: dict, target: dict | None, language: 
     name = instrument.get("name") or symbol
     outlook = str(decision.get("decision") or "HOLD").upper()
     outlook_display = _outlook_labels(language).get(outlook, outlook)
-    outlook_color = palette["green"] if outlook == "BUY" else palette["red"] if outlook == "SELL" else palette["amber"]
+    market_bias = _report_market_bias(decision, dimensions)
+    bias_display = _market_bias_labels(language).get(market_bias, market_bias)
+    outlook_color = palette["green"] if market_bias == "BULLISH" else palette["red"] if market_bias == "BEARISH" else palette["amber"]
     overall_quality = quality.get("overall_score")
     if overall_quality is None:
         raw_quality = quality.get("quality_score")
@@ -706,7 +895,7 @@ def _build_professional_report_pdf(report: dict, target: dict | None, language: 
     hero = Table([
         [
             [para("QUANTDINGER", subtitle_style), para(copy["title"], title_style), para(copy["subtitle"], subtitle_style)],
-            [para(copy["outlook"], subtitle_style), para(outlook_display, ParagraphStyle("ProOutlook", parent=title_style, fontSize=18, leading=22, textColor=outlook_color)), para(f"{copy['confidence']}  {pct(decision.get('confidence'))}", subtitle_style)],
+            [para(copy["market_bias"], subtitle_style), para(bias_display, ParagraphStyle("ProOutlook", parent=title_style, fontSize=18, leading=22, textColor=outlook_color)), para(f"{copy['trade_action']}  {outlook_display}<br/>{copy['confidence']}  {pct(decision.get('confidence'))}", subtitle_style)],
         ]
     ], colWidths=[content_width * 0.69, content_width * 0.31])
     hero.setStyle(TableStyle([
@@ -799,16 +988,18 @@ def _build_professional_report_pdf(report: dict, target: dict | None, language: 
         story.append(scenarios_table)
 
     if risk:
-        story.extend(section(copy["risk"]))
+        candidate = risk.get("candidate_setup") or {}
+        displayed_risk = candidate or risk
+        story.extend(section(copy["candidate_risk"] if candidate else copy["risk"]))
         story.append(metric_cards([
-            (copy["entry"], number(risk.get("entry_price"))),
-            (copy["stop"], number(risk.get("stop_loss"))),
-            (copy["take"], number(risk.get("take_profit"))),
-            (copy["rr"], number(risk.get("net_risk_reward"))),
+            (copy["entry"], number(displayed_risk.get("entry_price"))),
+            (copy["stop"], number(displayed_risk.get("stop_loss"))),
+            (copy["take"], number(displayed_risk.get("take_profit"))),
+            (copy["rr"], number(displayed_risk.get("net_risk_reward"))),
             (copy["position"], number(risk.get("recommended_position_pct"), 1, "%")),
             (copy["risk_budget"], number(risk.get("risk_budget_pct"), 1, "%")),
         ]))
-        warnings = [str(item) for item in (risk.get("warnings") or [])]
+        warnings = [str(item) for item in [*(risk.get("warnings") or []), *(candidate.get("warnings") or [])]]
         invalidations = [str(item) for item in (risk.get("invalidation_conditions") or [])]
         if warnings or invalidations:
             story.append(Spacer(1, 2 * mm))
@@ -849,13 +1040,10 @@ def _build_professional_report_pdf(report: dict, target: dict | None, language: 
         story.extend([PageBreak(), *section(copy["evidence"], f"{len(evidence)} observations")])
         evidence_rows = [[para(copy[key], table_head_light) for key in ("metric", "observed", "provider", "timestamp", "evidence_id")]]
         for item in evidence:
-            value = item.get("value")
-            if isinstance(value, (dict, list)):
-                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             evidence_rows.append([
                 para(item.get("metric") or "—", table_body),
-                para(value if value not in (None, "") else "—", table_body),
-                para(item.get("source") or "—", table_body),
+                para(_format_evidence_observation(item, is_zh=is_zh), table_body),
+                para(_format_evidence_provider(item.get("source")), table_body),
                 para(short_timestamp(item.get("as_of")), table_body),
                 para(item.get("evidence_id") or "—", muted),
             ])

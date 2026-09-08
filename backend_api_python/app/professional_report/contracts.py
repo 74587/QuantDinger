@@ -18,6 +18,7 @@ from pydantic import AliasChoices, AwareDatetime, BaseModel, ConfigDict, Field, 
 
 Market = Literal["USStock", "HKStock", "Crypto"]
 Decision = Literal["BUY", "SELL", "HOLD"]
+MarketBias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
 ConclusionStrength = Literal["none", "low", "medium", "high"]
 ScenarioName = Literal["bull", "base", "bear"]
 
@@ -198,6 +199,9 @@ class DataQualitySummary(_ContractModel):
 class DecisionProfile(_ContractModel):
     decision: Decision
     raw_decision: Decision | None = None
+    market_bias: MarketBias = "NEUTRAL"
+    market_bias_score: float = Field(default=0, ge=-100, le=100)
+    market_bias_basis: Literal["technical_score"] = "technical_score"
     confidence: float = Field(ge=0, le=100)
     raw_confidence: float | None = Field(default=None, ge=0, le=100)
     confidence_kind: Literal["model_strength", "calibrated_probability"] = "model_strength"
@@ -244,6 +248,32 @@ class ScenarioCase(_ContractModel):
     )
 
 
+class CandidateSetup(_ContractModel):
+    """Non-actionable price geometry retained when the trade action is HOLD."""
+
+    direction: Literal["BUY", "SELL"]
+    status: Literal["watch_only"] = "watch_only"
+    entry_price: float = Field(gt=0)
+    stop_loss: float = Field(gt=0)
+    take_profit: float = Field(gt=0)
+    stop_distance_pct: float = Field(ge=0)
+    gross_risk_reward: float = Field(ge=0)
+    net_risk_reward: float = Field(ge=0)
+    estimated_roundtrip_cost_bps: float = Field(ge=0)
+    source: str = "technical_levels"
+    warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_price_geometry(self) -> "CandidateSetup":
+        valid = (
+            (self.direction == "BUY" and self.stop_loss < self.entry_price < self.take_profit)
+            or (self.direction == "SELL" and self.take_profit < self.entry_price < self.stop_loss)
+        )
+        if not valid:
+            raise ValueError("candidate entry, stop and target geometry is invalid")
+        return self
+
+
 class RiskPlan(_ContractModel):
     decision: Decision | None = None
     entry_price: float | None = Field(default=None, ge=0)
@@ -260,6 +290,7 @@ class RiskPlan(_ContractModel):
     estimated_roundtrip_cost_bps: float | None = Field(default=None, ge=0)
     valid: bool = True
     warnings: list[str] = Field(default_factory=list)
+    candidate_setup: CandidateSetup | None = None
     horizon: str | None = None
     evidence_refs: list[str] = Field(
         default_factory=list,
@@ -333,12 +364,14 @@ class ProfessionalReportV1(_ContractModel):
 
 
 __all__ = [
+    "CandidateSetup",
     "DataQualitySummary",
     "DecisionProfile",
     "EvidenceClaim",
     "EvidenceObservation",
     "EvidenceSnapshotV1",
     "InstrumentIdentity",
+    "MarketBias",
     "ProfessionalReportV1",
     "RiskPlan",
     "ScenarioCase",

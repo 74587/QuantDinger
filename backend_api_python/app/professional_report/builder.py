@@ -30,6 +30,24 @@ def _score(value: Any, default: float = 50.0) -> float:
         return default
 
 
+def _market_bias(analysis_result: Mapping[str, Any]) -> tuple[str, float]:
+    """Keep technical market direction separate from the execution action."""
+    objective = analysis_result.get("objective_score") or {}
+    raw_value = objective.get("technical_score")
+    if raw_value is None:
+        displayed = _score((analysis_result.get("scores") or {}).get("technical"), 50.0)
+        raw_value = (displayed - 50.0) * 2.0
+    try:
+        score = max(-100.0, min(100.0, float(raw_value)))
+    except (TypeError, ValueError):
+        score = 0.0
+    if score >= 5.0:
+        return "BULLISH", round(score, 2)
+    if score <= -5.0:
+        return "BEARISH", round(score, 2)
+    return "NEUTRAL", round(score, 2)
+
+
 def _refs(observations: list[Mapping[str, Any]], *categories: str) -> list[str]:
     wanted = set(categories)
     return [
@@ -558,6 +576,7 @@ def build_professional_report(
         ):
             hard_gate_reasons.append("crypto_scope_or_unit_validation_failed")
     raw_decision = str(analysis_result.get("decision") or "HOLD").upper()
+    market_bias, market_bias_score = _market_bias(analysis_result)
     raw_confidence = int(_score(analysis_result.get("confidence"), 50))
     decision, confidence, gate_reasons = _apply_gate(raw_decision, raw_confidence, quality)
     if hard_gate_reasons:
@@ -577,6 +596,8 @@ def build_professional_report(
         data_quality_score=float(quality.get("overall_score") or quality.get("score") or 0),
         market=market,
         account_risk_budget_pct=account_risk_budget_pct,
+        market_bias=market_bias,
+        indicators=collector_payload.get("indicators") or {},
     )
     if decision != "HOLD" and not risk_plan.get("valid", False):
         decision = "HOLD"
@@ -678,6 +699,9 @@ def build_professional_report(
         "decision_profile": {
             "decision": decision,
             "raw_decision": raw_decision,
+            "market_bias": market_bias,
+            "market_bias_score": market_bias_score,
+            "market_bias_basis": "technical_score",
             "confidence": confidence,
             "raw_confidence": raw_confidence,
             "confidence_kind": "calibrated_probability"

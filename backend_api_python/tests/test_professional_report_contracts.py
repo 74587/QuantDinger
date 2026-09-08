@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.professional_report.contracts import (
+    CandidateSetup,
     DataQualitySummary,
     DecisionProfile,
     EvidenceClaim,
@@ -112,6 +113,25 @@ def test_contract_supports_the_three_v1_markets(market: str):
     identity = instrument(market)
     assert identity.market == market
     assert identity.quote_currency in {"USD", "USDT"}
+
+
+def test_candidate_setup_is_explicitly_watch_only():
+    setup = CandidateSetup(
+        direction="BUY",
+        entry_price=100,
+        stop_loss=95,
+        take_profit=110,
+        stop_distance_pct=5,
+        gross_risk_reward=2,
+        net_risk_reward=1.9,
+        estimated_roundtrip_cost_bps=10,
+    )
+
+    assert setup.status == "watch_only"
+    with pytest.raises(ValidationError):
+        CandidateSetup(**{**setup.model_dump(), "status": "actionable"})
+    with pytest.raises(ValidationError, match="geometry"):
+        CandidateSetup(**{**setup.model_dump(), "stop_loss": 105})
 
 
 def test_complete_fresh_consistent_snapshot_allows_strong_conclusion():
