@@ -574,6 +574,13 @@ class FastAnalysisScoringMixin:
             text = f"{title} {summary}"
             sentiment = item.get("sentiment", "neutral")
             is_global_event = item.get("is_global_event", False)
+            relevance = str(item.get("asset_relevance") or "direct").lower()
+
+            # Background headlines can be shown for context, but are excluded
+            # from target-asset scoring until an upstream source establishes a
+            # direct or material transmission channel.
+            if relevance not in {"direct", "material"}:
+                continue
 
             level, tag = geopolitical_match_level(text)
             if is_global_event and level == "none":

@@ -267,7 +267,14 @@ class AnalysisMemory:
             logger.error(f"Failed to store analysis memory: {e}", exc_info=True)
             return None
     
-    def get_recent(self, market: str, symbol: str, days: int = 7, limit: int = 5) -> List[Dict]:
+    def get_recent(
+        self,
+        market: str,
+        symbol: str,
+        days: int = 7,
+        limit: int = 5,
+        user_id: int | None = None,
+    ) -> List[Dict]:
         """
         Get recent analysis history for a symbol.
         
@@ -284,7 +291,11 @@ class AnalysisMemory:
             with get_db_connection() as db:
                 cur = db.cursor()
                 days_int = int(days)
-                cur.execute("""
+                user_clause = " AND user_id = %s" if user_id is not None else ""
+                params = (market, symbol, int(user_id), days_int, limit) if user_id is not None else (
+                    market, symbol, days_int, limit
+                )
+                cur.execute(f"""
                     SELECT 
                         id, decision, confidence, price_at_analysis,
                         summary, reasons, scores,
@@ -292,10 +303,11 @@ class AnalysisMemory:
                         task_status, task_error, updated_at
                     FROM qd_analysis_memory
                     WHERE market = %s AND symbol = %s
+                    {user_clause}
                     AND created_at > NOW() - (%s || ' days')::interval
                     ORDER BY created_at DESC
                     LIMIT %s
-                """, (market, symbol, days_int, limit))
+                """, params)
                 
                 rows = cur.fetchall() or []
                 cur.close()
@@ -542,8 +554,14 @@ class AnalysisMemory:
             logger.error(f"Failed to mark task failed {memory_id}: {e}")
             return False
     
-    def get_similar_patterns(self, market: str, symbol: str, 
-                             current_indicators: Dict, limit: int = 3) -> List[Dict]:
+    def get_similar_patterns(
+        self,
+        market: str,
+        symbol: str,
+        current_indicators: Dict,
+        limit: int = 3,
+        user_id: int | None = None,
+    ) -> List[Dict]:
         """
         Find historical analyses with similar technical patterns.
         
@@ -562,18 +580,23 @@ class AnalysisMemory:
             
             with get_db_connection() as db:
                 cur = db.cursor()
-                cur.execute("""
+                user_clause = " AND user_id = %s" if user_id is not None else ""
+                params = (market, symbol, int(user_id), limit * 5) if user_id is not None else (
+                    market, symbol, limit * 5
+                )
+                cur.execute(f"""
                     SELECT 
                         id, decision, confidence, price_at_analysis,
                         summary, reasons, indicators_snapshot,
                         created_at, was_correct, actual_return_pct
                     FROM qd_analysis_memory
                     WHERE market = %s AND symbol = %s
+                    {user_clause}
                     AND validated_at IS NOT NULL
                     AND was_correct IS NOT NULL
                     ORDER BY validated_at DESC NULLS LAST, created_at DESC
                     LIMIT %s
-                """, (market, symbol, limit * 5))
+                """, params)
                 
                 rows = cur.fetchall() or []
                 cur.close()
@@ -615,7 +638,9 @@ class AnalysisMemory:
             logger.error(f"Failed to get similar patterns: {e}")
             return []
 
-    def record_feedback(self, memory_id: int, feedback: str) -> bool:
+    def record_feedback(
+        self, memory_id: int, feedback: str, user_id: int | None = None
+    ) -> bool:
         """
         Record user feedback on an analysis.
         
@@ -626,14 +651,20 @@ class AnalysisMemory:
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                cur.execute("""
+                user_clause = " AND user_id = %s" if user_id is not None else ""
+                params = (feedback, memory_id, int(user_id)) if user_id is not None else (
+                    feedback, memory_id
+                )
+                cur.execute(f"""
                     UPDATE qd_analysis_memory
                     SET user_feedback = %s, feedback_at = NOW()
                     WHERE id = %s
-                """, (feedback, memory_id))
+                    {user_clause}
+                """, params)
+                updated = cur.rowcount > 0
                 db.commit()
                 cur.close()
-                return True
+                return updated
         except Exception as e:
             logger.error(f"Failed to record feedback: {e}")
             return False

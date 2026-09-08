@@ -1,4 +1,5 @@
 import copy
+import re
 import threading
 
 from app.services.fast_analysis import FastAnalysisService
@@ -54,6 +55,7 @@ def test_collect_all_honours_caller_core_timeout(monkeypatch):
     assert captured["timeout"] == 25.0
     assert result["fundamental"] == {"source": "test"}
     assert result["_meta"]["failed_items"] == []
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", result["collected_at"])
 
 
 def test_later_timeframe_backfills_primary_fundamentals_and_repairs_meta():

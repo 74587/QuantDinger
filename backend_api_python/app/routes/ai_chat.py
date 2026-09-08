@@ -3956,7 +3956,20 @@ def export_chat_report_pdf():
         logger.error(f"export_chat_report_pdf failed: {e}", exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
-    symbol = re.sub(r"[^A-Za-z0-9._-]+", "_", _plain_text(report.get("symbol") or target.get("symbol") or "report")).strip("_")
+    artifact = report.get("report") or report.get("professional_report") or report
+    instrument = artifact.get("instrument") if isinstance(artifact, dict) else {}
+    instrument = instrument if isinstance(instrument, dict) else {}
+    symbol = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        _plain_text(
+            instrument.get("canonical_symbol")
+            or instrument.get("symbol")
+            or report.get("symbol")
+            or target.get("symbol")
+            or "report"
+        ),
+    ).strip("_")
     filename = f"QuantDinger_{symbol or 'report'}_{_now_utc().strftime('%Y%m%d')}.pdf"
     return Response(
         pdf_bytes,

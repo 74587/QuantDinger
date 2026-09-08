@@ -27,6 +27,86 @@ def _has_cjk_text(value: Any) -> bool:
     return bool(re.search(r"[\u2e80-\u9fff\uac00-\ud7af\u3040-\u30ff]", text))
 
 
+def _professional_report_artifact(value: Any) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    candidate = value.get("report") or value.get("professional_report") or value
+    if not isinstance(candidate, dict):
+        return None
+    schema = candidate.get("schema_version")
+    if schema == "professional_report_v1" or (
+        schema == "1.0" and "instrument" in candidate and "decision_profile" in candidate
+    ):
+        return candidate
+    return None
+
+
+def _professional_pdf_projection(value: dict) -> dict:
+    """Project the v1 artifact into the generic PDF layout without legacy input data."""
+    report = _professional_report_artifact(value)
+    if not report:
+        return value
+    instrument = report.get("instrument") or {}
+    decision = report.get("decision_profile") or {}
+    risk = report.get("risk_plan") or {}
+    observations = ((report.get("evidence_snapshot") or {}).get("observations") or [])
+    observation_by_metric = {
+        str(item.get("metric")): item
+        for item in observations
+        if isinstance(item, dict) and item.get("metric")
+    }
+    quote = observation_by_metric.get("quote.price") or {}
+    change = observation_by_metric.get("quote.changePercent") or {}
+    dimensions = [item for item in (report.get("dimensions") or []) if isinstance(item, dict)]
+    claims = [item for item in (report.get("claims") or []) if isinstance(item, dict)]
+    scenarios = [item for item in (report.get("scenarios") or []) if isinstance(item, dict)]
+    warnings = list(risk.get("warnings") or [])
+    return {
+        "market": instrument.get("market"),
+        "symbol": instrument.get("canonical_symbol") or instrument.get("symbol"),
+        "decision": decision.get("decision") or "HOLD",
+        "confidence": decision.get("confidence"),
+        "summary": report.get("executive_summary") or decision.get("rationale"),
+        "market_data": {
+            "current_price": quote.get("value"),
+            "change_24h": change.get("value"),
+        },
+        "trading_plan": {
+            "entry_price": risk.get("entry_price"),
+            "stop_loss": risk.get("stop_loss"),
+            "take_profit": risk.get("take_profit"),
+            "risk_reward_ratio": risk.get("net_risk_reward"),
+            "rr_warning": "net_risk_reward_below_one" in warnings,
+        },
+        "scores": {item.get("key", "dimension"): item.get("score") for item in dimensions},
+        "detailed_analysis": {
+            item.get("key", "dimension"): item.get("narrative")
+            for item in dimensions
+            if item.get("narrative")
+        },
+        "trend_outlook": {
+            item.get("case", "scenario"): {
+                "probability": item.get("probability"),
+                "target_price": item.get("target_price"),
+                "trigger": item.get("trigger") or item.get("triggers"),
+                "invalidation": item.get("invalidation"),
+            }
+            for item in scenarios
+        },
+        "reasons": [item.get("text") for item in claims if item.get("kind") in {"thesis", "catalyst"}],
+        "risks": [item.get("text") for item in claims if item.get("kind") in {"risk", "counter_argument"}],
+        "indicators": {
+            item.get("metric"): {
+                "value": item.get("value"),
+                "source": item.get("source"),
+                "as_of": item.get("as_of"),
+            }
+            for item in observations[:30]
+            if isinstance(item, dict) and item.get("metric")
+        },
+    }
+
+
 def _register_report_pdf_font(language: str = "", prefer_cjk: bool = False) -> str:
     from pathlib import Path
 
@@ -409,6 +489,7 @@ def build_ai_report_pdf(report: dict, target: dict | None = None, language: str 
         TableStyle,
     )
 
+    report = _professional_pdf_projection(report)
     target = target or {}
     language_key = _language_key(language)
     prefer_cjk = language_key in {"zh-CN", "zh-TW", "ja", "ko"} or _has_cjk_text(report) or _has_cjk_text(target)

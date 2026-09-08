@@ -16,6 +16,7 @@ from app.services.ai_skill_registry import (
 )
 from app.services.ai_tool_registry import MCP_AGENT_TOOLS, TOOLS
 from app.services.billing_config import DEFAULT_BILLING_CONFIG, FEATURE_NAMES
+from app.routes.settings import CONFIG_SCHEMA
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -113,6 +114,50 @@ def test_retired_parameter_tuning_is_not_exposed_or_billable(app):
         (BACKEND_ROOT / "docs" / "api" / "openapi.yaml").read_text(encoding="utf-8")
     )["paths"]
     assert "/api/backtest/tune" not in human_paths
+
+
+def test_billing_settings_only_expose_costs_with_real_charge_paths():
+    billing_keys = {
+        item["key"]
+        for item in CONFIG_SCHEMA["billing"]["items"]
+        if item["key"].startswith("BILLING_COST_")
+    }
+    assert billing_keys == {
+        "BILLING_COST_BACKTEST",
+        "BILLING_COST_AI_REVIEW",
+        "BILLING_COST_AI_ANALYSIS",
+        "BILLING_COST_AI_CODE_GEN",
+        "BILLING_COST_AI_COPILOT_CHAT",
+        "BILLING_COST_AI_COPILOT_IMAGE",
+    }
+    assert set(DEFAULT_BILLING_CONFIG) == {
+        "enabled",
+        "cost_backtest",
+        "cost_ai_review",
+        "cost_ai_analysis",
+        "cost_ai_code_gen",
+        "cost_ai_copilot_chat",
+        "cost_ai_copilot_image",
+    }
+    assert "ai_indicator_to_strategy" not in FEATURE_NAMES
+    assert "ai_copilot_radar" not in FEATURE_NAMES
+
+    charge_paths = {
+        "backtest": "app/routes/backtest_center.py",
+        "ai_review": "app/routes/strategy_review_routes.py",
+        "ai_analysis": "app/routes/fast_analysis.py",
+        "ai_code_gen": "app/routes/strategy.py",
+        "ai_copilot_chat": "app/routes/ai_chat.py",
+        "ai_copilot_image": "app/routes/ai_chat.py",
+    }
+    backend_root = BACKEND_ROOT / "backend_api_python"
+    for feature, relative_path in charge_paths.items():
+        source = (backend_root / relative_path).read_text(encoding="utf-8")
+        billing_call = (
+            rf"(?:get_feature_cost|check_and_consume)\("
+            rf"[\s\S]{{0,160}}?(?:feature\s*=\s*)?['\"]{feature}['\"]"
+        )
+        assert re.search(billing_call, source), f"{feature} no longer has a runtime billing path"
 
 
 def test_prompt_skill_manifest_rejects_executable_or_action_fields():

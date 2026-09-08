@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from typing import Dict, List, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 import yfinance as yf
@@ -135,7 +135,10 @@ class MarketDataCollector:
             "market": market,
             "symbol": symbol,
             "timeframe": timeframe,
-            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # Evidence timestamps are instants, not server-local wall clocks.
+            # A timezone-less value was previously interpreted as UTC later in
+            # the report pipeline, shifting Asia deployments by eight hours.
+            "collected_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "price": None,
             "kline": None,
             "indicators": {},
@@ -1122,7 +1125,9 @@ class MarketDataCollector:
             "symbol": base_symbol,
             "volume_24h": volume_24h,
             "volume_change_24h": volume_change_24h,
+            "volume_to_market_cap_pct": market_structure.get("volume_to_market_cap_pct"),
             "funding_rate": funding_rate,
+            "funding_rate_decimal": derivatives.get("funding_rate_decimal"),
             "open_interest": derivatives.get("open_interest"),
             "open_interest_change_24h": oi_change,
             "long_short_ratio": long_short_ratio,
@@ -1134,7 +1139,12 @@ class MarketDataCollector:
                 "market_structure": market_structure.get("source"),
                 "derivatives": derivatives.get("source"),
                 "capital_flow": capital_flow.get("source"),
-            }
+            },
+            "metric_metadata": {
+                **(market_structure.get("field_metadata") or {}),
+                **(derivatives.get("field_metadata") or {}),
+                **(capital_flow.get("field_metadata") or {}),
+            },
         }
 
     def _normalize_crypto_base_symbol(self, symbol: str) -> str:
@@ -1266,12 +1276,21 @@ class MarketDataCollector:
         out = {
             "volume_24h": None,
             "volume_change_24h": None,
+            "volume_to_market_cap_pct": None,
             "source": "price+kline",
+            "field_metadata": {},
         }
         try:
             quote_volume = self._safe_num(price_data.get("quoteVolume"))
             if quote_volume is not None:
                 out["volume_24h"] = quote_volume
+                out["field_metadata"]["volume_24h"] = {
+                    "unit": "quote_asset",
+                    "currency": price_data.get("quoteCurrency") or price_data.get("quote_currency"),
+                    "provider": price_data.get("source") or "price_provider",
+                    "venue": price_data.get("exchange") or price_data.get("venue"),
+                    "product_type": price_data.get("market_type") or "spot",
+                }
         except Exception:
             pass
 
@@ -1281,6 +1300,12 @@ class MarketDataCollector:
                 prev_vol = self._safe_num(kline_data[-2].get("volume"), 0.0) or 0.0
                 if prev_vol > 0:
                     out["volume_change_24h"] = ((latest_vol - prev_vol) / prev_vol) * 100.0
+                    out["field_metadata"]["volume_change_24h"] = {
+                        "unit": "percent",
+                        "provider": "kline",
+                        "venue": price_data.get("exchange") or price_data.get("venue"),
+                        "product_type": price_data.get("market_type") or "spot",
+                    }
         except Exception:
             pass
 
@@ -1311,21 +1336,39 @@ class MarketDataCollector:
                 out["volume_24h"] = self._safe_num(coin.get("total_volume"))
                 if out["volume_24h"] is not None:
                     out["source"] = "coingecko"
+                    out["field_metadata"]["volume_24h"] = {
+                        "unit": "usd",
+                        "currency": "USD",
+                        "provider": "coingecko",
+                        "venue": "aggregate",
+                        "product_type": "spot",
+                    }
             if out["volume_change_24h"] is None:
                 market_cap = self._safe_num(coin.get("market_cap"))
                 total_volume = self._safe_num(coin.get("total_volume"))
                 if total_volume is not None and market_cap and market_cap > 0:
-                    out["volume_change_24h"] = (total_volume / market_cap) * 100.0
+                    # This is turnover, not a change through time.  Keeping it
+                    # separate prevents the scoring layer from interpreting a
+                    # 20% volume/market-cap ratio as +20% volume growth.
+                    out["volume_to_market_cap_pct"] = (total_volume / market_cap) * 100.0
                     out["source"] = "coingecko+proxy"
+                    out["field_metadata"]["volume_to_market_cap_pct"] = {
+                        "unit": "percent",
+                        "provider": "coingecko",
+                        "venue": "aggregate",
+                        "product_type": "spot",
+                    }
         return out
 
     def _get_crypto_derivatives_metrics(self, symbol: str) -> Dict[str, Any]:
         result = {
             "funding_rate": None,
+            "funding_rate_decimal": None,
             "open_interest": None,
             "open_interest_change_24h": None,
             "long_short_ratio": None,
             "source": "",
+            "field_metadata": {},
         }
 
         payload = self._coinglass_get("/api/futures/fundingRate/exchange-list", {"symbol": symbol}, ttl_sec=90)
@@ -1333,6 +1376,13 @@ class MarketDataCollector:
         result["funding_rate"] = self._pick_number(latest or payload, "oi_weighted_funding_rate", "funding_rate", "fundingRate")
         if result["funding_rate"] is not None:
             result["source"] = "coinglass"
+            result["funding_rate_decimal"] = result["funding_rate"] / 100.0
+            result["field_metadata"]["funding_rate"] = {
+                "unit": "percent",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
 
         payload = self._coinglass_get("/api/futures/open-interest/exchange-list", {"symbol": symbol}, ttl_sec=90)
         latest = self._pick_latest_item(payload)
@@ -1352,6 +1402,20 @@ class MarketDataCollector:
         )
         if result["open_interest"] is not None:
             result["source"] = "coinglass"
+            result["field_metadata"]["open_interest"] = {
+                "unit": "usd",
+                "currency": "USD",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
+        if result["open_interest_change_24h"] is not None:
+            result["field_metadata"]["open_interest_change_24h"] = {
+                "unit": "percent",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
 
         payload = self._coinglass_get(
             "/api/futures/global-long-short-account-ratio/history",
@@ -1367,6 +1431,12 @@ class MarketDataCollector:
         )
         if result["long_short_ratio"] is not None:
             result["source"] = "coinglass"
+            result["field_metadata"]["long_short_ratio"] = {
+                "unit": "ratio",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "perpetual",
+            }
 
         if result["funding_rate"] is None or result["open_interest"] is None or result["long_short_ratio"] is None:
             pair = f"{symbol}USDT"
@@ -1378,14 +1448,24 @@ class MarketDataCollector:
         cached = self._cache_get(cache_key)
         if isinstance(cached, dict):
             merged = dict(result)
+            filled_fields = set()
             for k, v in cached.items():
+                if k == "field_metadata":
+                    continue
                 if merged.get(k) is None and v is not None:
                     merged[k] = v
+                    filled_fields.add(k)
+            cached_metadata = cached.get("field_metadata") or {}
+            merged.setdefault("field_metadata", {}).update({
+                key: cached_metadata[key]
+                for key in filled_fields
+                if key in cached_metadata
+            })
             if any(merged.get(k) is not None for k in ("funding_rate", "open_interest", "long_short_ratio")) and not merged.get("source"):
                 merged["source"] = "binance_public"
             return merged
 
-        fallback = {}
+        fallback = {"field_metadata": {}}
         try:
             funding_resp = requests.get(
                 "https://fapi.binance.com/fapi/v1/fundingRate",
@@ -1395,7 +1475,17 @@ class MarketDataCollector:
             funding_resp.raise_for_status()
             items = funding_resp.json() or []
             if items:
-                fallback["funding_rate"] = self._safe_num(items[-1].get("fundingRate"))
+                decimal_rate = self._safe_num(items[-1].get("fundingRate"))
+                if decimal_rate is not None:
+                    fallback["funding_rate_decimal"] = decimal_rate
+                    fallback["funding_rate"] = decimal_rate * 100.0
+                    fallback["field_metadata"]["funding_rate"] = {
+                        "unit": "percent",
+                        "source_unit": "decimal",
+                        "provider": "binance_public",
+                        "venue": "binance",
+                        "product_type": "perpetual",
+                    }
         except Exception as e:
             logger.debug(f"Binance funding fallback failed for {pair}: {e}")
 
@@ -1410,11 +1500,24 @@ class MarketDataCollector:
             if items:
                 latest = items[-1]
                 fallback["open_interest"] = self._safe_num(latest.get("sumOpenInterestValue"))
+                fallback["field_metadata"]["open_interest"] = {
+                    "unit": "usd",
+                    "currency": "USD",
+                    "provider": "binance_public",
+                    "venue": "binance",
+                    "product_type": "perpetual",
+                }
                 if len(items) >= 2:
                     prev = self._safe_num(items[-2].get("sumOpenInterestValue"), 0.0) or 0.0
                     curr = self._safe_num(latest.get("sumOpenInterestValue"), 0.0) or 0.0
                     if prev > 0:
                         fallback["open_interest_change_24h"] = ((curr - prev) / prev) * 100.0
+                        fallback["field_metadata"]["open_interest_change_24h"] = {
+                            "unit": "percent",
+                            "provider": "binance_public",
+                            "venue": "binance",
+                            "product_type": "perpetual",
+                        }
         except Exception as e:
             logger.debug(f"Binance open interest fallback failed for {pair}: {e}")
 
@@ -1428,14 +1531,30 @@ class MarketDataCollector:
             items = ratio_resp.json() or []
             if items:
                 fallback["long_short_ratio"] = self._safe_num(items[-1].get("longShortRatio"))
+                fallback["field_metadata"]["long_short_ratio"] = {
+                    "unit": "ratio",
+                    "provider": "binance_public",
+                    "venue": "binance",
+                    "product_type": "perpetual",
+                }
         except Exception as e:
             logger.debug(f"Binance long/short fallback failed for {pair}: {e}")
 
         self._cache_set(cache_key, fallback, 120)
         merged = dict(result)
+        filled_fields = set()
         for k, v in fallback.items():
+            if k == "field_metadata":
+                continue
             if merged.get(k) is None and v is not None:
                 merged[k] = v
+                filled_fields.add(k)
+        fallback_metadata = fallback.get("field_metadata") or {}
+        merged.setdefault("field_metadata", {}).update({
+            key: fallback_metadata[key]
+            for key in filled_fields
+            if key in fallback_metadata
+        })
         if any(merged.get(k) is not None for k in ("funding_rate", "open_interest", "long_short_ratio")) and not merged.get("source"):
             merged["source"] = "binance_public"
         return merged
@@ -1445,6 +1564,7 @@ class MarketDataCollector:
             "exchange_netflow": None,
             "stablecoin_netflow": None,
             "source": "",
+            "field_metadata": {},
         }
 
         payload = self._coinglass_get("/api/futures/coin/netflow", {"symbol": symbol}, ttl_sec=180)
@@ -1458,6 +1578,14 @@ class MarketDataCollector:
             result["exchange_netflow"] = self._pick_number(latest or payload, "netflow", "netFlow", "net_flow")
             if result["exchange_netflow"] is not None:
                 result["source"] = "coinglass"
+        if result["exchange_netflow"] is not None:
+            result["field_metadata"]["exchange_netflow"] = {
+                "unit": "usd",
+                "currency": "USD",
+                "provider": "coinglass",
+                "venue": "aggregate",
+                "product_type": "spot",
+            }
 
         payload = self._cryptoquant_get(
             "/v1/stablecoin/exchange-flows/netflow",
@@ -1474,6 +1602,13 @@ class MarketDataCollector:
         )
         if result["stablecoin_netflow"] is not None:
             result["source"] = (result["source"] + "+cryptoquant").strip("+")
+            result["field_metadata"]["stablecoin_netflow"] = {
+                "unit": "usd",
+                "currency": "USD",
+                "provider": "cryptoquant",
+                "venue": "aggregate",
+                "product_type": "spot",
+            }
 
         return result
 
@@ -1874,10 +2009,16 @@ class MarketDataCollector:
             search_news = self._get_news_from_search(market, symbol, company_name)
             news_list.extend(search_news)
         
-        global_events = self._get_global_major_events()
-        if global_events:
-            news_list.extend(global_events)
-            logger.info(f"Added {len(global_events)} global major events to news list")
+        # Broad global headlines are disabled by default. They are useful as
+        # background context, but injecting them into every asset report made
+        # unrelated conflicts look like target-specific bearish evidence.
+        if os.getenv("FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS", "false").lower() == "true":
+            global_events = self._get_global_major_events()
+            for item in global_events:
+                item["asset_relevance"] = "background"
+            if global_events:
+                news_list.extend(global_events)
+                logger.info(f"Added {len(global_events)} background global events to news list")
         
         seen_titles = set()
         unique_news = []

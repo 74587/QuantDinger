@@ -40,6 +40,7 @@ ADVANCED_KEYS = {
     # AI tuning
     'OPENROUTER_TEMPERATURE',
     'AI_ANALYSIS_CONSENSUS_TIMEFRAMES', 'SEARCH_MAX_RESULTS',
+    'FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS',
     'SEARCH_GOOGLE_API_KEY', 'SEARCH_GOOGLE_CX', 'SEARCH_BING_API_KEY', 'SERPAPI_KEYS',
     'SEARCH_SEARXNG_ENGINES', 'SEARCH_SEARXNG_CATEGORIES', 'SEARCH_SEARXNG_LANGUAGE', 'SEARCH_SEARXNG_TIMEOUT',
     'GDELT_BASE_URL', 'GDELT_TIMEOUT', 'GDELT_MAX_RESULTS',
@@ -691,6 +692,31 @@ CONFIG_SCHEMA = {
         'icon': 'database',
         'order': 4,
         'items': [
+            {
+                'key': 'PROFESSIONAL_REPORT_DATA_TIER',
+                'label': 'Professional Report Data Tier',
+                'type': 'select',
+                'default': 'community',
+                'options': [
+                    {'value': 'community', 'label': 'Community / low-cost'},
+                    {'value': 'professional', 'label': 'Professional'},
+                ],
+                'description': 'Select the source tier declared in professional reports. Community remains the safe default and still uses every configured active fallback.'
+            },
+            {
+                'key': 'PROFESSIONAL_REPORT_RISK_BUDGET_PCT',
+                'label': 'Risk Budget per Trade (%)',
+                'type': 'number',
+                'default': '1.0',
+                'description': 'Account risk budget used to calculate the report position-size ceiling. This is not the target position percentage.'
+            },
+            {
+                'key': 'FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS',
+                'label': 'Include Broad Global Headlines',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Add broad global-event headlines to each asset report. Keep disabled unless this background context is explicitly needed.'
+            },
             {
                 'key': 'CCXT_DEFAULT_EXCHANGE',
                 'label': 'Default Crypto Exchange',
@@ -1719,13 +1745,6 @@ CONFIG_SCHEMA = {
                 'description': 'Credits per AI strategy/indicator code generation (higher token usage)'
             },
             {
-                'key': 'BILLING_COST_AI_INDICATOR_TO_STRATEGY',
-                'label': 'AI Indicator-to-Strategy Cost',
-                'type': 'number',
-                'default': '30',
-                'description': 'Credits per AI conversion from a chart-only indicator into an executable script strategy'
-            },
-            {
                 'key': 'BILLING_COST_AI_COPILOT_CHAT',
                 'label': 'AI Copilot Chat Cost',
                 'type': 'number',
@@ -1738,13 +1757,6 @@ CONFIG_SCHEMA = {
                 'type': 'number',
                 'default': '15',
                 'description': 'Extra credits charged when a Copilot message includes chart images'
-            },
-            {
-                'key': 'BILLING_COST_AI_COPILOT_RADAR',
-                'label': 'AI Copilot Radar Cost',
-                'type': 'number',
-                'default': '20',
-                'description': 'Credits per AI opportunity radar / market scan request'
             },
             {
                 'key': 'MARKETPLACE_PLATFORM_FEE_RATE',

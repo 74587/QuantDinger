@@ -1,6 +1,28 @@
 import pytest
 
-from app.services.ai_report_pdf import _report_pdf_labels, build_ai_report_pdf
+from app.services.ai_report_pdf import _professional_pdf_projection, _report_pdf_labels, build_ai_report_pdf
+
+
+def test_professional_report_v1_is_projected_for_pdf_without_legacy_input():
+    projection = _professional_pdf_projection({
+        "schema_version": "professional_report_v1",
+        "instrument": {"market": "HKStock", "symbol": "00700", "canonical_symbol": "00700"},
+        "decision_profile": {"decision": "HOLD", "confidence": 35},
+        "executive_summary": "数据质量不足，保持观望。",
+        "risk_plan": {"net_risk_reward": None, "warnings": ["no_directional_position"]},
+        "dimensions": [{"key": "technical", "score": 42, "narrative": "趋势偏弱"}],
+        "claims": [{"kind": "risk", "text": "关键数据缺失"}],
+        "scenarios": [],
+        "evidence_snapshot": {
+            "observations": [{"metric": "quote.price", "value": 438.4, "source": "provider", "as_of": "2026-09-07T00:00:00Z"}],
+        },
+    })
+
+    assert projection["market"] == "HKStock"
+    assert projection["symbol"] == "00700"
+    assert projection["market_data"]["current_price"] == 438.4
+    assert projection["detailed_analysis"]["technical"] == "趋势偏弱"
+    assert projection["risks"] == ["关键数据缺失"]
 
 
 SUPPORTED_LANGUAGES = (
