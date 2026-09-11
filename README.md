@@ -71,10 +71,10 @@
 ## Watch QuantDinger in action
 
 <p align="center">
-  <img src="docs/screenshots/quantdinger-v5-3x.gif" alt="QuantDinger product demo at 3× speed" width="800">
+  <img src="docs/screenshots/quantdinger-v5-2x.gif" alt="QuantDinger product demo at 2× speed" width="800">
 </p>
 
-<p align="center"><sub>Full product demo · 3× speed · looping GIF · no audio</sub></p>
+<p align="center"><sub>Full product demo · 2× speed · looping GIF · no audio</sub></p>
 
 ## What QuantDinger is
 
