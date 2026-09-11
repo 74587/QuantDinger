@@ -236,15 +236,21 @@ class GateSpotClient(_GateBase):
         oid = str(raw.get("id") or "") if isinstance(raw, dict) else ""
         return LiveOrderResult(exchange_id="gate", exchange_order_id=oid, filled=0.0, avg_price=0.0, raw=raw if isinstance(raw, dict) else {"raw": raw})
 
-    def cancel_order(self, *, order_id: str) -> Any:
+    def cancel_order(self, *, order_id: str, symbol: str) -> Any:
         if not order_id:
             raise LiveTradingError("Gate spot cancel_order requires order_id")
-        return self._signed_request("DELETE", f"/api/v4/spot/orders/{str(order_id)}")
+        if not str(symbol or "").strip():
+            raise LiveTradingError("Gate spot cancel_order requires symbol")
+        return self._signed_request("DELETE", f"/api/v4/spot/orders/{str(order_id)}",
+                                    params={"currency_pair": to_gate_currency_pair(symbol)})
 
-    def get_order(self, *, order_id: str) -> Any:
+    def get_order(self, *, order_id: str, symbol: str) -> Any:
         if not order_id:
             raise LiveTradingError("Gate spot get_order requires order_id")
-        return self._signed_request("GET", f"/api/v4/spot/orders/{str(order_id)}")
+        if not str(symbol or "").strip():
+            raise LiveTradingError("Gate spot get_order requires symbol")
+        return self._signed_request("GET", f"/api/v4/spot/orders/{str(order_id)}",
+                                    params={"currency_pair": to_gate_currency_pair(symbol)})
 
     def get_spot_trades_for_order(self, *, order_id: str, currency_pair: str) -> Tuple[float, str]:
         """Aggregate the actual fee from Gate spot fill history for a given order.
@@ -283,13 +289,13 @@ class GateSpotClient(_GateBase):
                     ccy = str(t.get("fee_currency") or "").strip()
         return total, ccy
 
-    def wait_for_fill(self, *, order_id: str, max_wait_sec: float = 10.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
+    def wait_for_fill(self, *, order_id: str, symbol: str, max_wait_sec: float = 10.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         while True:
             timed_out = time.time() >= end_ts
             try:
-                resp = self.get_order(order_id=str(order_id))
+                resp = self.get_order(order_id=str(order_id), symbol=symbol)
                 last = resp if isinstance(resp, dict) else {"raw": resp}
             except Exception:
                 last = last or {}

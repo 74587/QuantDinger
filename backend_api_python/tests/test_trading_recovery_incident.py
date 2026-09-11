@@ -182,7 +182,8 @@ def test_gate_grid_cancel_uses_native_signature(client_class, path):
     client = client_class.__new__(client_class)
     client._signed_request = Mock(return_value={'id': '28201'})
     cancel_grid_order(client, symbol='BTC/USDT', market_type='spot', exchange_order_id='28201', client_order_id='grid-168-1')
-    client._signed_request.assert_called_once_with('DELETE', path)
+    expected = {'params': {'currency_pair': 'BTC_USDT'}} if client_class is GateSpotClient else {}
+    client._signed_request.assert_called_once_with('DELETE', path, **expected)
 
 
 def test_gate_cancel_without_confirmed_order_id_is_not_reported_successful():

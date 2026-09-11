@@ -7,6 +7,7 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from app.services.execution_streams.events import ExecutionEvent
+from app.services.exchange_execution import coalesce_exchange_config_from_payload
 from app.utils.db import get_db_connection
 
 
@@ -274,19 +275,23 @@ class ExecutionEventRepository:
                 cur.execute(
                     """
                     SELECT gro.*, 'grid' AS owner_type, gro.id AS owner_id,
-                           st.user_id, st.credential_id, st.market_type,
-                           COALESCE(st.exchange_config->>'exchange_id', '') AS exchange_id
+                           st.user_id, st.market_type,
+                           to_jsonb(st)->>'credential_id' AS credential_id,
+                           st.exchange_config::text AS exchange_config,
+                           st.trading_config::text AS trading_config
                     FROM qd_grid_resting_orders gro
                     JOIN qd_strategies_trading st ON st.id = gro.strategy_id
                     WHERE (
                         (%s <> '' AND gro.exchange_order_id = %s)
                         OR (%s <> '' AND gro.client_order_id = %s)
                     )
-                    ORDER BY gro.id DESC LIMIT 1
+                    ORDER BY gro.id DESC
                     """,
                     (exchange_order_id, exchange_order_id, client_order_id, client_order_id),
                 )
-                row = cur.fetchone()
+                candidates = cur.fetchall() or []
+                row = next((binding for candidate in candidates
+                            if (binding := self._matching_grid_binding(candidate, event)) is not None), None)
             cur.close()
         if not row:
             return None
@@ -309,6 +314,35 @@ class ExecutionEventRepository:
             observed_filled=float(data.get("filled") or data.get("processed_fill_qty") or 0.0),
         )
         return self.resolve_binding(event)
+
+    @staticmethod
+    def _matching_grid_binding(candidate, event):
+        data = dict(candidate)
+        for key in ("exchange_config", "trading_config"):
+            raw = data.get(key)
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (ValueError, TypeError):
+                    return None
+            data[key] = raw if isinstance(raw, dict) else {}
+        config = coalesce_exchange_config_from_payload(data)
+        try:
+            credential_id = int(config.get("credential_id") or config.get("credentials_id") or 0)
+        except (ValueError, TypeError):
+            return None
+        exchange_id = str(config.get("exchange_id") or config.get("exchangeId") or config.get("exchange") or "").lower()
+        market_type = str(data.get("trading_config", {}).get("market_type") or data.get("market_type") or "").lower()
+        if credential_id <= 0 or credential_id != int(event.get("credential_id") or 0):
+            return None
+        if exchange_id != str(event.get("exchange_id") or "").lower():
+            return None
+        if event.get("market_type") and market_type != str(event["market_type"]).lower():
+            return None
+        if event.get("user_id") and int(data.get("user_id") or 0) != int(event["user_id"]):
+            return None
+        data.update(credential_id=credential_id, exchange_id=exchange_id, market_type=market_type)
+        return data
 
     def mark_processed(self, event_id: int) -> None:
         with get_db_connection() as db:

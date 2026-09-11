@@ -164,8 +164,7 @@ class PrivateWebSocketAdapter:
         if interval <= 0:
             return
         while not self._stop.is_set() and not connection_stop.wait(interval):
-            if time.monotonic() - self._last_message_at < interval:
-                continue
+            # Incoming frames must not defer a 20-second ping to the 40-second tick.
             payload = self.application_heartbeat_payload()
             if payload is None:
                 return
@@ -283,9 +282,7 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
         self._subscription_request_id = ""
 
     def _uses_spot_ws_api(self) -> bool:
-        return self.market_type == "spot" and exchange_trading_environment(
-            self.config, "binance"
-        ) != "live"
+        return self.market_type == "spot"
 
     def ready_on_open(self) -> bool:
         return not self._uses_spot_ws_api()
@@ -324,16 +321,10 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
             return
         api_key = str(self.config.get("api_key") or self.config.get("apiKey") or "")
         environment = exchange_trading_environment(self.config, "binance")
-        if self.market_type == "spot":
-            base = "https://demo-api.binance.com" if environment != "live" else str(
-                self.config.get("base_url") or "https://api.binance.com"
-            )
-            path = "/api/v3/userDataStream"
-        else:
-            base = "https://demo-fapi.binance.com" if environment != "live" else str(
-                self.config.get("base_url") or "https://fapi.binance.com"
-            )
-            path = "/fapi/v1/listenKey"
+        base = "https://demo-fapi.binance.com" if environment != "live" else str(
+            self.config.get("base_url") or "https://fapi.binance.com"
+        )
+        path = "/fapi/v1/listenKey"
         self._listen_key_base = base.rstrip("/")
         self._listen_key_path = path
         response = requests.post(
@@ -360,7 +351,7 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
                 api_key = str(self.config.get("api_key") or self.config.get("apiKey") or "")
                 response = requests.put(
                     f"{self._listen_key_base}{self._listen_key_path}",
-                    params={"listenKey": self._listen_key} if self.market_type == "spot" else None,
+                    params=None,
                     headers={"X-MBX-APIKEY": api_key, "Connection": "close"},
                     timeout=15,
                     verify=_get_requests_verify(),
@@ -374,11 +365,10 @@ class BinanceExecutionAdapter(PrivateWebSocketAdapter):
         if self._uses_spot_ws_api():
             if environment == "testnet":
                 return "wss://ws-api.testnet.binance.vision/ws-api/v3"
-            return "wss://demo-ws-api.binance.com/ws-api/v3"
-        if self.market_type == "spot":
-            host = "wss://demo-stream.binance.com/ws" if environment != "live" else "wss://stream.binance.com:9443/ws"
-        else:
-            host = "wss://fstream.binancefuture.com/ws" if environment != "live" else "wss://fstream.binance.com/ws"
+            if environment == "demo":
+                return "wss://demo-ws-api.binance.com/ws-api/v3"
+            return "wss://ws-api.binance.com:443/ws-api/v3"
+        host = "wss://fstream.binancefuture.com/ws" if environment != "live" else "wss://fstream.binance.com/ws"
         return f"{host}/{self._listen_key}"
 
     def handle_control(self, ws: Any, payload: Dict[str, Any]) -> bool:

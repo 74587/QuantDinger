@@ -205,7 +205,7 @@ def wait_live_order_fill(
     if isinstance(client, BybitClient):
         return client.wait_for_fill(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id, max_wait_sec=wait_sec)
     if isinstance(client, GateSpotClient):
-        return client.wait_for_fill(order_id=order_id, max_wait_sec=wait_sec)
+        return client.wait_for_fill(order_id=order_id, symbol=str(symbol), max_wait_sec=wait_sec)
     if isinstance(client, GateUsdtFuturesClient):
         return client.wait_for_fill(order_id=order_id, contract=to_gate_currency_pair(str(symbol)), max_wait_sec=wait_sec)
     if isinstance(client, HtxClient):
@@ -233,11 +233,11 @@ def cancel_live_limit_order(
         margin_coin = str(exchange_config.get("margin_coin") or exchange_config.get("marginCoin") or "USDT")
         return client.cancel_order(symbol=str(symbol), product_type=product_type, margin_coin=margin_coin, order_id=order_id, client_oid=client_order_id)
     if isinstance(client, BitgetSpotClient):
-        return client.cancel_order(symbol=str(symbol), client_order_id=client_order_id)
+        return client.cancel_order(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id)
     if isinstance(client, BybitClient):
         return client.cancel_order(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id)
     if isinstance(client, GateSpotClient):
-        return client.cancel_order(order_id=order_id)
+        return client.cancel_order(order_id=order_id, symbol=str(symbol))
     if isinstance(client, GateUsdtFuturesClient):
         return client.cancel_order(order_id=order_id)
     if isinstance(client, HtxClient):

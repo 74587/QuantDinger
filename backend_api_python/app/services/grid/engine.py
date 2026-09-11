@@ -1157,6 +1157,9 @@ class GridEngine:
                 client_order_id=order.client_order_id,
                 exchange_config=self.exchange_config,
             )
+        except Exception as exc:
+            logger.warning("grid cancel request unconfirmed sid=%s oid=%s: %s", self.strategy_id, order.id, exc)
+        try:
             filled, _, status = query_grid_order_fill(
                 client,
                 symbol=self.symbol,

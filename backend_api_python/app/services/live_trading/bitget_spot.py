@@ -502,11 +502,15 @@ class BitgetSpotClient(BaseRestClient):
         order_id = str(data.get("orderId") or "") if isinstance(data, dict) else ""
         return LiveOrderResult(exchange_id="bitget", exchange_order_id=order_id, filled=0.0, avg_price=0.0, raw=raw)
 
-    def cancel_order(self, *, symbol: str, client_order_id: str) -> Dict[str, Any]:
+    def cancel_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:
         sym = to_bitget_um_symbol(symbol)
-        if not client_order_id:
-            raise LiveTradingError("BitgetSpot cancel_order requires client_order_id")
-        body = {"symbol": sym, "clientOid": str(client_order_id)}
+        body = {"symbol": sym}
+        if order_id:
+            body["orderId"] = str(order_id)
+        elif client_order_id:
+            body["clientOid"] = str(client_order_id)
+        else:
+            raise LiveTradingError("BitgetSpot cancel_order requires order_id or client_order_id")
         return self._signed_request("POST", "/api/v2/spot/trade/cancel-order", json_body=body)
 
     def get_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:

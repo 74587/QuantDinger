@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import pytest
@@ -127,12 +128,19 @@ def test_application_heartbeat_sends_venue_payload(adapter_cls, expected):
     assert ws.messages == [expected]
 
 
-def test_binance_demo_spot_uses_signed_websocket_api_subscription(monkeypatch):
+@pytest.mark.parametrize(("environment", "expected_url"), (
+    ("live", "wss://ws-api.binance.com:443/ws-api/v3"),
+    ("demo", "wss://demo-ws-api.binance.com/ws-api/v3"),
+    ("testnet", "wss://ws-api.testnet.binance.vision/ws-api/v3"),
+))
+def test_binance_spot_uses_signed_websocket_api_subscription(monkeypatch, environment, expected_url):
     monkeypatch.setattr("app.services.execution_streams.adapters.time.time", lambda: 1_700_000_000.125)
+    monkeypatch.setattr("app.services.execution_streams.adapters.requests.post", lambda *a, **kw: pytest.fail("Spot must not request a listenKey"))
     adapter, states = _adapter(BinanceExecutionAdapter, market_type="spot")
+    adapter.config["environment"] = environment
 
     assert adapter.ready_on_open() is False
-    assert adapter.url() == "wss://demo-ws-api.binance.com/ws-api/v3"
+    assert adapter.url() == expected_url
     adapter.prepare()  # Must not call the retired REST listenKey endpoint.
     request = adapter.on_open_messages()[0]
     assert request["method"] == "userDataStream.subscribe.signature"
@@ -152,6 +160,27 @@ def test_binance_demo_spot_uses_signed_websocket_api_subscription(monkeypatch):
     )
     assert adapter.connected
     assert states == ["connected"]
+
+
+@pytest.mark.parametrize(("environment", "rest_host", "ws_host"), (
+    ("live", "https://fapi.binance.com", "wss://fstream.binance.com/ws"),
+    ("demo", "https://demo-fapi.binance.com", "wss://fstream.binancefuture.com/ws"),
+))
+def test_binance_futures_retains_listen_key_subscription(monkeypatch, environment, rest_host, ws_host):
+    adapter, _states = _adapter(BinanceExecutionAdapter)
+    adapter.config["environment"] = environment
+    calls = []
+    response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"listenKey": "stream-key"})
+    monkeypatch.setattr("app.services.execution_streams.adapters.requests.post", lambda url, **kw: calls.append((url, kw)) or response)
+    adapter._keepalive_thread = SimpleNamespace(is_alive=lambda: True)
+
+    adapter.prepare()
+
+    assert calls[0][0] == rest_host + "/fapi/v1/listenKey"
+    assert calls[0][1]["headers"]["X-MBX-APIKEY"] == "key"
+    assert adapter.url() == ws_host + "/stream-key"
+    assert adapter.ready_on_open()
+    assert adapter.on_open_messages() == []
 
 
 def test_binance_websocket_api_event_envelope_is_unwrapped():

@@ -38,7 +38,7 @@ def enrich_fill(
                 max_wait_sec=max_wait_sec,
             )
         elif isinstance(client, GateSpotClient):
-            fill_result = client.wait_for_fill(order_id=oid, max_wait_sec=max_wait_sec)
+            fill_result = client.wait_for_fill(order_id=oid, symbol=sym, max_wait_sec=max_wait_sec)
         elif isinstance(client, GateUsdtFuturesClient):
             fill_result = client.wait_for_fill(
                 order_id=oid,
