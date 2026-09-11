@@ -241,6 +241,8 @@ def get_positions():
                 from app.services.live_trading.leg_context import credential_id_from_exchange_config
 
                 resolved_ex = resolve_exchange_config(exchange_config, user_id=int(user_id or 1))
+                if str(resolved_ex.get("exchange_id") or "").lower() == "alpaca":
+                    market_type = "spot"
                 cred_id = int(
                     credential_id_from_exchange_config(resolved_ex)
                     or credential_id_from_exchange_config(exchange_config)
@@ -274,6 +276,7 @@ def get_positions():
                     credential_id=cred_id,
                     market_type=market_type,
                     allowed_symbols=allowed,
+                    exchange_id=str(resolved_ex.get("exchange_id") or ""),
                 )
                 from app.services.live_trading.position_ownership import (
                     build_ownership_rows,

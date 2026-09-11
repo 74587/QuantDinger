@@ -178,6 +178,8 @@ class PendingOrderPositionSyncMixin:
                 market_type = str(market_type or "swap").strip().lower()
                 if market_type in ("futures", "future", "perp", "perpetual"):
                     market_type = "swap"
+                if exchange_id == "alpaca":
+                    market_type = "spot"
 
                 # Get strategy's trading symbol(s) to filter positions
                 # Only sync positions for symbols that this strategy actually trades
@@ -502,7 +504,7 @@ class PendingOrderPositionSyncMixin:
                         # "BTC/USD" is the same format the strategy stores, so no extra
                         # normalization is needed here.
                         try:
-                            positions = client.get_positions() or []
+                            positions = client.get_positions(raise_on_error=True)
                         except Exception as e:
                             if is_file_descriptor_exhausted(e):
                                 set_exchange_sync_backoff(cache_key, seconds=_position_sync_fd_backoff_sec())

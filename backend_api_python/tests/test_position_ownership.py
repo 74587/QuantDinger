@@ -35,12 +35,12 @@ def test_crypto_spot_and_derivative_markets_support_position_coexistence(market_
 
 def test_non_crypto_market_rejects_advanced_position_coexistence():
     assert supports_position_coexistence("USStock") is False
-    assert supports_position_coexistence("spot", "alpaca") is False
+    assert supports_position_coexistence("spot", "ibkr") is False
     with pytest.raises(ValueError, match="positionOwnership.coexistenceMarketUnsupported"):
         repair_position_ownership(
             user_id=1,
             credential_id=2,
-            exchange_id="alpaca",
+            exchange_id="ibkr",
             market_type="USStock",
             symbol="AAPL",
             side="long",

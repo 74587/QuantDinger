@@ -6,6 +6,7 @@ Used by broker-accounts UI (not strategy L3 ledger).
 from __future__ import annotations
 
 import time
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.exchange_execution import resolve_exchange_config
@@ -642,6 +643,8 @@ def _fetch_alpaca_snapshot(exchange_config: Dict[str, Any], errors: List[str]) -
     try:
         for item in client.get_positions(raise_on_error=True):
             quantity = float(item.get("qty") or item.get("quantity") or 0)
+            if not math.isfinite(quantity):
+                raise ValueError("invalid_position_quantity")
             if not quantity:
                 continue
             positions.append({

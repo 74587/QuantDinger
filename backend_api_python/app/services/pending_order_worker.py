@@ -1248,6 +1248,9 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                     FROM pending_orders
                     WHERE status = 'pending'
                       AND (attempts < max_attempts)
+                      AND (COALESCE(last_error, '') NOT IN
+                           ('positionOwnership.accountBusy', 'positionOwnership.ordersPending')
+                           OR updated_at < NOW() - INTERVAL '5 seconds')
                     ORDER BY priority DESC, id ASC
                     LIMIT %s
                     """,
@@ -2546,7 +2549,38 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             if is_fatal_exchange_error(str(e)):
                 auto_stop_live_strategy(int(strategy_id), str(e), source="ibkr_order")
 
-    def _execute_alpaca_order(
+    def _execute_alpaca_order(self, **kwargs) -> None:
+        from app.services.live_trading.alpaca_ownership import alpaca_account_lock, guarded_alpaca_quantity
+        from app.services.live_trading.records import _get_user_id_from_strategy
+
+        order_id = int(kwargs["order_id"])
+        credential_id = credential_id_from_exchange_config(kwargs["exchange_config"])
+        try:
+            with alpaca_account_lock(credential_id):
+                payload = dict(kwargs["payload"])
+                row = kwargs["order_row"]
+                payload["amount"] = guarded_alpaca_quantity(
+                    client=kwargs["client"], strategy_id=kwargs["strategy_id"],
+                    user_id=_get_user_id_from_strategy(kwargs["strategy_id"]),
+                    credential_id=credential_id,
+                    symbol=payload.get("symbol") or row.get("symbol"),
+                    signal_type=payload.get("signal_type") or row.get("signal_type"),
+                    amount=payload.get("amount") or row.get("amount") or 0,
+                    order_id=order_id,
+                )
+                self._execute_alpaca_order_locked(**{**kwargs, "payload": payload})
+        except Exception as exc:
+            reason = str(exc)
+            if reason in {"positionOwnership.accountBusy", "positionOwnership.ordersPending"}:
+                self._mark_deferred(order_id, reason)
+            else:
+                if not reason.startswith("positionOwnership."):
+                    logger.exception("Alpaca ownership check failed: pending_id=%s", order_id)
+                    reason = "positionOwnership.snapshotUnavailable"
+                self._mark_failed(order_id=order_id, error=reason)
+                kwargs["_notify_live_best_effort"](status="failed", error=reason)
+
+    def _execute_alpaca_order_locked(
         self,
         *,
         order_id: int,
@@ -2906,12 +2940,21 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             cur.execute(
                 """
                 UPDATE pending_orders
-                SET status = 'deferred',
+                SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
                     last_error = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
                 (str(reason or "deferred"), int(order_id)),
+            )
+            cur.execute(
+                """
+                UPDATE strategy_order_intents soi
+                SET status = 'rejected', updated_at = NOW()
+                FROM pending_orders po
+                WHERE po.id = %s AND po.order_intent_id = soi.id AND po.status = 'failed'
+                """,
+                (int(order_id),),
             )
             db.commit()
             cur.close()

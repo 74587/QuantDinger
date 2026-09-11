@@ -332,11 +332,16 @@ def list_strategy_allocations_for_account(
     credential_id: int,
     market_type: str,
     allowed_symbols: Optional[set] = None,
+    exchange_id: str = "",
 ) -> List[Dict[str, Any]]:
     """List all strategy-owned legs for one credential and market."""
     mt = str(market_type or "swap").strip().lower()
     if mt in ("future", "futures", "perp", "perpetual"):
         mt = "swap"
+    market_types = [mt]
+    if str(exchange_id).lower() == "alpaca":
+        # Historical Alpaca fills used asset classes instead of the spot bucket.
+        market_types = ["spot", "usstock", "crypto"]
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
@@ -345,10 +350,13 @@ def list_strategy_allocations_for_account(
             FROM qd_strategy_positions p
             JOIN qd_strategies_trading s ON s.id = p.strategy_id
             WHERE s.user_id = %s AND s.execution_mode = 'live'
-              AND p.market_type = %s AND p.size > 0
-              AND (p.credential_id = %s OR %s = 0)
+              AND LOWER(p.market_type) = ANY(%s) AND p.size > 0
+              AND (p.credential_id = %s OR %s = 0
+                   OR (COALESCE(p.credential_id, 0) = 0
+                       AND COALESCE(NULLIF(s.exchange_config::jsonb->>'credential_id', ''),
+                                    s.exchange_config::jsonb->>'credentials_id') = %s))
             """,
-            (int(user_id), mt, int(credential_id or 0), int(credential_id or 0)),
+            (int(user_id), market_types, int(credential_id or 0), int(credential_id or 0), str(credential_id or 0)),
         )
         rows = [dict(row) for row in (cur.fetchall() or [])]
         cur.close()

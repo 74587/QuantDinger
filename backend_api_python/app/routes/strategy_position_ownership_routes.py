@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Tuple
+from contextlib import contextmanager
 
 from flask import g, jsonify, request
 
@@ -35,6 +36,8 @@ def _ownership_context(strategy_id: int, user_id: int) -> Tuple[Dict[str, Any], 
     market_type = normalize_market_type(
         str(trading.get("market_type") or strategy.get("market_type") or resolved.get("market_type") or "swap")
     )
+    if str(resolved.get("exchange_id") or "").lower() == "alpaca":
+        market_type = "spot"
     allowed = strategy_allowed_symbols({"symbol": strategy.get("symbol"), "trading_config": trading})
     return strategy, resolved, credential_id, market_type, allowed
 
@@ -52,6 +55,7 @@ def _load_ownership_rows(strategy_id: int, user_id: int, *, fresh: bool = False)
     )
     from app.services.live_trading.strategy_position_sync import sync_strategy_positions_from_exchange
 
+    snapshot = {}
     if fresh and str(strategy.get("execution_mode") or "").lower() == "live":
         from app.services.live_trading.account_snapshot import fetch_account_snapshot
         from app.services.live_trading.account_positions import snapshot_rows_to_account_legs
@@ -70,6 +74,7 @@ def _load_ownership_rows(strategy_id: int, user_id: int, *, fresh: bool = False)
     allocated_rows = list_strategy_allocations_for_account(
         user_id=int(user_id), credential_id=credential_id, market_type=market_type,
         allowed_symbols=allowed,
+        exchange_id=str(resolved.get("exchange_id") or ""),
     )
     allowed_canonical = {canonical_symbol(symbol) for symbol in allowed}
     if allowed_canonical:
@@ -96,7 +101,20 @@ def _load_ownership_rows(strategy_id: int, user_id: int, *, fresh: bool = False)
         "credential_id": credential_id,
         "market_type": market_type,
         "allowed": allowed_canonical,
+        "open_orders": snapshot.get("open_orders") or [],
     }
+
+
+@contextmanager
+def _repair_guard(strategy_id, user_id, symbol):
+    _strategy, resolved, credential_id, _market, _allowed = _ownership_context(strategy_id, user_id)
+    if str(resolved.get("exchange_id") or "").lower() != "alpaca":
+        yield
+        return
+    from app.services.live_trading.alpaca_ownership import alpaca_account_lock, ensure_alpaca_settled
+    with alpaca_account_lock(credential_id):
+        ensure_alpaca_settled(user_id=user_id, credential_id=credential_id, symbol=symbol)
+        yield
 
 
 @strategy_blp.route('/strategies/position-ownership', methods=['GET'])
@@ -118,6 +136,7 @@ def get_position_ownership():
                 "status": status,
                 "market_type": context["market_type"],
                 "credential_id": context["credential_id"],
+                "exchange_id": str(context["exchange"].get("exchange_id") or ""),
                 "advanced_coexistence_available": supports_position_coexistence(
                     context["market_type"],
                     str(context["exchange"].get("exchange_id") or ""),
@@ -147,34 +166,41 @@ def repair_position_ownership_route():
     if not strategy_id or not symbol or side not in {"long", "short"}:
         return jsonify({"code": 0, "msg": "positionOwnership.invalidRepairRequest", "data": None}), 400
     try:
-        rows, context = _load_ownership_rows(strategy_id, int(g.user_id), fresh=True)
-        from app.services.live_trading.position_ownership import canonical_symbol, repair_position_ownership
+        with _repair_guard(strategy_id, int(g.user_id), symbol):
+            rows, context = _load_ownership_rows(strategy_id, int(g.user_id), fresh=True)
+            from app.services.live_trading.position_ownership import canonical_symbol, repair_position_ownership
 
-        wanted = canonical_symbol(symbol)
-        if context["allowed"] and wanted not in context["allowed"]:
-            return jsonify({"code": 0, "msg": "positionOwnership.symbolNotOwned", "data": None}), 409
-        current = next(
-            (row for row in rows if canonical_symbol(row.get("symbol") or "") == wanted and row.get("side") == side),
-            None,
-        ) or {"account_qty": 0.0, "strategy_qty": 0.0, "inst_id": ""}
-        result = repair_position_ownership(
-            user_id=int(g.user_id),
-            credential_id=int(context["credential_id"] or 0),
-            exchange_id=str(context["exchange"].get("exchange_id") or ""),
-            market_type=str(context["market_type"]),
-            symbol=wanted,
-            side=side,
-            account_qty=float(current.get("account_qty") or 0.0),
-            strategy_qty=float(current.get("strategy_qty") or 0.0),
-            action=action,
-            inst_id=str(current.get("inst_id") or ""),
-            reference_price=float(current.get("reference_price") or 0.0),
-        )
-        return jsonify({"code": 1, "msg": "success", "data": result.metadata()})
+            wanted = canonical_symbol(symbol)
+            if str(context["exchange"].get("exchange_id") or "").lower() == "alpaca":
+                orders = context.get("open_orders") or []
+                if len(orders) >= 500 or any(canonical_symbol(row.get("symbol")) == wanted for row in orders):
+                    raise ValueError("positionOwnership.ordersPending")
+            if context["allowed"] and wanted not in context["allowed"]:
+                return jsonify({"code": 0, "msg": "positionOwnership.symbolNotOwned", "data": None}), 409
+            current = next(
+                (row for row in rows if canonical_symbol(row.get("symbol") or "") == wanted and row.get("side") == side),
+                None,
+            ) or {"account_qty": 0.0, "strategy_qty": 0.0, "inst_id": ""}
+            result = repair_position_ownership(
+                user_id=int(g.user_id),
+                credential_id=int(context["credential_id"] or 0),
+                exchange_id=str(context["exchange"].get("exchange_id") or ""),
+                market_type=str(context["market_type"]),
+                symbol=wanted,
+                side=side,
+                account_qty=float(current.get("account_qty") or 0.0),
+                strategy_qty=float(current.get("strategy_qty") or 0.0),
+                action=action,
+                inst_id=str(current.get("inst_id") or ""),
+                reference_price=float(current.get("reference_price") or 0.0),
+            )
+            return jsonify({"code": 1, "msg": "success", "data": result.metadata()})
     except LookupError:
         return jsonify({"code": 0, "msg": "strategyV2.strategyNotFound", "data": None}), 404
     except ValueError as exc:
         known = {
+            "positionOwnership.accountBusy",
+            "positionOwnership.ordersPending",
             "positionOwnership.accountBelowStrategyAllocation",
             "positionOwnership.coexistenceMarketUnsupported",
             "positionOwnership.invalidRepairAction",

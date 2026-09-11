@@ -56,11 +56,13 @@ def normalize_market_type(value: str) -> str:
 
 
 def supports_position_coexistence(value: str, exchange_id: str = "") -> bool:
-    """Return whether account/strategy inventory can share one Crypto market leg."""
+    """Return whether execution enforces protected inventory for this venue."""
     market = normalize_market_type(value)
+    exchange = str(exchange_id or "").strip().lower()
+    if exchange == "alpaca":
+        return market in {"spot", "usstock", "crypto"}
     if market not in COEXISTENCE_MARKET_TYPES:
         return False
-    exchange = str(exchange_id or "").strip().lower()
     return market == "swap" or not exchange or exchange in CRYPTO_COEXISTENCE_EXCHANGES
 
 
@@ -336,6 +338,10 @@ def repair_position_ownership(
     reference_price: float = 0.0,
 ) -> OwnershipSnapshot:
     """Apply an explicit user repair action and return the resulting snapshot."""
+    if not all(math.isfinite(float(value or 0)) for value in (account_qty, strategy_qty, reference_price)):
+        raise ValueError("positionOwnership.snapshotUnavailable")
+    if str(exchange_id or "").lower() == "alpaca":
+        market_type = "spot"
     action_name = str(action or "").strip().lower()
     if action_name not in {"protect_manual", "reset_protection", "strict_mode", "recheck"}:
         raise ValueError("positionOwnership.invalidRepairAction")
