@@ -1,6 +1,6 @@
 # Release quantdinger-mcp to PyPI
 
-## Unreleased
+## This release: 0.6.2
 
 Disable inferred output schemas for heterogeneous gateway responses. On Python
 3.10, FastMCP inferred an `Any` return as a required `result` wrapper and rejected
@@ -9,7 +9,7 @@ retain `isError=true`, redacted text, and structured details; successful respons
 remain unwrapped JSON text. CI now completes every Python matrix job even when
 one version fails, and regression tests cover both tool schemas and success payloads.
 
-## This release: 0.6.1
+## Previous release: 0.6.1
 
 Health probes now report MCP protocol errors for HTTP failures, timeouts, connection failures, and malformed or unsuccessful health responses. Error details still pass through the redaction contract. The accompanying backend patch fixes idempotency row counts, Alpaca account snapshots, and best-effort futures quotes; deploying the MCP package alone does not update the backend.
 
@@ -46,10 +46,10 @@ py -3.13 -m build
 # 5. Upload (you run this -- needs your PyPI token)
 $env:TWINE_USERNAME = "__token__"
 $env:TWINE_PASSWORD = "pypi-Ag..."   # your API token
-py -3.13 -m twine upload dist/quantdinger_mcp-0.6.1*
+py -3.13 -m twine upload dist/quantdinger_mcp-0.6.2*
 
 # 6. Verify
-pip install --upgrade "quantdinger-mcp==0.6.1"
+pip install --upgrade "quantdinger-mcp==0.6.2"
 quantdinger-mcp
 ```
 
@@ -61,11 +61,11 @@ pip install -e ".[dev]"
 python -m pytest tests/ -q
 rm -rf dist build src/*.egg-info
 python -m build
-TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-... python -m twine upload dist/quantdinger_mcp-0.6.0*
+TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-... python -m twine upload dist/quantdinger_mcp-0.6.2*
 ```
 
 ## Notes
 
-- Upload **only** the `0.6.0` files from `dist/` -- do not upload older versions again.
+- Upload **only** the `0.6.2` files from `dist/` -- do not upload older versions again.
 - PyPI token: Account settings -> API tokens -> scope `quantdinger-mcp` or entire account.
 - After publish: restart Cursor MCP or `pip install --upgrade quantdinger-mcp`.
