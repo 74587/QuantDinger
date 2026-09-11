@@ -14,6 +14,22 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+_SEARCHABLE_SYMBOLS = """(
+    SELECT market, symbol, name, sort_order, is_active, is_hot
+    FROM (
+        SELECT market, symbol, name, sort_order, is_active,
+               MAX(is_hot) OVER (PARTITION BY market, UPPER(symbol)) AS is_hot,
+               ROW_NUMBER() OVER (
+                   PARTITION BY market, UPPER(symbol)
+                   ORDER BY sort_order DESC, id ASC
+               ) AS occurrence
+        FROM qd_market_symbols
+        WHERE is_active = 1
+    ) ranked
+    WHERE occurrence = 1
+)"""
+
+
 def _get_db_connection():
     """Get database connection, returns None if not available."""
     try:
@@ -42,8 +58,8 @@ def get_hot_symbols(market: str, limit: int = 10) -> List[Dict]:
         with _get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                """
-                SELECT market, symbol, name FROM qd_market_symbols
+                f"""
+                SELECT market, symbol, name FROM {_SEARCHABLE_SYMBOLS} s
                 WHERE market = ? AND is_active = 1 AND is_hot = 1
                 ORDER BY sort_order DESC
                 LIMIT ?
@@ -82,8 +98,8 @@ def search_symbols(market: str, keyword: str, limit: int = 20) -> List[Dict]:
         with _get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                """
-                SELECT market, symbol, name FROM qd_market_symbols
+                f"""
+                SELECT market, symbol, name FROM {_SEARCHABLE_SYMBOLS} s
                 WHERE market = ? AND is_active = 1 AND UPPER(symbol) = UPPER(?)
                 LIMIT ?
                 """,
@@ -98,8 +114,8 @@ def search_symbols(market: str, keyword: str, limit: int = 20) -> List[Dict]:
                 ]
 
             cur.execute(
-                """
-                SELECT market, symbol, name FROM qd_market_symbols s
+                f"""
+                SELECT market, symbol, name FROM {_SEARCHABLE_SYMBOLS} s
                 WHERE market = ? AND is_active = 1
                   AND (
                     UPPER(symbol) LIKE UPPER(?)
@@ -168,8 +184,8 @@ def _search_symbols_without_aliases(market: str, keyword: str, limit: int) -> Li
         with _get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                """
-                SELECT market, symbol, name FROM qd_market_symbols
+                f"""
+                SELECT market, symbol, name FROM {_SEARCHABLE_SYMBOLS} s
                 WHERE market = ? AND is_active = 1
                   AND (UPPER(symbol) LIKE UPPER(?) OR UPPER(name) LIKE UPPER(?))
                 ORDER BY

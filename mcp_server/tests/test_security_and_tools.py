@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import importlib
+import asyncio
+import json
 import re
 import sys
 from pathlib import Path
 
 import pytest
+import httpx
 
 pytest.importorskip("mcp")
 
@@ -36,6 +39,68 @@ def test_mcp_tool_registry_complete(fresh_module):
 def test_mcp_tools_are_actually_registered(fresh_module):
     registered = set(fresh_module.mcp._tool_manager._tools)
     assert registered == set(fresh_module.MCP_TOOL_NAMES)
+
+
+def test_every_tool_has_explicit_risk_annotations(fresh_module):
+    from quantdinger_mcp.tool_contract import WRITE_TOOLS
+
+    tools = asyncio.run(fresh_module.mcp.list_tools())
+    assert set(WRITE_TOOLS).issubset({tool.name for tool in tools})
+    for tool in tools:
+        hints = tool.annotations
+        assert hints is not None
+        assert hints.readOnlyHint is (tool.name not in WRITE_TOOLS)
+        assert hints.destructiveHint is WRITE_TOOLS.get(tool.name, False)
+        assert hints.idempotentHint is (tool.name not in WRITE_TOOLS)
+        assert hints.openWorldHint is True
+
+
+@pytest.mark.parametrize('status,body', [
+    (404, {'code': 404, 'message': 'Strategy not found', 'data': None}),
+    (200, {'code': 400, 'message': 'Rejected', 'data': None}),
+    (200, {'code': 0, 'data': {'error': 'UNSUPPORTED_TRADING_ENVIRONMENT', 'spot_positions': []}}),
+    (200, {'code': 0, 'data': {'success': False, 'error_type': 'SecurityError'}}),
+])
+def test_protocol_marks_gateway_and_business_failures(monkeypatch, fresh_module, status, body):
+    from mcp.types import CallToolResult
+
+    with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(status, json=body)),
+                      base_url='https://example.test') as client:
+        monkeypatch.setattr(fresh_module, '_client', client)
+        result = asyncio.run(fresh_module.mcp.call_tool('get_strategy', {'strategy_id': 1}))
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    assert json.loads(result.content[0].text) == result.structuredContent
+
+
+@pytest.mark.parametrize('exception_type', [httpx.ConnectError, httpx.ReadTimeout])
+def test_protocol_marks_transport_failures(monkeypatch, fresh_module, exception_type):
+    def failed(request):
+        raise exception_type('fixture transport failure', request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(failed), base_url='https://example.test') as client:
+        monkeypatch.setattr(fresh_module, '_client', client)
+        result = asyncio.run(fresh_module.mcp.call_tool('get_strategy', {'strategy_id': 1}))
+    assert result.isError is True
+    assert result.structuredContent['body']['retriable'] is True
+
+
+def test_protocol_guard_denial_and_error_redaction(monkeypatch, fresh_module):
+    monkeypatch.setattr(fresh_module, '_post', lambda *a, **k: pytest.fail('denied operation reached gateway'))
+    denied = asyncio.run(fresh_module.mcp.call_tool('stop_strategy', {'strategy_id': 1}))
+    assert denied.isError is True
+    monkeypatch.setattr(fresh_module, '_get', lambda *a, **k: {'error': True, 'secret_key': 'fixture-secret'})
+    failed = asyncio.run(fresh_module.mcp.call_tool('get_strategy', {'strategy_id': 1}))
+    assert failed.structuredContent['secret_key'] == '***'
+    assert 'fixture-secret' not in failed.content[0].text
+
+
+def test_successful_empty_snapshot_is_not_an_error(monkeypatch, fresh_module):
+    from mcp.types import CallToolResult
+
+    monkeypatch.setattr(fresh_module, '_get', lambda *a, **k: {'error': '', 'spot_positions': [], 'warnings': []})
+    result = asyncio.run(fresh_module.mcp.call_tool('get_account_snapshot', {'credential_id': 1}))
+    assert not isinstance(result, CallToolResult) or result.isError is False
 
 
 def test_strategy_authoring_contract_uses_agent_gateway(monkeypatch, fresh_module):

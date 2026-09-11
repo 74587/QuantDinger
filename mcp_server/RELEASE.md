@@ -1,6 +1,10 @@
 # Release quantdinger-mcp to PyPI
 
-## This release: 0.5.0
+## This release: 0.6.0
+
+Gateway HTTP errors, application errors, validation failures, and confirmation denials now return MCP `isError=true` while preserving redacted structured details. All 58 tools declare read-only, destructive, idempotent, and open-world hints. Write hints remain conservatively non-idempotent so clients cannot infer that retries against older gateways are safe. Confirmation and server-side permission checks remain required.
+
+## Previous release: 0.5.0
 
 This release expands MCP to complete research, strategy authoring, backtest, broker observation, notification, and safety-gated trading workflows. It adds atomic idempotency, distributed quotas, job cancellation, notional caps, and an emergency stop.
 
@@ -29,10 +33,10 @@ py -3.13 -m build
 # 5. Upload (you run this -- needs your PyPI token)
 $env:TWINE_USERNAME = "__token__"
 $env:TWINE_PASSWORD = "pypi-Ag..."   # your API token
-py -3.13 -m twine upload dist/quantdinger_mcp-0.5.0*
+py -3.13 -m twine upload dist/quantdinger_mcp-0.6.0*
 
 # 6. Verify
-pip install --upgrade "quantdinger-mcp==0.5.0"
+pip install --upgrade "quantdinger-mcp==0.6.0"
 quantdinger-mcp
 ```
 
@@ -44,11 +48,11 @@ pip install -e ".[dev]"
 python -m pytest tests/ -q
 rm -rf dist build src/*.egg-info
 python -m build
-TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-... python -m twine upload dist/quantdinger_mcp-0.5.0*
+TWINE_USERNAME=__token__ TWINE_PASSWORD=pypi-... python -m twine upload dist/quantdinger_mcp-0.6.0*
 ```
 
 ## Notes
 
-- Upload **only** the `0.5.0` files from `dist/` -- do not upload older versions again.
+- Upload **only** the `0.6.0` files from `dist/` -- do not upload older versions again.
 - PyPI token: Account settings -> API tokens -> scope `quantdinger-mcp` or entire account.
 - After publish: restart Cursor MCP or `pip install --upgrade quantdinger-mcp`.

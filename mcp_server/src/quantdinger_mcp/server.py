@@ -17,6 +17,7 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
 from . import __version__
+from .tool_contract import register_tool
 from .security import (
     assert_code_size,
     assert_indicator_code_size,
@@ -225,7 +226,9 @@ def _unwrap(r: httpx.Response) -> Any:
     except Exception:
         return {"error": True, "status": r.status_code, "text": r.text[:2000]}
     if r.status_code >= 400:
-        return {"error": True, "status": r.status_code, "body": body}
+        return redact_secrets({"error": True, "status": r.status_code, "body": body})
+    if isinstance(body, dict) and body.get("code") not in (None, 0, 200, "0", "200"):
+        return redact_secrets({"error": True, "status": r.status_code, "body": body})
     if isinstance(body, dict) and "data" in body:
         data = body["data"]
         return redact_secrets(data) if isinstance(data, (dict, list)) else data
@@ -268,18 +271,19 @@ mcp = FastMCP(
     ),
 )
 mcp._mcp_server.version = __version__
+_tool = register_tool(mcp)
 
 
 # Read-class tools
 
 
-@mcp.tool()
+@_tool
 def whoami() -> Any:
     """Return the calling token's identity, scopes, and allowlists."""
     return _get("/api/agent/v1/whoami")
 
 
-@mcp.tool()
+@_tool
 def check_health() -> Any:
     """Public liveness probe (no token required). Does not expose tenant data."""
     try:
@@ -297,13 +301,13 @@ def check_health() -> Any:
     return body
 
 
-@mcp.tool()
+@_tool
 def list_markets() -> Any:
     """List markets the configured token is allowed to query."""
     return _get("/api/agent/v1/markets")
 
 
-@mcp.tool()
+@_tool
 def search_symbols(market: str, keyword: str = "", limit: int = 20) -> Any:
     """Find symbols in a market."""
     limit = max(1, min(100, int(limit)))
@@ -313,7 +317,7 @@ def search_symbols(market: str, keyword: str = "", limit: int = 20) -> Any:
     )
 
 
-@mcp.tool()
+@_tool
 def get_klines(
     market: str,
     symbol: str,
@@ -329,32 +333,32 @@ def get_klines(
     return _get("/api/agent/v1/klines", params=params)
 
 
-@mcp.tool()
+@_tool
 def get_price(market: str, symbol: str) -> Any:
     """Latest price for a symbol."""
     return _get("/api/agent/v1/price", params={"market": market, "symbol": symbol})
 
 
-@mcp.tool()
+@_tool
 def list_strategies(limit: int = 50) -> Any:
     """List the tenant's strategies (compact projection)."""
     limit = max(1, min(200, int(limit)))
     return _get("/api/agent/v1/strategies", params={"limit": limit})
 
 
-@mcp.tool()
+@_tool
 def get_strategy(strategy_id: int) -> Any:
     """Get a strategy by id (tenant-scoped; secrets redacted)."""
     return _get(f"/api/agent/v1/strategies/{int(strategy_id)}")
 
 
-@mcp.tool()
+@_tool
 def runtime_overview() -> Any:
     """Compact runtime overview for this tenant."""
     return _get("/api/agent/v1/runtime/overview")
 
 
-@mcp.tool()
+@_tool
 def stop_strategy(
     strategy_id: int,
     idempotency_key: str = "",
@@ -378,7 +382,7 @@ def stop_strategy(
     )
 
 
-@mcp.tool()
+@_tool
 def place_quick_order(
     market: str,
     symbol: str,
@@ -445,7 +449,7 @@ def place_quick_order(
     return _post("/api/agent/v1/quick-trade/orders", json=payload, headers=headers)
 
 
-@mcp.tool()
+@_tool
 def emergency_stop_trading(
     idempotency_key: str = "",
     confirm_emergency_stop: bool = False,
@@ -469,13 +473,13 @@ def emergency_stop_trading(
     )
 
 
-@mcp.tool()
+@_tool
 def get_job(job_id: str) -> Any:
     """Poll a previously submitted backtest job."""
     return _get(f"/api/agent/v1/jobs/{job_id}")
 
 
-@mcp.tool()
+@_tool
 def cancel_job(
     job_id: str,
     idempotency_key: str = "",
@@ -494,7 +498,7 @@ def cancel_job(
     )
 
 
-@mcp.tool()
+@_tool
 def list_jobs(kind: str | None = None, limit: int = 50) -> Any:
     """List recent jobs for this tenant. Optional `kind` filter."""
     limit = max(1, min(200, int(limit)))
@@ -504,7 +508,7 @@ def list_jobs(kind: str | None = None, limit: int = 50) -> Any:
     return _get("/api/agent/v1/jobs", params=params)
 
 
-@mcp.tool()
+@_tool
 def wait_for_job(
     job_id: str,
     timeout_s: float | None = None,
@@ -522,7 +526,7 @@ def wait_for_job(
     )
 
 
-@mcp.tool()
+@_tool
 def stream_job_until_done(
     job_id: str,
     since_seq: int = 0,
@@ -551,13 +555,13 @@ def stream_job_until_done(
 # Indicator workspace
 
 
-@mcp.tool()
+@_tool
 def get_indicator_authoring_contract() -> Any:
     """Fetch chart-only indicator I/O contract + starter Python template."""
     return _get("/api/agent/v1/indicators/authoring-contract")
 
 
-@mcp.tool()
+@_tool
 def validate_indicator_code(code: str, indicator_params: dict | None = None) -> Any:
     """Sandbox-validate chart-only indicator Python without saving."""
     assert_indicator_code_size(code)
@@ -568,7 +572,7 @@ def validate_indicator_code(code: str, indicator_params: dict | None = None) -> 
     )
 
 
-@mcp.tool()
+@_tool
 def save_indicator(
     code: str,
     name: str | None = None,
@@ -593,7 +597,7 @@ def save_indicator(
     )
 
 
-@mcp.tool()
+@_tool
 def link_indicator_config(
     config: dict,
     idempotency_key: str = "",
@@ -606,14 +610,14 @@ def link_indicator_config(
     )
 
 
-@mcp.tool()
+@_tool
 def list_indicators(limit: int = 50) -> Any:
     """List saved indicators for this tenant (no code bodies)."""
     limit = max(1, min(200, int(limit)))
     return _get("/api/agent/v1/indicators", params={"limit": limit})
 
 
-@mcp.tool()
+@_tool
 def get_indicator(indicator_id: int) -> Any:
     """Fetch one chart indicator including its Python source."""
     return _get(f"/api/agent/v1/indicators/{int(indicator_id)}")
@@ -622,7 +626,7 @@ def get_indicator(indicator_id: int) -> Any:
 # Strategy workspace
 
 
-@mcp.tool()
+@_tool
 def create_strategy(
     name: str,
     source_id: int,
@@ -658,7 +662,7 @@ def create_strategy(
     )
 
 
-@mcp.tool()
+@_tool
 def update_strategy(strategy_id: int, patch: dict, idempotency_key: str = "") -> Any:
     """Patch the canonical deployment configuration for a strategy (scope W)."""
     body = assert_json_dict("patch", patch)
@@ -672,20 +676,20 @@ def update_strategy(strategy_id: int, patch: dict, idempotency_key: str = "") ->
 # Strategy API V2 source workspace
 
 
-@mcp.tool()
+@_tool
 def get_strategy_authoring_contract() -> Any:
     """Fetch the canonical Strategy API V2 runtime contract and starter Python source."""
     return _get("/api/agent/v1/strategy-sources/authoring-contract")
 
 
-@mcp.tool()
+@_tool
 def list_strategy_templates(limit: int = 20) -> Any:
     """List system Strategy API V2 templates, including starter source code."""
     limit = max(1, min(100, int(limit)))
     return _get("/api/agent/v1/strategy-sources/templates", params={"limit": limit})
 
 
-@mcp.tool()
+@_tool
 def compile_strategy_code(code: str | None = None, source_id: int | None = None) -> Any:
     """Compile Strategy API V2 code and return its canonical manifest without saving."""
     payload: dict[str, Any] = {}
@@ -699,20 +703,20 @@ def compile_strategy_code(code: str | None = None, source_id: int | None = None)
     return _post("/api/agent/v1/strategy-sources/compile", json=payload)
 
 
-@mcp.tool()
+@_tool
 def list_strategy_sources(limit: int = 50) -> Any:
     """List saved Strategy API V2 sources without code bodies."""
     limit = max(1, min(200, int(limit)))
     return _get("/api/agent/v1/strategy-sources", params={"limit": limit})
 
 
-@mcp.tool()
+@_tool
 def get_strategy_source(source_id: int) -> Any:
     """Get one tenant-owned Strategy API V2 source including code."""
     return _get(f"/api/agent/v1/strategy-sources/{int(source_id)}")
 
 
-@mcp.tool()
+@_tool
 def save_strategy_source(
     name: str,
     code: str,
@@ -747,13 +751,13 @@ def save_strategy_source(
     )
 
 
-@mcp.tool()
+@_tool
 def list_strategy_source_versions(source_id: int) -> Any:
     """List immutable version snapshots for one tenant-owned strategy source."""
     return _get(f"/api/agent/v1/strategy-sources/{int(source_id)}/versions")
 
 
-@mcp.tool()
+@_tool
 def restore_strategy_source_version(
     source_id: int,
     version_id: int,
@@ -782,7 +786,7 @@ def restore_strategy_source_version(
 # Backtests
 
 
-@mcp.tool()
+@_tool
 def submit_backtest(
     code: str,
     start_date: str,
@@ -816,19 +820,19 @@ def submit_backtest(
 # Portfolio (read-only)
 
 
-@mcp.tool()
+@_tool
 def list_portfolio_positions() -> Any:
     """Manual portfolio positions for this tenant (read-only, scope R)."""
     return _get("/api/agent/v1/portfolio/positions")
 
 
-@mcp.tool()
+@_tool
 def list_paper_orders() -> Any:
     """Recent paper orders submitted via agent trading APIs (scope R)."""
     return _get("/api/agent/v1/portfolio/paper-orders")
 
 
-@mcp.tool()
+@_tool
 def cancel_open_paper_orders(
     idempotency_key: str = "",
     confirm_cancel: bool = False,
@@ -855,19 +859,19 @@ def cancel_open_paper_orders(
 # Research workspace
 
 
-@mcp.tool()
+@_tool
 def list_universes() -> Any:
     """List visible point-in-time universes."""
     return _get("/api/agent/v1/research/universes")
 
 
-@mcp.tool()
+@_tool
 def get_universe(universe_id: int) -> Any:
     """Get universe metadata."""
     return _get(f"/api/agent/v1/research/universes/{int(universe_id)}")
 
 
-@mcp.tool()
+@_tool
 def list_universe_members(
     universe_id: int,
     as_of: str | None = None,
@@ -884,7 +888,7 @@ def list_universe_members(
     return _get(f"/api/agent/v1/research/universes/{int(universe_id)}/members", params=params)
 
 
-@mcp.tool()
+@_tool
 def list_factors(category: str = "", factor_type: str = "") -> Any:
     """List registered technical and fundamental factor definitions."""
     return _get(
@@ -893,13 +897,13 @@ def list_factors(category: str = "", factor_type: str = "") -> Any:
     )
 
 
-@mcp.tool()
+@_tool
 def get_factor(factor_id: str) -> Any:
     """Get one factor definition and parameter schema."""
     return _get(f"/api/agent/v1/research/factors/{factor_id}")
 
 
-@mcp.tool()
+@_tool
 def list_watchlist(limit: int = 100, cursor: int = 0) -> Any:
     """List the tenant watchlist."""
     return _get(
@@ -908,7 +912,7 @@ def list_watchlist(limit: int = 100, cursor: int = 0) -> Any:
     )
 
 
-@mcp.tool()
+@_tool
 def add_watchlist(
     market: str,
     symbol: str,
@@ -931,7 +935,7 @@ def add_watchlist(
     )
 
 
-@mcp.tool()
+@_tool
 def remove_watchlist(
     market: str,
     symbol: str,
@@ -951,32 +955,32 @@ def remove_watchlist(
 # Broker and execution observations
 
 
-@mcp.tool()
+@_tool
 def list_trading_accounts() -> Any:
     """List safe broker credential metadata; never returns secrets."""
     return _get("/api/agent/v1/trading/accounts")
 
 
-@mcp.tool()
+@_tool
 def get_account_snapshot(credential_id: int) -> Any:
     """Fetch live positions and open orders for an owned credential."""
     return _get(f"/api/agent/v1/trading/accounts/{int(credential_id)}/snapshot")
 
 
-@mcp.tool()
+@_tool
 def list_account_positions(credential_id: int, market_type: str = "") -> Any:
     """Read the locally mirrored broker-account positions."""
     params = {"market_type": market_type} if market_type else None
     return _get(f"/api/agent/v1/trading/accounts/{int(credential_id)}/positions", params=params)
 
 
-@mcp.tool()
+@_tool
 def list_strategy_positions(strategy_id: int) -> Any:
     """Read positions for one tenant strategy."""
     return _get(f"/api/agent/v1/trading/strategies/{int(strategy_id)}/positions")
 
 
-@mcp.tool()
+@_tool
 def list_strategy_trades(strategy_id: int, limit: int = 50, cursor: int = 0) -> Any:
     """Read cursor-paginated strategy fills."""
     return _get(
@@ -985,7 +989,7 @@ def list_strategy_trades(strategy_id: int, limit: int = 50, cursor: int = 0) -> 
     )
 
 
-@mcp.tool()
+@_tool
 def list_strategy_pending_orders(strategy_id: int, limit: int = 50, cursor: int = 0) -> Any:
     """Read cursor-paginated pending orders for one strategy."""
     return _get(
@@ -994,7 +998,7 @@ def list_strategy_pending_orders(strategy_id: int, limit: int = 50, cursor: int 
     )
 
 
-@mcp.tool()
+@_tool
 def list_agent_quick_trades(limit: int = 50, cursor: int = 0) -> Any:
     """Read quick trades created by Agent Gateway."""
     return _get(
@@ -1006,7 +1010,7 @@ def list_agent_quick_trades(limit: int = 50, cursor: int = 0) -> Any:
 # Notification automation
 
 
-@mcp.tool()
+@_tool
 def list_signal_alerts(limit: int = 50, cursor: int = 0) -> Any:
     """List indicator signal-alert tasks (scope N)."""
     return _get(
@@ -1015,7 +1019,7 @@ def list_signal_alerts(limit: int = 50, cursor: int = 0) -> Any:
     )
 
 
-@mcp.tool()
+@_tool
 def create_signal_alert(payload: dict, idempotency_key: str = "") -> Any:
     """Create an indicator signal-alert task."""
     return _post(
@@ -1025,7 +1029,7 @@ def create_signal_alert(payload: dict, idempotency_key: str = "") -> Any:
     )
 
 
-@mcp.tool()
+@_tool
 def update_signal_alert(task_id: int, payload: dict, idempotency_key: str = "") -> Any:
     """Update an owned signal-alert task."""
     return _patch_with_headers(
@@ -1035,7 +1039,7 @@ def update_signal_alert(task_id: int, payload: dict, idempotency_key: str = "") 
     )
 
 
-@mcp.tool()
+@_tool
 def set_signal_alert_status(
     task_id: int,
     status: str,
@@ -1049,7 +1053,7 @@ def set_signal_alert_status(
     )
 
 
-@mcp.tool()
+@_tool
 def delete_signal_alert(
     task_id: int,
     idempotency_key: str = "",
@@ -1064,7 +1068,7 @@ def delete_signal_alert(
     )
 
 
-@mcp.tool()
+@_tool
 def run_signal_alert(
     task_id: int,
     idempotency_key: str = "",
