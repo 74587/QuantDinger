@@ -16,8 +16,6 @@ QuantDinger 是一套可自托管的 AI 量化交易平台，覆盖行情研究�
   <img src="screenshots/quantdinger-v5-2x.gif" alt="QuantDinger 完整宣传片，2 倍速动态演示" width="800">
 </p>
 
-<p align="center"><sub>完整宣传片 · 2 倍速 · 循环 GIF · 无声</sub></p>
-
 ## 按目标开始
 
 | 你的目标 | 首先阅读 | 接下来阅读 |
