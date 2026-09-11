@@ -24,7 +24,7 @@
     ·
     <a href="https://www.quantdinger.com"><strong>Website</strong></a>
     ·
-    <a href="https://youtu.be/7l1TocuEmvw"><strong>Video Demo</strong></a>
+    <a href="#watch-quantdinger-in-action"><strong>Video Demo</strong></a>
     ·
     <a href="mailto:support@quantdinger.com"><strong>Official Support Email</strong></a>
   </p>
@@ -71,12 +71,10 @@
 ## Watch QuantDinger in action
 
 <p align="center">
-  <a href="https://youtu.be/7l1TocuEmvw">
-    <img src="https://i.ytimg.com/vi/7l1TocuEmvw/maxresdefault.jpg" alt="Watch the QuantDinger v5 promotional video on YouTube" width="800">
-  </a>
+  <img src="docs/screenshots/quantdinger-v5-3x.gif" alt="QuantDinger product demo at 3× speed" width="800">
 </p>
 
-<p align="center"><a href="https://youtu.be/7l1TocuEmvw"><strong>▶ Watch the QuantDinger v5 video on YouTube</strong></a></p>
+<p align="center"><sub>Full product demo · 3× speed · looping GIF · no audio</sub></p>
 
 ## What QuantDinger is
 
