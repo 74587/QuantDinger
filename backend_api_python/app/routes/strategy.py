@@ -228,10 +228,15 @@ def stop_strategy(strategy_id: int):
         strategy_id,
         close_positions=close_positions,
     )
-    get_strategy_service().update_strategy_status(strategy_id, "stopped", user_id=int(g.user_id))
+    status = str(result.get("status") or "")
+    if status in {"stopping", "stopped"}:
+        get_strategy_service().update_strategy_status(strategy_id, "stopped", user_id=int(g.user_id))
     data = {"id": strategy_id, **result}
     if not result.get("success"):
-        return _error("strategyV2.stopClosePartialFailure", 409, data=data)
+        message = "strategyV2.stopClosePartialFailure" if close_positions and status == "stopped" else "strategyV2.stopFailed"
+        return _error(message, 409, data=data)
+    if status == "stopping":
+        return _ok(data, "strategyV2.stopQueued"), 202
     message = "strategyV2.stoppedAndCloseQueued" if close_positions else "strategyV2.paused"
     return _ok(data, message)
 

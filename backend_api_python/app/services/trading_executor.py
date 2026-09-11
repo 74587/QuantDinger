@@ -62,6 +62,7 @@ class TradingExecutor:
         self.order_gateway = StrategyV2OrderGateway()
         self._last_start_failure = ""
         self._last_exit_reason: dict[int, str] = {}
+        self.runtime_guard = None
 
     def start_strategy(self, strategy_id: int) -> bool:
         strategy_id = int(strategy_id)
@@ -79,6 +80,9 @@ class TradingExecutor:
             except Exception as exc:
                 self._last_start_failure = str(exc or "strategyV2.livePreflightFailed")
                 logger.warning("Strategy %s live preflight rejected: %s", strategy_id, exc)
+                return False
+            if self.runtime_guard and not self.runtime_guard(strategy_id):
+                self._last_start_failure = "strategyRuntime.leaseLost"
                 return False
             thread = threading.Thread(
                 target=self._run_strategy_loop,
@@ -1202,6 +1206,8 @@ class TradingExecutor:
             and inflight_check(request)
         ):
             return False
+        if self.runtime_guard and not self.runtime_guard(strategy_id):
+            return False
         pending_id = self.order_gateway.submit(request)
         if pending_id:
             order_details = [f"pending_id={pending_id}"]
@@ -1265,6 +1271,8 @@ class TradingExecutor:
             return client
 
         def enqueue_market(signal_type: str, quantity: float, price: float, reason: str) -> bool:
+            if self.runtime_guard and not self.runtime_guard(strategy_id):
+                return False
             return self._execute_signal(
                 strategy_id=strategy_id,
                 strategy_name=strategy_name,
@@ -1328,6 +1336,7 @@ class TradingExecutor:
             create_client_fn=create_grid_client,
             risk_exit_fn=evaluate_grid_risk,
         )
+        runner.engine.order_guard = lambda: self.runtime_guard is None or self.runtime_guard(strategy_id)
         ok, message = runner.startup(initial_price, bars_df=frame)
         if not ok:
             raise RuntimeError(f"grid.startupFailed:{message}")
@@ -1984,6 +1993,9 @@ class TradingExecutor:
         return source_id, code
 
     def _is_strategy_running(self, strategy_id: int, thread: threading.Thread) -> bool:
+        if self.runtime_guard and not self.runtime_guard(strategy_id):
+            self._last_exit_reason[strategy_id] = "strategyRuntime.leaseLost"
+            return False
         with self.lock:
             if self.running_strategies.get(strategy_id) is not thread:
                 return False

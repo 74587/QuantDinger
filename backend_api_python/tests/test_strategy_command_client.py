@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from app.services.strategy_command_client import StrategyCommandClient
 from app.services.strategy_command_repository import StrategyCommand
 
@@ -83,3 +85,40 @@ def test_stop_policy_forwards_close_positions(monkeypatch):
     assert result["success"] is True
     assert result["close_requested"] is True
     assert repository.commands[0].payload == {"close_positions": True}
+
+
+@pytest.mark.parametrize("status", ["pending", "processing"])
+@pytest.mark.parametrize("close_positions", [False, True])
+def test_stop_wait_timeout_preserves_accepted_command(monkeypatch, status, close_positions):
+    repository = FakeRepository(status=status)
+    client = StrategyCommandClient(repository)
+    monkeypatch.setenv("STRATEGY_COMMAND_STOP_WAIT_SEC", "5")
+    monkeypatch.setattr(client, "_wait", lambda command_id, timeout: repository.get(command_id))
+
+    result = client.stop_strategy_with_policy(9, close_positions=close_positions)
+
+    assert result["success"] is True
+    assert result["status"] == "stopping"
+    assert result["command_id"] == repository.commands[0].id
+    assert result["close_requested"] is close_positions
+    assert result["close_orders_queued"] == 0
+    assert result["close_errors"] == []
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_terminal_stop_failure_is_not_accepted(monkeypatch, status):
+    client = StrategyCommandClient(FakeRepository(status=status))
+    result = client.stop_strategy_with_policy(9)
+    assert result["success"] is False
+    assert result["status"] == "running"
+    assert result["command_id"] == 1
+
+
+def test_stop_enqueue_failure_is_not_accepted(monkeypatch):
+    repository = FakeRepository()
+    def fail(**kwargs):
+        raise RuntimeError("queue unavailable")
+    monkeypatch.setattr(repository, "enqueue", fail)
+    result = StrategyCommandClient(repository).stop_strategy_with_policy(9)
+    assert result["success"] is False
+    assert "command_id" not in result

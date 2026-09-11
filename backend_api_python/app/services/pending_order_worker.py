@@ -115,6 +115,7 @@ from app.services.live_trading.bybit import BybitClient
 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
 from app.services.live_trading.htx import HtxClient
 from app.utils.db import get_db_connection
+from app.services.pending_order_loops import PendingOrderLoops
 from app.utils.logger import get_logger
 from app.utils.strategy_runtime_logs import append_strategy_log
 from app.services.strategy_lifecycle import (
@@ -135,12 +136,14 @@ logger = get_logger(__name__)
 ALPACA_FILL_DELTA_EPSILON = 1e-8
 
 
-class PendingOrderWorker(PendingOrderPositionSyncMixin):
+class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
     def __init__(self, poll_interval_sec: float = 1.0, batch_size: int = 50):
         self.poll_interval_sec = float(poll_interval_sec)
         self.batch_size = int(batch_size)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._sync_thread: Optional[threading.Thread] = None
+        self.lease_guard = None
         self._lock = threading.Lock()
         self._notifier = SignalNotifier()
         self._instrument_rules = get_instrument_rules_provider()
@@ -177,15 +180,19 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
 
     def start(self) -> bool:
         with self._lock:
+            if self._thread and self._thread.is_alive() and self._sync_thread and self._sync_thread.is_alive():
+                return True
             try:
                 ensure_position_ledger_schema()
             except Exception as e:
                 logger.warning("ensure_position_ledger_schema failed: %s", e)
-            if self._thread and self._thread.is_alive():
-                return True
             self._stop_event.clear()
-            self._thread = threading.Thread(target=self._run_loop, name="PendingOrderWorker", daemon=True)
-            self._thread.start()
+            if not self._thread or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run_loop, name="PendingOrderWorker", daemon=True)
+                self._thread.start()
+            if not self._sync_thread or not self._sync_thread.is_alive():
+                self._sync_thread = threading.Thread(target=self._run_sync_loop, name="PendingOrderReconciliation", daemon=True)
+                self._sync_thread.start()
             logger.info("PendingOrderWorker started")
             return True
 
@@ -195,42 +202,9 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
             th = self._thread
         if th and th.is_alive():
             th.join(timeout=timeout_sec)
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=timeout_sec)
         logger.info("PendingOrderWorker stopped")
-
-    def _run_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self._tick()
-            except Exception as e:
-                logger.warning(f"PendingOrderWorker tick error: {e}")
-            time.sleep(self.poll_interval_sec)
-
-    def _tick(self) -> None:
-        # logger.info(f"[PendingOrderWorker] _tick start. last_sync={self._last_position_sync_ts}")
-        self._sync_quick_trade_orders()
-        self._sync_alpaca_sent_orders()
-        self._sync_live_sent_orders()
-        orders = self._fetch_pending_orders(limit=self.batch_size)
-        # logger.info(f"[PendingOrderWorker] orders fetched: {len(orders)}")
-        if not orders:
-            self._maybe_sync_positions()
-            return
-
-        for o in orders:
-            oid = o.get("id")
-            if not oid:
-                continue
-
-            # Mark processing (best-effort)
-            if not self._mark_processing(order_id=int(oid)):
-                continue
-
-            try:
-                self._dispatch_one(o)
-            except Exception as e:
-                self._mark_failed(order_id=int(oid), error=str(e))
-
-        self._maybe_sync_positions()
 
     def _sync_quick_trade_orders(self, limit: int = 50) -> None:
         """Reconcile non-terminal Quick Trade orders and protect new fills."""

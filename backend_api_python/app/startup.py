@@ -230,11 +230,26 @@ def run_startup_hooks(app: Flask) -> None:
         restore_running_strategies()
 
 
-def _start_trading_support_services() -> None:
+def _start_trading_support_services(*, lease_guard=None) -> None:
     """Start exchange-facing services that belong with the trading runtime."""
+    worker = get_pending_order_worker()
+    worker.lease_guard = lease_guard
+    if os.getenv("ENABLE_PENDING_ORDER_WORKER", "true").lower() == "true":
+        if not worker.start():
+            raise RuntimeError("Pending order worker failed to start")
     start_execution_stream_supervisor()
-    start_pending_order_worker()
     start_grid_fill_poller()
+
+
+def stop_trading_support_services() -> None:
+    """Stop exchange consumers before relinquishing their process lease."""
+    from app.services.grid.poller import get_grid_fill_poller
+
+    get_grid_fill_poller().stop()
+    if _pending_order_worker is not None:
+        _pending_order_worker.stop()
+    if _execution_stream_supervisor is not None:
+        _execution_stream_supervisor.stop()
 
 
 def _start_scheduler_services(*, include_celery_managed: bool = False) -> None:

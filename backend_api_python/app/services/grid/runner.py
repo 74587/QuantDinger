@@ -44,7 +44,7 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
         gr.shutdown()
         return
     try:
-        from app.services.exchange_execution import load_strategy_configs, resolve_exchange_config
+        from app.services.exchange_execution import coalesce_exchange_config_from_payload, load_strategy_configs, resolve_exchange_config
         from app.services.live_trading.factory import create_client
 
         sc = load_strategy_configs(sid) or {}
@@ -58,8 +58,8 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
         if not symbol:
             return
         user_id = int(sc.get("user_id") or 1)
-        ex_cfg = resolve_exchange_config(sc.get("exchange_config") or {}, user_id=user_id)
-        mt = str(tc.get("market_type") or "swap").strip().lower()
+        ex_cfg = resolve_exchange_config(coalesce_exchange_config_from_payload(sc), user_id=user_id)
+        mt = str(tc.get("market_type") or sc.get("market_type") or "swap").strip().lower()
 
         def _create_client():
             return create_client(ex_cfg, market_type=mt)
@@ -74,7 +74,7 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
             enqueue_market=lambda *a, **k: False,
         )
         engine.shutdown()
-        append_strategy_log(sid, "info", "Grid orders cancelled on strategy stop (no active runner)")
+        append_strategy_log(sid, "info", "strategyRuntime.gridStopCleanup")
     except Exception as e:
         logger.warning("shutdown_grid_for_strategy sid=%s: %s", sid, e)
         append_strategy_log(sid, "warning", f"Grid stop cancel failed: {e}")

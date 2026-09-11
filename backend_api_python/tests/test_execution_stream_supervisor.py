@@ -104,3 +104,24 @@ def test_active_stream_query_excludes_stopped_and_signal_strategies(monkeypatch)
     normalized = " ".join(executed[0].lower().split())
     assert "status, '')) = 'running'" in normalized
     assert "execution_mode, 'signal')) = 'live'" in normalized
+
+
+def test_symbol_discovery_accepts_legacy_text_configs_and_pending_orders(monkeypatch):
+    from contextlib import contextmanager
+    from unittest.mock import Mock
+    cursor = Mock()
+    cursor.fetchall.return_value = [
+        {'exchange_config': '{"credential_id": 7}', 'symbol': 'BTC/USDT'},
+        {'exchange_config': '{"credentials_id": "8"}', 'symbol': 'ETH/USDT'},
+        {'exchange_config': None, 'credential_id': 7, 'symbol': 'SOL/USDT'},
+        {'exchange_config': 'invalid legacy JSON', 'symbol': 'XRP/USDT'},
+        {'exchange_config': '[]', 'symbol': 'DOGE/USDT'},
+    ]
+    @contextmanager
+    def connection():
+        yield Mock(cursor=lambda: cursor)
+    monkeypatch.setattr(supervisor_module, 'get_db_connection', connection)
+    assert ExecutionStreamSupervisor._symbols_by_credential() == {
+        7: {'BTC/USDT', 'SOL/USDT'}, 8: {'ETH/USDT'},
+    }
+    assert 'exchange_config->>' not in cursor.execute.call_args.args[0]

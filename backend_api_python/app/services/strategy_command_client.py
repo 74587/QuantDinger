@@ -75,15 +75,17 @@ class StrategyCommandClient:
                 payload={"close_positions": bool(close_positions)},
             )
             self._remember(strategy_id, "stop", command.id)
+            queued = {
+                "success": True,
+                "status": "stopping",
+                "command_id": command.id,
+                "close_requested": bool(command.payload.get("close_positions")),
+                "close_orders_queued": 0,
+                "close_errors": [],
+            }
             timeout = max(0.0, float(os.getenv("STRATEGY_COMMAND_STOP_WAIT_SEC", "5")))
             if timeout == 0:
-                return {
-                    "success": True,
-                    "status": "stopping",
-                    "close_requested": bool(close_positions),
-                    "close_orders_queued": 0,
-                    "close_errors": [],
-                }
+                return queued
             finished = self._wait(command.id, timeout)
             if finished is None or finished.status not in TERMINAL_COMMAND_STATUSES:
                 logger.warning(
@@ -91,16 +93,11 @@ class StrategyCommandClient:
                     strategy_id,
                     command.id,
                 )
-                return {
-                    "success": False,
-                    "status": "stopping",
-                    "close_requested": bool(close_positions),
-                    "close_orders_queued": 0,
-                    "close_errors": [],
-                }
+                return queued
             if finished.status == "succeeded":
                 result = dict(finished.result or {})
                 result.setdefault("success", True)
+                result.setdefault("command_id", command.id)
                 result.setdefault("status", "stopped")
                 result.setdefault("close_requested", bool(close_positions))
                 result.setdefault("close_orders_queued", 0)
@@ -109,6 +106,7 @@ class StrategyCommandClient:
             return {
                 "success": False,
                 "status": "running",
+                "command_id": command.id,
                 "close_requested": bool(close_positions),
                 "close_orders_queued": 0,
                 "close_errors": [finished.error_message] if finished.error_message else [],

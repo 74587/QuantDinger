@@ -378,22 +378,26 @@ class ExecutionStreamSupervisor:
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT COALESCE(NULLIF(exchange_config->>'credential_id', ''),
-                                NULLIF(exchange_config->>'credentials_id', ''), '0')::INTEGER AS credential_id,
-                       symbol
+                SELECT exchange_config::text AS exchange_config, 0 AS credential_id, symbol
                 FROM qd_strategies_trading
                 WHERE COALESCE(symbol, '') <> ''
                   AND LOWER(COALESCE(status, '')) = 'running'
                   AND LOWER(COALESCE(execution_mode, 'signal')) = 'live'
                 UNION
-                SELECT credential_id, symbol
+                SELECT NULL AS exchange_config, credential_id, symbol
                 FROM pending_orders
                 WHERE credential_id > 0 AND COALESCE(symbol, '') <> ''
                   AND status IN ('pending','processing','sent','syncing')
                 """
             )
             for row in cur.fetchall() or []:
-                credential_id = int(row.get("credential_id") or 0)
+                try:
+                    config = json.loads(row.get("exchange_config") or "{}")
+                    if not isinstance(config, dict):
+                        config = {}
+                    credential_id = int(row.get("credential_id") or config.get("credential_id") or config.get("credentials_id") or 0)
+                except (TypeError, ValueError):
+                    continue
                 if credential_id > 0:
                     out.setdefault(credential_id, set()).add(str(row.get("symbol") or ""))
             cur.close()

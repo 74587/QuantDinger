@@ -50,6 +50,7 @@ class GridEngine:
         self.cfg = GridBotConfig.from_trading_config(self.trading_config)
         self._create_client = create_client_fn
         self._enqueue_market = enqueue_market
+        self.order_guard = None
         self._orders = GridRestingOrderRepository()
         self._cells = GridCellRepository()
         self._bootstrapped = False
@@ -636,6 +637,8 @@ class GridEngine:
             logger.debug("grid initial pre-place probe sid=%s: %s", self.strategy_id, e)
         try:
             client = self._create_client()
+            if self.order_guard and not self.order_guard():
+                return False
             execution = execute_grid_market_order(
                 client,
                 symbol=self.symbol,
@@ -1474,6 +1477,8 @@ class GridEngine:
                 not reduce_only
                 and self.cfg.order_mode in ("maker", "limit", "limit_first", "maker_then_market")
             )
+            if self.order_guard and not self.order_guard():
+                return False
             res = place_grid_limit_order(
                 client,
                 symbol=self.symbol,
@@ -1816,6 +1821,8 @@ class GridEngine:
 
     def cancel_all_orders_on_exchange(self) -> None:
         open_orders = self._orders.list_open(self.strategy_id)
+        if not open_orders:
+            return
         try:
             client = self._create_client()
         except Exception as e:

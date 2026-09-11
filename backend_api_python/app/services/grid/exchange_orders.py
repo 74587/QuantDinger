@@ -651,6 +651,11 @@ def cancel_grid_order(
 ) -> None:
     mt = str(market_type or "swap").strip().lower()
     ex_cfg = exchange_config if isinstance(exchange_config, dict) else {}
+    if isinstance(client, (GateSpotClient, GateUsdtFuturesClient)):
+        if not exchange_order_id:
+            raise LiveTradingError("Gate cancellation requires a confirmed exchange order ID")
+        client.cancel_order(order_id=str(exchange_order_id))
+        return
     if isinstance(client, OkxClient):
         client.cancel_order(
             market_type=mt,
