@@ -4,10 +4,14 @@ from contextlib import contextmanager
 import math
 
 from app.utils.db import get_db_connection
+from app.utils.logger import get_logger
+from app.services.live_trading.leg_context import credential_id_from_exchange_config
 from app.services.live_trading.account_positions import list_strategy_allocations_for_account
 from app.services.live_trading.position_ownership import (
     canonical_symbol, evaluate_and_record_ownership, protected_quantity,
 )
+
+logger = get_logger(__name__)
 
 
 @contextmanager
@@ -120,3 +124,43 @@ def guarded_alpaca_quantity(*, client, strategy_id, user_id, credential_id, symb
     if quantity <= 1e-8:
         raise ValueError("positionOwnership.noStrategyInventory")
     return quantity
+
+
+def execute_guarded_alpaca_order(worker, **kwargs):
+    """Validate broker capabilities before checking and submitting owned inventory."""
+    from app.services.live_trading.records import _get_user_id_from_strategy
+
+    order_id = int(kwargs["order_id"])
+    payload = kwargs["payload"]
+    signal = str(payload.get("signal_type") or kwargs["order_row"].get("signal_type") or "").lower()
+    market = str(kwargs.get("market_category") or "USStock").strip().lower()
+    if market in {"crypto", "cryptocurrency"} and "short" in signal:
+        reason = "alpaca_crypto_short_not_supported"
+        worker._mark_failed(order_id=order_id, error=reason)
+        kwargs["_notify_live_best_effort"](status="failed", error=reason)
+        return
+    credential_id = credential_id_from_exchange_config(kwargs["exchange_config"])
+    try:
+        with alpaca_account_lock(credential_id):
+            payload = dict(kwargs["payload"])
+            row = kwargs["order_row"]
+            payload["amount"] = guarded_alpaca_quantity(
+                client=kwargs["client"], strategy_id=kwargs["strategy_id"],
+                user_id=_get_user_id_from_strategy(kwargs["strategy_id"]),
+                credential_id=credential_id,
+                symbol=payload.get("symbol") or row.get("symbol"),
+                signal_type=payload.get("signal_type") or row.get("signal_type"),
+                amount=payload.get("amount") or row.get("amount") or 0,
+                order_id=order_id,
+            )
+            worker._execute_alpaca_order_locked(**{**kwargs, "payload": payload})
+    except Exception as exc:
+        reason = str(exc)
+        if reason in {"positionOwnership.accountBusy", "positionOwnership.ordersPending"}:
+            worker._mark_deferred(order_id, reason)
+        else:
+            if not reason.startswith("positionOwnership."):
+                logger.exception("Alpaca ownership check failed: pending_id=%s", order_id)
+                reason = "positionOwnership.snapshotUnavailable"
+            worker._mark_failed(order_id=order_id, error=reason)
+            kwargs["_notify_live_best_effort"](status="failed", error=reason)

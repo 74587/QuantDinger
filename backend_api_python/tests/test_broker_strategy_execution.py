@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from contextlib import nullcontext
 
 import pytest
 
@@ -97,10 +98,32 @@ def test_ibkr_strategy_entry_uses_native_bracket(monkeypatch):
 
 
 def test_alpaca_equity_short_limit_is_supported(monkeypatch):
+    from app.services.live_trading import alpaca_ownership, records
+    from app.services.live_trading.position_ownership import calculate_position_ownership
+
     calls = []
+    snapshots = []
+    monkeypatch.setattr(alpaca_ownership, "alpaca_account_lock", lambda credential: nullcontext())
+    monkeypatch.setattr(alpaca_ownership, "ensure_alpaca_settled", lambda **kwargs: None)
+    monkeypatch.setattr(alpaca_ownership, "list_strategy_allocations_for_account", lambda **kwargs: [])
+    monkeypatch.setattr(records, "_get_user_id_from_strategy", lambda sid: 7)
+    monkeypatch.setattr(alpaca_ownership, "evaluate_and_record_ownership", lambda **kwargs:
+                        calculate_position_ownership(**{key: kwargs[key] for key in
+                            ("symbol", "side", "account_qty", "strategy_qty")}))
 
     class Client:
+        def get_positions(self, *, raise_on_error):
+            assert raise_on_error
+            snapshots.append("positions")
+            return []
+
+        def get_orders(self, *, status, limit, raise_on_error):
+            assert status == "open" and raise_on_error
+            snapshots.append("orders")
+            return []
+
         def place_limit_order(self, **kwargs):
+            assert snapshots == ["positions", "orders"]
             calls.append(kwargs)
             return _result()
 
@@ -118,7 +141,7 @@ def test_alpaca_equity_short_limit_is_supported(monkeypatch):
         },
         client=Client(),
         strategy_id=3,
-        exchange_config={},
+        exchange_config={"exchange_id": "alpaca", "credential_id": 33},
         market_category="USStock",
         _notify_live_best_effort=lambda **kwargs: None,
         _console_print=lambda message: None,
