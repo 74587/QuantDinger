@@ -36,6 +36,19 @@ def test_mcp_tool_registry_complete(fresh_module):
         assert hasattr(fresh_module, name), f"missing tool function: {name}"
 
 
+def test_gateway_tools_do_not_advertise_an_inferred_result_wrapper(fresh_module):
+    tools = asyncio.run(fresh_module.mcp.list_tools())
+    assert len(tools) == len(fresh_module.MCP_TOOL_NAMES)
+    assert all(tool.outputSchema is None for tool in tools)
+
+
+@pytest.mark.parametrize("body", [{"strategy_id": 1}, {"items": [], "pagination": {"total": 0}}])
+def test_success_payload_is_preserved_without_a_result_wrapper(monkeypatch, fresh_module, body):
+    monkeypatch.setattr(fresh_module, '_get', lambda *a, **kw: body)
+    result = asyncio.run(fresh_module.mcp.call_tool('get_strategy', {'strategy_id': 1}))
+    assert json.loads(result[0].text) == body
+
+
 @pytest.mark.parametrize("failure", ["http", "json_http", "timeout", "connection", "invalid", "business"])
 def test_health_failures_set_protocol_error(fresh_module, monkeypatch, failure):
     from mcp.types import CallToolResult

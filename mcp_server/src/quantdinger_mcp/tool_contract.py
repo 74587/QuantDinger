@@ -53,7 +53,10 @@ def register_tool(server):
                 )
             return value
 
-        server.tool(annotations=annotations)(invoke)
+        # Gateway responses have heterogeneous shapes. An inferred Any output
+        # model can require a synthetic `result` field that conflicts with our
+        # explicit CallToolResult error payload on Python 3.10.
+        server.tool(annotations=annotations, structured_output=False)(invoke)
         return fn
 
     return register

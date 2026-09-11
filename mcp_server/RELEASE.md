@@ -1,5 +1,14 @@
 # Release quantdinger-mcp to PyPI
 
+## Unreleased
+
+Disable inferred output schemas for heterogeneous gateway responses. On Python
+3.10, FastMCP inferred an `Any` return as a required `result` wrapper and rejected
+our explicit error `CallToolResult` before it reached the client. Error results
+retain `isError=true`, redacted text, and structured details; successful responses
+remain unwrapped JSON text. CI now completes every Python matrix job even when
+one version fails, and regression tests cover both tool schemas and success payloads.
+
 ## This release: 0.6.1
 
 Health probes now report MCP protocol errors for HTTP failures, timeouts, connection failures, and malformed or unsuccessful health responses. Error details still pass through the redaction contract. The accompanying backend patch fixes idempotency row counts, Alpaca account snapshots, and best-effort futures quotes; deploying the MCP package alone does not update the backend.
