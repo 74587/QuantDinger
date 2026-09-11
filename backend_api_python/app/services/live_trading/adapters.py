@@ -52,7 +52,7 @@ class LiveOrderPhaseAdapter:
             exchange_config=self.exchange_config,
             leverage=float(intent.leverage or 1.0),
             ref_price=float(self.ref_price or 0.0),
-            spot_quote_amt=float(self.spot_quote_amt or 0.0),
+            spot_quote_amt=float(intent.quote_amount or self.spot_quote_amt or 0.0),
             spot_market_buy_uses_quote=bool(self.spot_market_buy_uses_quote),
         )
 
@@ -122,7 +122,7 @@ class LiveOrderPhaseAdapter:
         return FillSnapshot(
             filled_qty=float((raw or {}).get("filled") or 0.0),
             avg_price=float((raw or {}).get("avg_price") or 0.0),
-            status=str((raw or {}).get("status") or ""),
+            status=str((raw or {}).get("status") or (raw or {}).get("state") or ""),
             raw=dict(raw or {}),
             fees_by_ccy=fees_by_ccy,
         )

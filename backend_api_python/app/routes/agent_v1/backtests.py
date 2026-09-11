@@ -154,7 +154,7 @@ def _run_backtest(payload: dict, on_progress=None) -> Any:
     leverage = float(payload.get("leverage") or 1) if leverage_enabled else 1.0
     if on_progress:
         on_progress({"phase": "running_backtest", "percent": 25})
-    _, result = _backtest.run(
+    run_id, result = _backtest.run(
         user_id=int(payload.get("__user_id") or 1),
         code=code,
         start_date=start_date,
@@ -168,11 +168,11 @@ def _run_backtest(payload: dict, on_progress=None) -> Any:
         instrument_rules_snapshot_id=str(
             payload.get("instrumentRulesSnapshotId") or ""
         ).strip(),
-        persist=False,
+        persist=True,
     )
     if on_progress:
         on_progress({"phase": "finalizing", "percent": 95})
-    return result
+    return {**result, "runId": run_id}
 
 
 @agent_v1_bp.route("/backtest/run", methods=["POST"])

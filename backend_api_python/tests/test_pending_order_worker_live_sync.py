@@ -253,6 +253,22 @@ def test_live_sent_sync_tracks_market_leg_without_overwriting_limit_fill(monkeyp
     assert snapshots[0]["status"] == "filled"
 
 
+def test_restart_after_market_poll_timeout_books_only_the_market_tail(monkeypatch):
+    row = _row(filled=2.0, avg_price=100.0)
+    row["amount"] = 3.0
+    row["exchange_response_json"] = json.dumps({"phases": {"executor": {
+        "limit_summary": {"exchange_order_id": "limit-1", "filled_qty": 2.0, "avg_price": 100.0},
+        "market_summary": {"exchange_order_id": "exchange-41", "filled_qty": 0.0, "avg_price": 0.0},
+    }}})
+    worker, snapshots, persisted = _worker(monkeypatch, row, exchange_fill=(1.0, 101.0, "filled"))
+    worker._sync_one_live_sent_order(row)
+    assert persisted[0]["filled"] == 1.0
+    assert persisted[0]["avg_price"] == 101.0
+    assert snapshots[0]["filled"] == 3.0
+    assert snapshots[0]["avg_price"] == pytest.approx(100 + 1 / 3)
+    assert snapshots[0]["status"] == "filled"
+
+
 def test_live_sent_sync_keeps_terminal_fill_open_when_average_price_is_missing(monkeypatch):
     row = _row(filled=0.0, avg_price=0.0)
     worker, snapshots, persisted = _worker(

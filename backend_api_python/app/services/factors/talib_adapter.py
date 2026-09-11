@@ -88,8 +88,12 @@ def compute_talib_indicator(
         raise TalibFactorError(f"factor.missingFields:{','.join(missing)}")
     clean = frame.copy()
     clean.columns = [str(column).strip().lower() for column in clean.columns]
+    normalized = dict(params or {})
+    if library_id == "SMA" and "period" in normalized:
+        period = normalized.pop("period")
+        normalized.setdefault("timeperiod", period)
     try:
-        result = function(clean, **dict(params or {}))
+        result = function(clean, **normalized)
     except Exception as exc:
         raise TalibFactorError("factor.computeFailed") from exc
     outputs = list(function.info.get("output_names") or [])

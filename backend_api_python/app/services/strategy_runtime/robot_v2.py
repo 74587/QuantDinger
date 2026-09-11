@@ -147,9 +147,7 @@ def _build_grid_v2_source(
         for index, role in enumerate(roles)
         if role in {"long_seed", "short_seed"}
     ]
-    # More entry slots than entry cells cannot change trading behavior, but it
-    # increases generated state and makes workload estimates misleading.
-    max_open_orders = min(max_open_orders, max(1, len(entry_indexes)))
+    max_open_orders = min(max_open_orders, max(1, len(roles)))
     entry_budget = 1.0 if side == "neutral" else max(0.0, 1.0 - initial_pct)
     budget_pcts = [0.0 for _ in roles]
     for index in entry_indexes:
@@ -157,13 +155,13 @@ def _build_grid_v2_source(
     for index in seed_indexes:
         budget_pcts[index] = initial_pct / max(1, len(seed_indexes))
 
-    # Arm orders nearest to the anchor first, matching the live max-open-order policy.
+    # Seed cells become entry candidates after their initial inventory exits.
     arm_order = sorted(
-        entry_indexes,
+        [index for index in range(len(roles)) if budget_pcts[index] > 0],
         key=lambda index: abs(
             (
                 lower_prices[index]
-                if roles[index] == "long_entry"
+                if roles[index].startswith("long")
                 else upper_prices[index]
             )
             - reference
@@ -197,7 +195,7 @@ def _build_grid_v2_source(
         f"MAX_OPEN_ENTRY_ORDERS = {max_open_orders!r}\n"
         f"{_equity_risk_constants(config)}"
         "PERSIST_RUNTIME_STATE = True\n"
-        "GRID_TEMPLATE_VERSION = 6\n"
+        "GRID_TEMPLATE_VERSION = 7\n"
     )
     body = f'''
 
@@ -391,12 +389,38 @@ def _place_exit(index):
     g.cell_states[index] = "exit_pending"
 
 
-def _arm_orders(context):
+def _entry_price(index):
+    return _price(CELL_LOWER[index] if CELL_ROLES[index].startswith("long") else CELL_UPPER[index])
+
+
+def _arm_orders(context, price):
     for index in range(len(CELL_ROLES)):
         if g.cell_states[index] == "exit_ready":
             _place_exit(index)
-    active_entries = sum(1 for state in g.cell_states if state == "entry_pending")
+    pinned = []
+    candidates = []
     for index in ARM_ORDER:
+        state = g.cell_states[index]
+        if state not in ("entry_ready", "entry_pending"):
+            continue
+        if state == "entry_pending":
+            status = _status(g.cell_refs[index])
+            if abs(float(status.get("filled_quantity") or 0.0)) > 1e-12:
+                pinned.append(index)
+                continue
+        entry_price = _entry_price(index)
+        if (CELL_ROLES[index].startswith("long") and entry_price <= price) or (CELL_ROLES[index].startswith("short") and entry_price >= price):
+            candidates.append(index)
+    candidates.sort(key=lambda index: (abs(_entry_price(index) - price), index))
+    selected = candidates[:max(0, MAX_OPEN_ENTRY_ORDERS - len(pinned))]
+    for index in ARM_ORDER:
+        if g.cell_states[index] == "entry_pending" and index not in selected and index not in pinned:
+            if cancel_order(g.cell_refs[index]):
+                g.cell_refs[index] = ""
+                g.cell_states[index] = "entry_ready"
+                g.cell_cycles[index] += 1
+    active_entries = sum(1 for state in g.cell_states if state == "entry_pending")
+    for index in selected:
         if active_entries >= MAX_OPEN_ENTRY_ORDERS:
             break
         if g.cell_states[index] == "entry_ready":
@@ -405,10 +429,11 @@ def _arm_orders(context):
 
 
 def handle_data(context, data):
-    bars = get_history(2, TIMEFRAME, ["high", "low", "close"], INSTRUMENT)
-    if len(bars) < 1 or g.halted:
+    if g.halted:
         return
-    price = float(bars["close"].iloc[-1])
+    price = data.current(INSTRUMENT, "close", frequency=TIMEFRAME)
+    if price <= 0:
+        return
     if g.anchor_price <= 0:
         g.anchor_price = price
     _reconcile_initial()
@@ -428,7 +453,7 @@ def handle_data(context, data):
             reason="grid_initial_" + side,
             client_order_id=g.initial_ref,
         )
-    _arm_orders(context)
+    _arm_orders(context, price)
 '''
     return constants + body
 

@@ -13,6 +13,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.signal_notifier import SignalNotifier
@@ -2104,6 +2105,7 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 symbol=str(symbol),
                 side=side,
                 quantity=float(remaining or 0.0),
+                quote_amount=float(spot_quote_amt or 0.0),
                 market_type=market_type,
                 price=float(limit_price or 0.0),
                 pos_side=pos_side,
@@ -2115,36 +2117,16 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 exchange_config=exchange_config,
             )
             if execution_algo == "limit":
-                intent = OrderIntent(
-                    symbol=intent.symbol,
-                    side=intent.side,
-                    quantity=intent.quantity,
-                    market_type=intent.market_type,
-                    price=intent.price,
-                    pos_side=intent.pos_side,
-                    reduce_only=intent.reduce_only,
+                intent = replace(
+                    intent,
                     client_order_id=limit_client_oid,
-                    fallback_client_order_id=market_client_oid,
-                    leverage=intent.leverage,
-                    margin_mode=intent.margin_mode,
-                    exchange_config=intent.exchange_config,
                 )
                 execution_result = RestingLimitExecutor(adapter).execute(intent)
                 limit_order_id = str(execution_result.exchange_order_id or "")
             elif use_limit_first:
-                intent = OrderIntent(
-                    symbol=intent.symbol,
-                    side=intent.side,
-                    quantity=intent.quantity,
-                    market_type=intent.market_type,
-                    price=intent.price,
-                    pos_side=intent.pos_side,
-                    reduce_only=intent.reduce_only,
+                intent = replace(
+                    intent,
                     client_order_id=limit_client_oid,
-                    fallback_client_order_id=market_client_oid,
-                    leverage=intent.leverage,
-                    margin_mode=intent.margin_mode,
-                    exchange_config=intent.exchange_config,
                 )
                 execution_result = LimitThenMarketExecutor(
                     adapter,
@@ -2176,7 +2158,9 @@ class PendingOrderWorker(PendingOrderPositionSyncMixin):
                 append_strategy_log(strategy_id, "error", f"Exchange order failed ({exchange_id} {symbol} {signal_type}): {friendly_error}")
                 return
             apply_execution_result(fills, execution_result)
-            if execution_algo != "limit":
+            if use_limit_first and not (execution_result.raw.get("market_summary") or {}).get("exchange_order_id"):
+                limit_order_id = str(execution_result.exchange_order_id or "")
+            elif execution_algo != "limit":
                 market_order_id = str(execution_result.exchange_order_id or "")
         except LiveTradingError as e:
             logger.warning(f"live executor failed: pending_id={order_id}, strategy_id={strategy_id}, cfg={safe_cfg}, err={e}")

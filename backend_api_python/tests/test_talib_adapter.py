@@ -37,3 +37,24 @@ def test_talib_single_and_multi_output_computation():
     assert np.isfinite(rsi)
     assert list(macd.columns) == ["macd", "macdsignal", "macdhist"]
     assert np.isfinite(macd["macdhist"].dropna().iloc[-1])
+
+
+@pytest.mark.parametrize("name", ["sma", "SMA", "talib:SMA"])
+@pytest.mark.parametrize("period", [20, 60])
+def test_sma_platform_period_matches_native_talib_parameter(name, period):
+    frame = _frame()
+    params = {"period": period}
+    actual = compute_talib_indicator(name, frame, params)
+    expected = frame["close"].rolling(period).mean()
+
+    np.testing.assert_allclose(actual, expected, equal_nan=True)
+    assert params == {"period": period}
+    assert compute_talib_factor(name, frame, params) == pytest.approx(expected.iloc[-1])
+
+
+def test_sma_explicit_timeperiod_takes_precedence_over_alias():
+    frame = _frame()
+    actual = compute_talib_indicator("SMA", frame, {"period": 20, "timeperiod": 60})
+    expected = compute_talib_indicator("SMA", frame, {"timeperiod": 60})
+
+    pd.testing.assert_series_equal(actual, expected)

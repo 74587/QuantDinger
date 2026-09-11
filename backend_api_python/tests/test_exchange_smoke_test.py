@@ -19,7 +19,7 @@ def _load_module():
     return mod
 
 
-def test_load_cases_from_config():
+def test_load_cases_from_config(tmp_path):
     mod = _load_module()
     cfg = {
         "defaults": {
@@ -40,15 +40,9 @@ def test_load_cases_from_config():
             }
         ],
     }
-    path = Path(__file__).resolve().parent / "_tmp_smoke_config.json"
-    try:
-        path.write_text(json.dumps(cfg), encoding="utf-8")
-        cases = mod.load_cases(path, Namespace())
-    finally:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+    path = tmp_path / "smoke_config.json"
+    path.write_text(json.dumps(cfg), encoding="utf-8")
+    cases = mod.load_cases(path, Namespace())
 
     assert len(cases) == 1
     case = cases[0]

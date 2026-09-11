@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from app.services.live_trading.base import LiveOrderResult, LiveTradingError
 from app.services.live_trading.contracts import ExchangeOrderAdapter, FillSnapshot, OrderIntent
+from app.services.pending_orders.sent_order_recovery import normalize_live_order_status
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,9 @@ class MarketOrderExecutor:
     def execute(self, intent: OrderIntent) -> OrderExecutionResult:
         try:
             result = self.adapter.place_market_order(intent)
+        except LiveTradingError as exc:
+            return OrderExecutionResult.rejected(exc)
+        try:
             fill = self.adapter.wait_for_fill(
                 intent,
                 order_id=result.exchange_order_id,
@@ -68,8 +72,11 @@ class MarketOrderExecutor:
                 )
             status = "filled" if float(result.filled or 0.0) > 0 else "submitted"
             return OrderExecutionResult.from_live_order(result, status=status)
-        except LiveTradingError as exc:
-            return OrderExecutionResult.rejected(exc)
+        except Exception as exc:
+            return replace(
+                OrderExecutionResult.from_live_order(result),
+                raw={"place": dict(result.raw or {}), "reconciliation_error": str(exc)},
+            )
 
 
 class RestingLimitExecutor:
@@ -110,6 +117,8 @@ class LimitThenMarketExecutor:
     def execute(self, intent: OrderIntent) -> OrderExecutionResult:
         if float(intent.price or 0.0) <= 0:
             return MarketOrderExecutor(self.adapter).execute(intent)
+        result = None
+        fill = None
         try:
             result = self.adapter.place_limit_order(intent)
             fill = self.adapter.wait_for_fill(
@@ -117,49 +126,42 @@ class LimitThenMarketExecutor:
                 order_id=result.exchange_order_id,
                 max_wait_sec=self.max_wait_sec,
             )
-            limit_filled = float(fill.filled_qty or 0.0) if fill else 0.0
+            limit_filled = max(float(result.filled or 0.0), float(fill.filled_qty or 0.0) if fill else 0.0)
             if _is_complete(fill, requested_qty=float(intent.quantity or 0.0)):
-                return OrderExecutionResult(
-                    success=True,
-                    exchange_id=str(result.exchange_id or ""),
-                    exchange_order_id=str(result.exchange_order_id or ""),
-                    filled_qty=float(fill.filled_qty or 0.0),
-                    avg_price=float(fill.avg_price or 0.0),
-                    status=fill.status or "filled",
-                    raw=dict(fill.raw or result.raw or {}),
-                    fees_by_ccy=dict(fill.fees_by_ccy or {}),
-                )
+                return _limit_result(result, fill)
             if not self.fallback_to_market:
-                return OrderExecutionResult(
-                    success=True,
-                    exchange_id=str(result.exchange_id or ""),
-                    exchange_order_id=str(result.exchange_order_id or ""),
-                    filled_qty=limit_filled,
-                    avg_price=float(fill.avg_price or 0.0) if fill else 0.0,
-                    status=(fill.status if fill else "") or "submitted",
-                    raw={"limit_place": dict(result.raw or {}), "limit_fill": dict((fill.raw if fill else {}) or {})},
-                    fees_by_ccy=dict((fill.fees_by_ccy if fill else {}) or {}),
-                )
+                return _limit_result(result, fill)
             self.adapter.cancel_order(intent, order_id=result.exchange_order_id)
+            confirmed = self.adapter.wait_for_fill(
+                intent, order_id=result.exchange_order_id, max_wait_sec=self.max_wait_sec,
+            )
+            if confirmed is None or float(confirmed.filled_qty or 0.0) < limit_filled:
+                return _limit_result(result, fill, pending=True)
+            fill = confirmed
+            limit_filled = float(fill.filled_qty or 0.0)
+            if normalize_live_order_status(fill.status) not in ("filled", "cancelled"):
+                return _limit_result(result, fill, pending=True)
+            if limit_filled > 0 and float(fill.avg_price or 0.0) <= 0:
+                return _limit_result(result, fill, pending=True)
             remaining_qty = max(0.0, float(intent.quantity or 0.0) - limit_filled)
-            if remaining_qty <= 0:
-                return OrderExecutionResult(
-                    success=True,
-                    exchange_id=str(result.exchange_id or ""),
-                    exchange_order_id=str(result.exchange_order_id or ""),
-                    filled_qty=limit_filled,
-                    avg_price=float(fill.avg_price or 0.0) if fill else 0.0,
-                    status=(fill.status if fill else "") or "submitted",
-                    raw={"limit_place": dict(result.raw or {}), "limit_fill": dict((fill.raw if fill else {}) or {})},
-                    fees_by_ccy=dict((fill.fees_by_ccy if fill else {}) or {}),
-                )
+            if remaining_qty <= 0 or _is_complete(fill, requested_qty=float(intent.quantity or 0.0)):
+                return _limit_result(result, fill)
             market_intent = replace(
                 intent,
                 quantity=remaining_qty,
                 price=0.0,
                 client_order_id=intent.fallback_client_order_id or intent.client_order_id,
+                quote_amount=max(0.0, float(intent.quote_amount or 0.0) - limit_filled * float(fill.avg_price or 0.0)),
             )
+            if float(intent.quote_amount or 0.0) > 0 and market_intent.quote_amount <= 0:
+                return _limit_result(result, fill)
             market = MarketOrderExecutor(self.adapter).execute(market_intent)
+            if not market.success:
+                settled_limit = _limit_result(result, fill)
+                return replace(
+                    settled_limit,
+                    raw={**settled_limit.raw, "market_error": market.error},
+                )
             total_qty = limit_filled + float(market.filled_qty or 0.0)
             limit_avg = float(fill.avg_price or 0.0) if fill else 0.0
             market_avg = float(market.avg_price or 0.0)
@@ -195,8 +197,33 @@ class LimitThenMarketExecutor:
                     },
                 },
             )
-        except LiveTradingError as exc:
-            return OrderExecutionResult.rejected(exc)
+        except Exception as exc:
+            if result is not None:
+                deferred = _limit_result(result, fill, pending=True)
+                return replace(deferred, raw={**deferred.raw, "reconciliation_error": str(exc)})
+            if isinstance(exc, LiveTradingError):
+                return OrderExecutionResult.rejected(exc)
+            raise
+
+
+def _limit_result(result: LiveOrderResult, fill: Optional[FillSnapshot], *, pending: bool = False) -> OrderExecutionResult:
+    quantity = max(float(result.filled or 0.0), float(fill.filled_qty or 0.0) if fill else 0.0)
+    average = float(fill.avg_price or result.avg_price or 0.0) if fill else float(result.avg_price or 0.0)
+    return OrderExecutionResult(
+        success=True,
+        exchange_id=str(result.exchange_id or ""),
+        exchange_order_id=str(result.exchange_order_id or ""),
+        filled_qty=quantity,
+        avg_price=average,
+        status="submitted" if pending else (fill.status if fill else "") or "submitted",
+        fees_by_ccy=dict(fill.fees_by_ccy or {}) if fill else {},
+        raw={
+            "limit_place": dict(result.raw or {}),
+            "limit_fill": dict(fill.raw or {}) if fill else {},
+            "limit_summary": {"exchange_order_id": str(result.exchange_order_id or ""),
+                              "filled_qty": quantity, "avg_price": average},
+        },
+    )
 
 
 def _is_complete(fill: Optional[FillSnapshot], *, requested_qty: float) -> bool:

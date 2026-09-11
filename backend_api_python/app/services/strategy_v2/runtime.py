@@ -6,6 +6,7 @@ import inspect
 import math
 import calendar
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -32,12 +33,16 @@ from .protection import ProtectionDecision, ProtectionEngine, ProtectionSpec, Pr
 
 def _backtest_time_iso(value: Any) -> str:
     """Serialize the UTC-naive market index as an unambiguous UTC instant."""
-    timestamp = pd.Timestamp(value)
+    return _cached_backtest_time_iso(pd.Timestamp(value))
+
+
+@lru_cache(maxsize=8192)
+def _cached_backtest_time_iso(timestamp: pd.Timestamp) -> str:
     if timestamp.tzinfo is None:
         timestamp = timestamp.tz_localize("UTC")
     else:
         timestamp = timestamp.tz_convert("UTC")
-    return timestamp.floor("s").isoformat().replace("+00:00", "Z")
+    return timestamp.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 @dataclass
@@ -212,11 +217,37 @@ class StrategyRuntimeContext:
         self._logs: list[str] = []
         self._default_protection: ProtectionSpec | None = None
         self._indicator_cache: dict[tuple[Any, ...], pd.Series | pd.DataFrame] = {}
+        self._handler_shapes: dict[str, tuple[Any, int | None]] = {}
         self._order_sequence = 0
         self._order_statuses: dict[str, dict[str, Any]] = {}
         self._cancelled_order_ids: set[str] = set()
         self._last_exit_reasons: dict[str, str] = {}
         self.logger = StrategyRuntimeLogger(self.log)
+
+    def invoke_handler(self, name: str, handler: Any, args: tuple[Any, ...]) -> Any:
+        cached = self._handler_shapes.get(name)
+        if cached is None or cached[0] is not handler:
+            parameters = tuple(inspect.signature(handler).parameters.values())
+            count = None if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters) else sum(
+                item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                for item in parameters
+            )
+            cached = (handler, count)
+            self._handler_shapes[name] = cached
+        return handler(*args if cached[1] is None else args[:cached[1]])
+
+    def refresh_portal(self, portal: MultiAssetDataPortal) -> None:
+        if self._indicator_cache:
+            for frequency, frames in self.portal.frames_by_frequency.items():
+                updated = portal.frames_by_frequency.get(frequency, {})
+                if any(
+                    key not in updated or not frame.equals(updated[key].iloc[:len(frame)])
+                    for key, frame in frames.items()
+                ):
+                    self._indicator_cache.clear()
+                    break
+        self.portal = portal
+        self.data = StrategyDataView(portal)
 
     def set_default_protection(self, **values: Any) -> None:
         self._default_protection = ProtectionSpec.from_value(values)
@@ -609,7 +640,7 @@ def _builtin_indicator_contract(
     aliases: dict[str, str] = {}
     outputs: tuple[tuple[str, str], ...] = ((name, ""),)
     factor_id = name
-    if name in {"atr", "rsi", "adx"}:
+    if name in {"sma", "atr", "rsi", "adx"}:
         aliases = {"timeperiod": "period"}
     elif name == "macd":
         aliases = {
@@ -1823,14 +1854,7 @@ class StrategyV2BacktestRunner:
         if not callable(handler):
             return None
         try:
-            signature = inspect.signature(handler)
-            positional = [
-                item for item in signature.parameters.values()
-                if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in signature.parameters.values()):
-                return handler(*args)
-            return handler(*args[:len(positional)])
+            return self.context.invoke_handler(handler_name, handler, args)
         except StrategyV2ContractError:
             raise
         except Exception as exc:
@@ -2227,8 +2251,7 @@ class StrategyV2LiveSession:
         bar_advanced = self.last_processed is None or timestamp > self.last_processed
 
         self.portal = portal
-        self.context.portal = portal
-        self.context.data = StrategyDataView(portal)
+        self.context.refresh_portal(portal)
         self.context.previous_trading_date = self.last_processed
         portal.set_clock(timestamp, include_current=True)
 
@@ -2590,14 +2613,7 @@ class StrategyV2LiveSession:
         if not callable(handler):
             return None
         try:
-            signature = inspect.signature(handler)
-            positional = [
-                item for item in signature.parameters.values()
-                if item.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            ]
-            if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in signature.parameters.values()):
-                return handler(*args)
-            return handler(*args[:len(positional)])
+            return self.context.invoke_handler(handler_name, handler, args)
         except StrategyV2ContractError:
             raise
         except Exception as exc:

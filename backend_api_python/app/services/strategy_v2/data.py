@@ -63,6 +63,9 @@ class MultiAssetDataPortal:
                 f"strategyV2.drivingFrequencyUnavailable:{self.driving_frequency}"
             )
         self.frames = self.frames_by_frequency[self.driving_frequency]
+        self._columns: dict[tuple[str, str], dict[str, Any]] = {}
+        self._visible_ends: dict[tuple[str, str], int] = {}
+        self._field_positions: dict[tuple[str, str, tuple[str, ...]], list[int]] = {}
         values: set[pd.Timestamp] = set()
         for frame in self.frames.values():
             values.update(pd.Timestamp(item) for item in frame.index)
@@ -73,8 +76,28 @@ class MultiAssetDataPortal:
         return self._timestamps
 
     def set_clock(self, current_dt: Any, *, include_current: bool) -> None:
-        self.current_dt = pd.Timestamp(current_dt)
+        timestamp = pd.Timestamp(current_dt)
+        if timestamp != self.current_dt or bool(include_current) != self._include_current:
+            self._visible_ends.clear()
+        self.current_dt = timestamp
         self._include_current = bool(include_current)
+
+    def _visible_end(self, key: str, frequency: str) -> int:
+        cache_key = (key, frequency)
+        if cache_key not in self._visible_ends:
+            cutoff = self._visible_cutoff(frequency)
+            frame = self.frames_by_frequency[frequency][key]
+            self._visible_ends[cache_key] = (
+                0 if cutoff is None else int(frame.index.searchsorted(cutoff, side="right"))
+            )
+        return self._visible_ends[cache_key]
+
+    def _column_arrays(self, key: str, frequency: str) -> dict[str, Any]:
+        cache_key = (key, frequency)
+        if cache_key not in self._columns:
+            frame = self.frames_by_frequency[frequency][key]
+            self._columns[cache_key] = {name: frame[name].to_numpy(copy=False) for name in frame.columns}
+        return self._columns[cache_key]
 
     def resolve_key(self, symbol: object, *, frequency: object = None) -> str:
         frames = self.frames_for_frequency(frequency)
@@ -109,14 +132,9 @@ class MultiAssetDataPortal:
         frames = self.frames_for_frequency(normalized)
         key = self.resolve_key(symbol, frequency=normalized)
         frame = frames[key]
-        cutoff = self._visible_cutoff(normalized)
-        if cutoff is None:
-            return frame.iloc[0:0].copy()
-        end_index = int(frame.index.searchsorted(cutoff, side="right"))
-        visible = frame.iloc[:end_index]
-        if count is not None and int(count) > 0:
-            visible = visible.tail(int(count))
-        return visible.copy()
+        end_index = self._visible_end(key, normalized)
+        start_index = max(0, end_index - int(count)) if count is not None and int(count) > 0 else 0
+        return frame.iloc[start_index:end_index].copy()
 
     def history(
         self,
@@ -132,10 +150,23 @@ class MultiAssetDataPortal:
         output: dict[str, pd.DataFrame] = {}
         for symbol in requested:
             key = self.resolve_key(symbol, frequency=normalized)
-            frame = self.visible_frame(key, count=count, frequency=normalized)
             if selected_fields:
-                available = [field for field in selected_fields if field in frame.columns]
-                frame = frame.loc[:, available]
+                frame = self.frames_by_frequency[normalized][key]
+                selection = (normalized, key, tuple(selected_fields))
+                positions = self._field_positions.get(selection)
+                if positions is None:
+                    positions = [
+                        index for field in selected_fields
+                        for index, column in enumerate(frame.columns) if column == field
+                    ]
+                    if len(self._field_positions) >= 256:
+                        self._field_positions.clear()
+                    self._field_positions[selection] = positions
+                end_index = self._visible_end(key, normalized)
+                start_index = max(0, end_index - int(count)) if count is not None and int(count) > 0 else 0
+                frame = frame.iloc[start_index:end_index, positions].copy()
+            else:
+                frame = self.visible_frame(key, count=count, frequency=normalized)
             output[key] = frame
         if len(output) == 1:
             return next(iter(output.values()))
@@ -149,11 +180,14 @@ class MultiAssetDataPortal:
         *,
         frequency: object = None,
     ) -> float:
-        frame = self.visible_frame(symbol, count=1, frequency=frequency)
-        if frame.empty or field not in frame.columns:
+        normalized = normalize_frequency(frequency, self.driving_frequency)
+        key = self.resolve_key(symbol, frequency=normalized)
+        end_index = self._visible_end(key, normalized)
+        columns = self._column_arrays(key, normalized)
+        if end_index <= 0 or field not in columns:
             return float(default)
         try:
-            value = float(frame.iloc[-1][field])
+            value = float(columns[field][end_index - 1])
             return value if value == value else float(default)
         except Exception:
             return float(default)
@@ -178,17 +212,19 @@ class MultiAssetDataPortal:
             return self._bar_cache[key]
 
         frame = self.frames[key]
-        if ts not in frame.index:
+        try:
+            row_index = frame.index.get_loc(ts)
+        except KeyError:
             self._bar_cache[key] = None
             return None
-        row = frame.loc[ts]
+        columns = self._column_arrays(key, self.driving_frequency)
         try:
             bar: dict[str, Any] = {
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
-                "volume": float(row.get("volume") or 0.0),
+                "open": float(columns["open"][row_index]),
+                "high": float(columns["high"][row_index]),
+                "low": float(columns["low"][row_index]),
+                "close": float(columns["close"][row_index]),
+                "volume": float(columns["volume"][row_index] or 0.0) if "volume" in columns else 0.0,
             }
             for name in (
                 "suspended",
@@ -199,8 +235,8 @@ class MultiAssetDataPortal:
                 "is_limit_down",
                 "industry",
             ):
-                if name in row.index:
-                    bar[name] = row.get(name)
+                if name in columns:
+                    bar[name] = columns[name][row_index]
             self._bar_cache[key] = bar
             return bar
         except (KeyError, TypeError, ValueError):

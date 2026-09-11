@@ -388,12 +388,15 @@ def _ema_values(values: pd.Series, period: int) -> pd.Series:
     clean = _numeric(values).reset_index(drop=True)
     if len(clean) < period:
         raise FactorError("factor.insufficientHistory")
-    output = pd.Series(np.nan, index=clean.index, dtype=float)
-    output.iloc[period - 1] = float(clean.iloc[:period].mean())
+    raw = clean.to_numpy(copy=False)
+    output = np.full(len(clean), np.nan, dtype=float)
+    previous = float(clean.iloc[:period].mean())
+    output[period - 1] = previous
     multiplier = 2.0 / (period + 1.0)
     for index in range(period, len(clean)):
-        output.iloc[index] = (float(clean.iloc[index]) - float(output.iloc[index - 1])) * multiplier + float(output.iloc[index - 1])
-    return output
+        previous = (float(raw[index]) - previous) * multiplier + previous
+        output[index] = previous
+    return pd.Series(output, index=clean.index, dtype=float)
 
 
 def _sma(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
@@ -422,9 +425,11 @@ def _rsi(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
     losses = (-deltas.clip(upper=0.0))
     avg_gain = float(gains.iloc[:period].mean())
     avg_loss = float(losses.iloc[:period].mean())
+    gain_values = gains.to_numpy(copy=False)
+    loss_values = losses.to_numpy(copy=False)
     for index in range(period, len(deltas)):
-        avg_gain = (avg_gain * (period - 1) + float(gains.iloc[index])) / period
-        avg_loss = (avg_loss * (period - 1) + float(losses.iloc[index])) / period
+        avg_gain = (avg_gain * (period - 1) + float(gain_values[index])) / period
+        avg_loss = (avg_loss * (period - 1) + float(loss_values[index])) / period
     if avg_loss <= 0:
         return 100.0
     return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
@@ -528,10 +533,18 @@ def _kdj(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
     close = pd.to_numeric(frame["close"], errors="coerce").reset_index(drop=True)
     k_value = 50.0
     d_value = 50.0
+    if np.isinf(high.to_numpy()).any() or np.isinf(low.to_numpy()).any():
+        # Rolling extrema treat infinity as missing; preserve the scalar contract.
+        highs = [float(high.iloc[max(0, i - period + 1):i + 1].max()) for i in range(len(frame))]
+        lows = [float(low.iloc[max(0, i - period + 1):i + 1].min()) for i in range(len(frame))]
+    else:
+        highs = high.rolling(period, min_periods=1).max().to_numpy(copy=False)
+        lows = low.rolling(period, min_periods=1).min().to_numpy(copy=False)
+    closes = close.to_numpy(copy=False)
     for index in range(period - 1, len(frame)):
-        highest = float(high.iloc[index - period + 1:index + 1].max())
-        lowest = float(low.iloc[index - period + 1:index + 1].min())
-        rsv = 50.0 if highest <= lowest else (float(close.iloc[index]) - lowest) / (highest - lowest) * 100.0
+        highest = float(highs[index])
+        lowest = float(lows[index])
+        rsv = 50.0 if highest <= lowest else (float(closes[index]) - lowest) / (highest - lowest) * 100.0
         k_value = ((k_period - 1) * k_value + rsv) / k_period
         d_value = ((d_period - 1) * d_value + k_value) / d_period
     output = _choice(params, "output", {"k", "d", "j"}, "j")
@@ -574,16 +587,16 @@ def _mfi(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
 def _adx_components(frame: pd.DataFrame, period: int) -> tuple[float, float, float]:
     if len(frame) < period + 1:
         raise FactorError("factor.insufficientHistory")
-    high = pd.to_numeric(frame["high"], errors="coerce").reset_index(drop=True)
-    low = pd.to_numeric(frame["low"], errors="coerce").reset_index(drop=True)
-    close = pd.to_numeric(frame["close"], errors="coerce").reset_index(drop=True)
+    high = pd.to_numeric(frame["high"], errors="coerce").to_numpy(copy=False)
+    low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(copy=False)
+    close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(copy=False)
     tr = []
     plus_dm = []
     minus_dm = []
     for index in range(1, len(frame)):
-        tr.append(max(float(high.iloc[index] - low.iloc[index]), abs(float(high.iloc[index] - close.iloc[index - 1])), abs(float(low.iloc[index] - close.iloc[index - 1]))))
-        up = float(high.iloc[index] - high.iloc[index - 1])
-        down = float(low.iloc[index - 1] - low.iloc[index])
+        tr.append(max(float(high[index] - low[index]), abs(float(high[index] - close[index - 1])), abs(float(low[index] - close[index - 1]))))
+        up = float(high[index] - high[index - 1])
+        down = float(low[index - 1] - low[index])
         plus_dm.append(up if up > down and up > 0 else 0.0)
         minus_dm.append(down if down > up and down > 0 else 0.0)
     if len(tr) < period:
@@ -641,29 +654,30 @@ def _supertrend(frame: pd.DataFrame, params: Mapping[str, Any]) -> float:
     multiplier = _positive_float(params, "multiplier", 3.0)
     if len(frame) < period + 1:
         raise FactorError("factor.insufficientHistory")
-    high = pd.to_numeric(frame["high"], errors="coerce").reset_index(drop=True)
-    low = pd.to_numeric(frame["low"], errors="coerce").reset_index(drop=True)
-    close = pd.to_numeric(frame["close"], errors="coerce").reset_index(drop=True)
+    high = pd.to_numeric(frame["high"], errors="coerce").to_numpy(copy=False)
+    low = pd.to_numeric(frame["low"], errors="coerce").to_numpy(copy=False)
+    close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(copy=False)
     tr = _true_range(frame)
-    atr_values = pd.Series(np.nan, index=range(len(frame)), dtype=float)
-    atr_values.iloc[period - 1] = float(tr.iloc[:period].mean())
+    ranges = tr.to_numpy(copy=False)
+    atr_values = np.full(len(frame), np.nan, dtype=float)
+    atr_values[period - 1] = float(tr.iloc[:period].mean())
     for index in range(period, len(frame)):
-        atr_values.iloc[index] = (float(atr_values.iloc[index - 1]) * (period - 1) + float(tr.iloc[index])) / period
+        atr_values[index] = (float(atr_values[index - 1]) * (period - 1) + float(ranges[index])) / period
     direction = 1
     final_upper = final_lower = float("nan")
     line = float("nan")
     for index in range(period - 1, len(frame)):
-        midpoint = (float(high.iloc[index]) + float(low.iloc[index])) / 2.0
-        basic_upper = midpoint + multiplier * float(atr_values.iloc[index])
-        basic_lower = midpoint - multiplier * float(atr_values.iloc[index])
+        midpoint = (float(high[index]) + float(low[index])) / 2.0
+        basic_upper = midpoint + multiplier * float(atr_values[index])
+        basic_lower = midpoint - multiplier * float(atr_values[index])
         if index == period - 1:
             final_upper, final_lower = basic_upper, basic_lower
         else:
-            final_upper = basic_upper if basic_upper < final_upper or float(close.iloc[index - 1]) > final_upper else final_upper
-            final_lower = basic_lower if basic_lower > final_lower or float(close.iloc[index - 1]) < final_lower else final_lower
-            if direction < 0 and float(close.iloc[index]) > final_upper:
+            final_upper = basic_upper if basic_upper < final_upper or float(close[index - 1]) > final_upper else final_upper
+            final_lower = basic_lower if basic_lower > final_lower or float(close[index - 1]) < final_lower else final_lower
+            if direction < 0 and float(close[index]) > final_upper:
                 direction = 1
-            elif direction > 0 and float(close.iloc[index]) < final_lower:
+            elif direction > 0 and float(close[index]) < final_lower:
                 direction = -1
         line = final_lower if direction > 0 else final_upper
     output = _choice(params, "output", {"direction", "line"}, "direction")

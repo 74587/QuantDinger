@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -19,6 +20,7 @@ from app.services.backtest_limits import (
 from app.services.fundamental_data import get_fundamental_data_service
 from app.services.instrument_rules import InstrumentRulesProvider, get_instrument_rules_provider
 from app.services.universe import UniverseService, get_universe_service
+from app.utils.logger import get_logger
 
 from .contract import StrategyV2ContractError, compile_strategy_v2
 from .factor_research import FactorResearchEngine
@@ -27,6 +29,9 @@ from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
 from .snapshot import MarketDataSnapshotStore, canonical_frame_bytes
 from .storage import StrategyBacktestRepository
+
+
+logger = get_logger(__name__)
 
 
 class StrategyV2BacktestService:
@@ -143,6 +148,7 @@ class StrategyV2BacktestService:
         strategy_name: str = "",
         instrument_rules_snapshot_id: str = "",
     ) -> tuple[int | None, dict[str, Any]]:
+        started_at = perf_counter()
         program = compile_strategy_v2(code)
         manifest = program.manifest
         if end_date <= start_date:
@@ -174,6 +180,7 @@ class StrategyV2BacktestService:
                 warmup_bars=manifest.warmup_bars,
                 fetch_start=fetch_starts[item],
             )
+        data_at = perf_counter()
         frequency_frames, skipped = self.fetch_frequency_frames(
             candidates,
             manifest.frequencies,
@@ -205,6 +212,7 @@ class StrategyV2BacktestService:
                 persist=self.data_kind == "market" and persist,
             )
 
+        replay_at = perf_counter()
         runner = StrategyV2BacktestRunner(
             code=code,
             frames=frames,
@@ -219,6 +227,7 @@ class StrategyV2BacktestService:
             instrument_rules=rules_snapshot,
         )
         result = runner.run(start_date=start_date, end_date=end_date)
+        report_at = perf_counter()
         result["reviewCandles"] = _build_review_candle_snapshots(
             frames,
             result.get("closedTrades") or [],
@@ -327,6 +336,7 @@ class StrategyV2BacktestService:
             "higherTimeframePolicy": "completed_before_driving_bar_close",
         }
 
+        persistence_at = perf_counter()
         run_id = None
         if persist:
             if self.data_kind != "market":
@@ -350,6 +360,15 @@ class StrategyV2BacktestService:
                 result=result,
                 code=code,
             )
+        completed_at = perf_counter()
+        logger.info("Strategy V2 backtest timing run_id=%s symbols=%s frequency=%s seconds=%s", run_id, len(frames), frequency, {
+            "prepare": round(data_at - started_at, 6),
+            "market_data_and_rules": round(replay_at - data_at, 6),
+            "simulation": round(report_at - replay_at, 6),
+            "report_and_snapshots": round(persistence_at - report_at, 6),
+            "persistence": round(completed_at - persistence_at, 6),
+            "total": round(completed_at - started_at, 6),
+        })
         return run_id, result
 
     def resolve_candidates(

@@ -29,6 +29,7 @@ class FakeAdapter:
 
     def cancel_order(self, intent, *, order_id: str = ""):
         self.calls.append(("cancel", order_id))
+        self.fill_status = "canceled"
         return {"ok": True}
 
     def wait_for_fill(self, intent, *, order_id: str = "", max_wait_sec: float = 15.0):
@@ -104,6 +105,7 @@ def test_limit_then_market_cancels_and_falls_back_when_unfilled():
         ("limit", "SOL/USDT"),
         ("wait", "l1", 1.0),
         ("cancel", "l1"),
+        ("wait", "l1", 1.0),
         ("market", "SOL/USDT"),
         ("wait", "m1", 12.0),
     ]
@@ -123,6 +125,7 @@ def test_limit_then_market_preserves_partial_limit_fill_and_markets_remaining():
         ("limit", "SOL/USDT"),
         ("wait", "l1", 1.0),
         ("cancel", "l1"),
+        ("wait", "l1", 1.0),
         ("market", "SOL/USDT"),
         ("wait", "m1", 12.0),
     ]

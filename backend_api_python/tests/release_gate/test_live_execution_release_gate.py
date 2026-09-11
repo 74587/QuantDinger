@@ -13,6 +13,7 @@ from app.services.live_trading.executors import LimitThenMarketExecutor, MarketO
 class DurableLedger:
     position_qty: float = 0.0
     orders: dict = field(default_factory=dict)
+    cancelled: set = field(default_factory=set)
 
 
 class SimulatedExchangeAdapter:
@@ -65,7 +66,8 @@ class SimulatedExchangeAdapter:
             if qty > 0 and not self.ledger.orders.get("limit-fill-applied"):
                 self.ledger.position_qty += qty
                 self.ledger.orders["limit-fill-applied"] = True
-            return FillSnapshot(qty, 100.0 if qty > 0 else 0.0, "partial" if qty > 0 else "open", {})
+            status = "canceled" if order_id in self.ledger.cancelled else "partial" if qty > 0 else "open"
+            return FillSnapshot(qty, 100.0 if qty > 0 else 0.0, status, {})
         placed = self._existing(intent)
         return FillSnapshot(
             float(placed.filled if placed else 0.0),
@@ -76,6 +78,7 @@ class SimulatedExchangeAdapter:
 
     def cancel_order(self, intent: OrderIntent, *, order_id: str = ""):
         self.calls.append(("cancel", order_id))
+        self.ledger.cancelled.add(order_id)
         return {"ok": True}
 
     def query_position(self, intent: OrderIntent):
@@ -107,7 +110,10 @@ def test_partial_fill_cancel_market_fallback_close_and_restart_idempotency():
     assert ledger.position_qty == pytest.approx(3.0)
     assert ("cancel", "limit-1") in first_process.calls
 
-    restarted_process = SimulatedExchangeAdapter(ledger)
+    restarted_process = SimulatedExchangeAdapter(ledger, limit_fill_qty=1.0)
+    repeated_open = LimitThenMarketExecutor(restarted_process).execute(open_intent)
+    assert repeated_open.filled_qty == pytest.approx(opened.filled_qty)
+    assert ledger.position_qty == pytest.approx(3.0)
     close_intent = OrderIntent(
         symbol="BTC/USDT",
         side="sell",

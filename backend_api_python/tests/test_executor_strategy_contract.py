@@ -509,7 +509,7 @@ def test_martingale_generated_source_uses_confirmed_batched_incremental_orders()
         _robot_payload("grid"),
         user_id=7,
     )
-    assert "GRID_TEMPLATE_VERSION = 6" in grid["code"]
+    assert "GRID_TEMPLATE_VERSION = 7" in grid["code"]
     assert "g.cell_states" in grid["code"]
     assert 'reason=side + "_exit"' in grid["code"]
 
@@ -816,7 +816,7 @@ def test_neutral_grid_preview_is_symmetric_and_uses_adjacent_cell_exits():
     assert all(row["take_profit_price"] < row["price"] for row in short_rows)
 
 
-def test_dense_grid_preview_warns_and_generated_source_caps_unused_entry_slots():
+def test_dense_grid_preview_warns_and_generated_source_preserves_entry_slots():
     request = _robot_payload(
         "grid",
         side="long",
@@ -832,7 +832,7 @@ def test_dense_grid_preview_warns_and_generated_source_caps_unused_entry_slots()
 
     assert "high_frequency_grid_backtest_workload" in preview["warnings"]
     assert preview["config"]["grid_count"] == 80
-    assert "MAX_OPEN_ENTRY_ORDERS = 40" in payload["code"]
+    assert "MAX_OPEN_ENTRY_ORDERS = 50" in payload["code"]
 
 
 def test_grid_preview_rejects_pathological_cell_count_instead_of_silent_truncation():

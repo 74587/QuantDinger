@@ -71,6 +71,14 @@ curl -X POST http://localhost:8888/api/agent/v1/backtest/run \
 ```
 
 Poll `/api/agent/v1/jobs/{job_id}` or consume `/api/agent/v1/jobs/{job_id}/stream`. Reuse an idempotency key when retrying the same submission.
+
+Successful backtests also save a standard Backtest Center history record for the
+agent token's user. The completed job's `result.runId` identifies that record;
+the initial submission still returns `job_id` while the run is queued. The result
+keeps its existing metrics alongside `runId`. A persistence error fails the job
+instead of reporting a successful result without saved history. Jobs completed
+before this behavior was enabled are not automatically added to history.
+
 Cancel a queued or running job with `POST /jobs/{job_id}/cancel` using B scope, confirmation at the MCP layer, and a new idempotency key. A running worker may finish its local computation, but it cannot overwrite the durable cancelled state.
 
 ## Indicators
