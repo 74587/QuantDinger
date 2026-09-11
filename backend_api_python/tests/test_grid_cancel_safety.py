@@ -64,6 +64,8 @@ def test_dedupe_failure_preserves_order(monkeypatch, harness, purpose, method, f
         monkeypatch.setattr(engine, "_create_client", fail)
     else:
         monkeypatch.setattr("app.services.grid.engine." + ("cancel_grid_order" if failure == "cancel" else "query_grid_order_fill"), fail)
+        if failure == "cancel":
+            state.snapshot = (0.0, 100.0, "unknown")
     getattr(engine, method)(purpose)
     assert not state.updates
 
@@ -120,6 +122,7 @@ def test_confirmed_dedupe_keeps_largest_order(harness, purpose, method):
 def test_bulk_cancel_failure_keeps_order(monkeypatch, harness, method):
     engine, state = harness
     monkeypatch.setattr("app.services.grid.engine.cancel_grid_order", fail)
+    state.snapshot = (0.0, 100.0, "unknown")
     getattr(engine, method)()
     assert not state.updates
 
@@ -127,6 +130,7 @@ def test_bulk_cancel_failure_keeps_order(monkeypatch, harness, method):
 def test_shutdown_never_blanket_cancels_local_orders(monkeypatch, harness):
     engine, state = harness
     monkeypatch.setattr("app.services.grid.engine.cancel_grid_order", fail)
+    state.snapshot = (0.0, 100.0, "unknown")
     engine._orders.cancel_all = lambda *a: pytest.fail("Blanket cancellation hides unresolved orders")
     engine._cells.release_cancelled_working_orders = lambda *a: 0
     engine.shutdown()
