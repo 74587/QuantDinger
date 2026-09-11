@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.services.billing_service import BillingError, get_billing_service
 
 logger = get_logger(__name__)
 
@@ -94,8 +95,27 @@ def submit_job(
     """
     job_id = _new_job_id()
     created_at = datetime.utcnow()
+    request_payload = dict(request_payload)
     with get_db_connection() as db:
         cur = db.cursor()
+        if idempotency_key and agent_token_id:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"agent-job:{user_id}:{agent_token_id}:{kind}:{idempotency_key}",))
+            cur.execute("""SELECT job_id, kind, status, request, created_at FROM qd_agent_jobs
+                WHERE user_id = %s AND agent_token_id = %s AND kind = %s AND idempotency_key = %s
+                ORDER BY id DESC LIMIT 1""", (user_id, agent_token_id, kind, idempotency_key))
+            existing = cur.fetchone()
+            if existing:
+                saved = _request_dict(existing)
+                saved.pop("__billing", None)
+                if saved != request_payload:
+                    raise BillingError("IDEMPOTENCY_CONFLICT", status=409)
+                db.commit()
+                cur.close()
+                return _job_receipt(existing, duplicate=True)
+        if kind == "backtest":
+            request_payload["__billing"] = get_billing_service().consume_in_transaction(
+                cur, int(user_id), "backtest", f"agent-backtest:{job_id}")
         cur.execute(
             """
             INSERT INTO qd_agent_jobs
@@ -114,7 +134,8 @@ def submit_job(
     accepts_progress = _runner_accepts_progress(runner)
 
     def _run() -> None:
-        _set_status(job_id, "running", started_at=datetime.utcnow())
+        if not _set_status(job_id, "running", started_at=datetime.utcnow()):
+            return
         row = get_job_for_worker(job_id)
         if row and row.get("status") == "cancelled":
             return
@@ -133,7 +154,7 @@ def submit_job(
             if _set_result(job_id, result):
                 _publish_progress(job_id, {"phase": "succeeded", "ts": time.time()}, terminal=True)
             else:
-                _publish_progress(job_id, {"phase": "cancelled", "ts": time.time()}, terminal=True)
+                _publish_terminal_state(job_id)
         except Exception as exc:
             tb = traceback.format_exc()
             logger.error(f"agent_job {job_id} kind={kind} failed: {exc}\n{tb}")
@@ -144,28 +165,44 @@ def submit_job(
                     terminal=True,
                 )
             else:
-                _publish_progress(job_id, {"phase": "cancelled", "ts": time.time()}, terminal=True)
+                _publish_terminal_state(job_id)
 
     celery_enabled = os.getenv("CELERY_TASKS_ENABLED", "false").strip().lower() in {
         "1", "true", "yes", "on",
     }
-    if celery_enabled:
-        from app.tasks.agent_jobs import execute_agent_job, supports_kind
+    try:
+        if celery_enabled:
+            from app.tasks.agent_jobs import execute_agent_job, supports_kind
 
-        if supports_kind(kind):
-            execute_agent_job.delay(job_id)
+            if supports_kind(kind):
+                execute_agent_job.delay(job_id)
+            else:
+                logger.warning("No Celery runner registered for agent job kind=%s; using local executor", kind)
+                _get_executor().submit(_run)
         else:
-            logger.warning("No Celery runner registered for agent job kind=%s; using local executor", kind)
             _get_executor().submit(_run)
-    else:
-        _get_executor().submit(_run)
+    except Exception:
+        logger.exception("Agent job dispatch failed for %s", job_id)
+        _set_failure(job_id, "AGENT_JOB_DISPATCH_FAILED")
+        return _job_receipt(get_job_for_worker(job_id))
 
-    return {
-        "job_id": job_id,
-        "status": "queued",
-        "kind": kind,
-        "created_at": created_at.isoformat() + "Z",
-    }
+    return _job_receipt({"job_id": job_id, "status": "queued", "kind": kind,
+                         "created_at": created_at.isoformat() + "Z", "request": request_payload})
+
+
+def _request_dict(row: dict) -> dict:
+    value = row.get("request") or {}
+    return json.loads(value) if isinstance(value, str) else dict(value)
+
+
+def _job_receipt(row: dict, *, duplicate: bool = False) -> dict:
+    out = {key: row.get(key) for key in ("job_id", "status", "kind", "created_at")}
+    billing = _request_dict(row).get("__billing")
+    if billing is not None:
+        out["billing"] = billing
+    if duplicate:
+        out["duplicate"] = True
+    return out
 
 
 def record_completed_job(
@@ -260,13 +297,20 @@ def _publish_progress(job_id: str, event: dict, *, terminal: bool = False) -> No
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                "UPDATE qd_agent_jobs SET progress = %s::jsonb WHERE job_id = %s",
-                (json.dumps(event, default=str), job_id),
+                """UPDATE qd_agent_jobs SET progress = %s::jsonb WHERE job_id = %s
+                   AND (status IN ('queued', 'running') OR status = %s)""",
+                (json.dumps(event, default=str), job_id, str(event.get("phase") or "") if terminal else ""),
             )
             db.commit()
             cur.close()
     except Exception as exc:
         logger.debug(f"agent_jobs: progress persist failed for {job_id}: {exc}")
+
+
+def _publish_terminal_state(job_id: str) -> None:
+    row = get_job_for_worker(job_id)
+    if row and row.get("status") in {"succeeded", "failed", "cancelled"}:
+        _publish_progress(job_id, {"phase": row["status"], "ts": time.time()}, terminal=True)
 
 
 def stream_progress(job_id: str, *, since_seq: int = 0, idle_timeout_s: float = 60.0) -> Iterator[dict]:
@@ -348,7 +392,7 @@ def _gc_job_state(job_id: str) -> None:
 def _set_status(job_id: str, status: str, *, started_at: Optional[datetime] = None) -> bool:
     with get_db_connection() as db:
         cur = db.cursor()
-        guard = " AND status <> 'cancelled'" if status == "running" else ""
+        guard = " AND status = 'queued'" if status == "running" else ""
         if started_at is not None:
             cur.execute(
                 f"UPDATE qd_agent_jobs SET status = %s, started_at = %s WHERE job_id = %s{guard}",
@@ -360,43 +404,45 @@ def _set_status(job_id: str, status: str, *, started_at: Optional[datetime] = No
                 (status, job_id),
             )
         db.commit()
-        changed = bool(cur.rowcount)
+        changed = cur.rowcount > 0
         cur.close()
     return changed
 
 
 def _set_result(job_id: str, result: Any) -> bool:
-    with get_db_connection() as db:
-        cur = db.cursor()
-        cur.execute(
-            """
-            UPDATE qd_agent_jobs
-            SET status = 'succeeded', result = %s::jsonb, finished_at = NOW()
-            WHERE job_id = %s AND status <> 'cancelled'
-            """,
-            (json.dumps(result, default=str), job_id),
-        )
-        changed = bool(cur.rowcount)
-        db.commit()
-        cur.close()
-    return changed
+    return _finish_job(job_id, "succeeded", result=result)
 
 
 def _set_failure(job_id: str, error: str) -> bool:
+    return _finish_job(job_id, "failed", error=error[:6000])
+
+
+def _finish_job(job_id: str, status: str, *, result: Any = None,
+                error: Optional[str] = None, user_id: Optional[int] = None) -> bool:
+    """Commit the terminal state and any refund in one transaction."""
     with get_db_connection() as db:
         cur = db.cursor()
-        cur.execute(
-            """
-            UPDATE qd_agent_jobs
-            SET status = 'failed', error = %s, finished_at = NOW()
-            WHERE job_id = %s AND status <> 'cancelled'
-            """,
-            (error[:6000], job_id),
-        )
-        changed = bool(cur.rowcount)
+        cur.execute("SELECT user_id, status, request FROM qd_agent_jobs WHERE job_id = %s FOR UPDATE", (job_id,))
+        row = cur.fetchone()
+        if not row or (user_id is not None and int(row["user_id"]) != int(user_id)) or row["status"] not in {"queued", "running"}:
+            db.commit()
+            cur.close()
+            return False
+        payload = _request_dict(row)
+        charge = payload.get("__billing")
+        if charge is not None:
+            if status != "succeeded":
+                charge = get_billing_service().refund_in_transaction(cur, int(row["user_id"]), charge)
+                payload["__billing"] = charge
+            result = {**(result if isinstance(result, dict) else {}), "billing": charge}
+        cur.execute("""UPDATE qd_agent_jobs SET status = %s, result = %s::jsonb,
+            error = %s, request = %s::jsonb, progress = %s::jsonb,
+            finished_at = NOW() WHERE job_id = %s""",
+            (status, json.dumps(result, default=str), error, json.dumps(payload, default=str),
+             json.dumps({"phase": status}), job_id))
         db.commit()
         cur.close()
-    return changed
+    return True
 
 
 def get_job(job_id: str, *, user_id: int) -> Optional[dict]:
@@ -414,6 +460,8 @@ def get_job(job_id: str, *, user_id: int) -> Optional[dict]:
         )
         row = cur.fetchone()
         cur.close()
+    if row and "__billing" in _request_dict(row):
+        row["billing"] = _request_dict(row)["__billing"]
     return row
 
 
@@ -498,23 +546,21 @@ def cancel_job(job_id: str, *, user_id: int) -> Optional[dict]:
     Thread and Celery runners may not be force-killed safely. The durable row is
     marked immediately, and result/failure writers refuse to overwrite it.
     """
+    if _finish_job(job_id, "cancelled", user_id=user_id):
+        _publish_progress(job_id, {"phase": "cancelled", "ts": time.time()}, terminal=True)
+    return get_job(job_id, user_id=user_id)
+
+
+def expire_billed_jobs(*, limit: int = 100) -> int:
+    """Release credits for jobs orphaned by process death or lost dispatch."""
+    timeout = max(300, int(os.getenv("AGENT_BILLED_JOB_TIMEOUT_SEC", "7200")))
     with get_db_connection() as db:
         cur = db.cursor()
-        cur.execute(
-            """
-            UPDATE qd_agent_jobs
-            SET status = 'cancelled', finished_at = NOW(),
-                progress = '{"phase":"cancelled"}'::jsonb
-            WHERE job_id = %s AND user_id = %s
-              AND status IN ('queued', 'running')
-            RETURNING job_id, kind, status, created_at, started_at, finished_at
-            """,
-            (job_id, int(user_id)),
-        )
-        row = cur.fetchone()
-        db.commit()
+        cur.execute("""SELECT job_id FROM qd_agent_jobs
+            WHERE status IN ('queued', 'running') AND jsonb_exists(request, '__billing')
+              AND created_at < NOW() - (%s * INTERVAL '1 second')
+            ORDER BY created_at LIMIT %s""",
+            (timeout, max(1, min(int(limit), 1000))))
+        rows = cur.fetchall()
         cur.close()
-    if row:
-        _publish_progress(job_id, {"phase": "cancelled", "ts": time.time()}, terminal=True)
-        return row
-    return get_job(job_id, user_id=user_id)
+    return sum(bool(_set_failure(row["job_id"], "AGENT_JOB_EXPIRED")) for row in rows)

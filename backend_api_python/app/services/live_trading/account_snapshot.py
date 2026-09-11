@@ -620,6 +620,61 @@ def _fetch_binance_snapshot(
     return swap_pos, spot_pos, orders
 
 
+def _fetch_alpaca_snapshot(exchange_config: Dict[str, Any], errors: List[str]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    from app.services.alpaca_trading.symbols import parse_symbol
+
+    positions: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
+    try:
+        client = create_client(exchange_config, market_type="spot")
+    except Exception:
+        logger.warning("Alpaca snapshot connection failed", exc_info=True)
+        errors.append("brokerAccounts.snapshotConnectionFailed")
+        return [], positions, orders
+
+    def instrument(item):
+        asset_class = str(item.get("asset_class") or "").lower()
+        hint = "Crypto" if asset_class == "crypto" else "USStock" if asset_class == "us_equity" else None
+        symbol, asset_class = parse_symbol(str(item.get("symbol") or ""), market_hint=hint)
+        return {"symbol": symbol, "inst_id": str(item.get("symbol") or ""), "market_type": "spot",
+                "market": "Crypto" if asset_class == "crypto" else "USStock", "asset_class": asset_class}
+
+    try:
+        for item in client.get_positions(raise_on_error=True):
+            quantity = float(item.get("qty") or item.get("quantity") or 0)
+            if not quantity:
+                continue
+            positions.append({
+                **instrument(item),
+                "side": "short" if quantity < 0 or str(item.get("side")).lower() == "short" else "long",
+                "size": abs(quantity),
+                "entry_price": float(item.get("avg_entry_price") or item.get("avgCost") or 0),
+                "mark_price": float(item.get("current_price") or item.get("currentPrice") or 0),
+                "market_value": float(item.get("market_value") or item.get("marketValue") or 0),
+                "unrealized_pnl": float(item.get("unrealized_pnl") or item.get("unrealizedPnL") or 0),
+            })
+    except Exception:
+        logger.warning("Alpaca snapshot positions failed", exc_info=True)
+        errors.append("brokerAccounts.snapshotPositionsFailed")
+    try:
+        for item in client.get_orders(status="open", limit=500, raise_on_error=True):
+            orders.append({
+                **instrument(item),
+                "exchange_order_id": str(item.get("id") or item.get("orderId") or ""),
+                "side": str(item.get("side") or "").lower(),
+                "order_type": str(item.get("order_type") or item.get("orderType") or "").lower(),
+                "price": float(item.get("limit_price") or item.get("limitPrice") or 0),
+                "amount": abs(float(item.get("qty") or item.get("quantity") or 0)),
+                "filled": abs(float(item.get("filled_qty") or item.get("filled") or 0)),
+                "notional": float(item.get("notional") or 0),
+                "status": str(item.get("status") or ""),
+            })
+    except Exception:
+        logger.warning("Alpaca snapshot orders failed", exc_info=True)
+        errors.append("brokerAccounts.snapshotOrdersFailed")
+    return [], positions, orders
+
+
 def fetch_account_snapshot(*, user_id: int, credential_id: int) -> Dict[str, Any]:
     """Live fetch swap/spot legs + open orders for one credential."""
     cred = int(credential_id or 0)
@@ -649,7 +704,12 @@ def fetch_account_snapshot(*, user_id: int, credential_id: int) -> Dict[str, Any
     spot_all: List[Dict[str, Any]] = []
     orders_all: List[Dict[str, Any]] = []
 
-    if exchange_id in ("okx", "okex"):
+    if exchange_id == "alpaca":
+        sp, st, od = _fetch_alpaca_snapshot(exchange_config, errors)
+        swap_all.extend(sp)
+        spot_all.extend(st)
+        orders_all.extend(od)
+    elif exchange_id in ("okx", "okex"):
         try:
             client = create_client(exchange_config, market_type="swap")
             sp, st, od = _fetch_okx_snapshot(client, exchange_id, errors)

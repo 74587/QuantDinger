@@ -289,15 +289,14 @@ def check_health() -> Any:
     try:
         r = _public_client.get("/api/agent/v1/health")
     except httpx.TimeoutException:
-        return {"ok": False, "status": 504, "retriable": True}
+        return {"error": True, "ok": False, "status": 504, "retriable": True}
     except httpx.RequestError as exc:
-        return {"ok": False, "status": 503, "retriable": True, "details": str(exc)}
-    try:
-        body = r.json()
-    except Exception:
-        return {"ok": r.status_code == 200, "status": r.status_code}
-    if isinstance(body, dict) and "data" in body:
-        return body["data"]
+        return {"error": True, "ok": False, "status": 503, "retriable": True, "details": str(exc)}
+    body = _unwrap(r)
+    if not isinstance(body, dict) or (
+        not body.get("error") and body.get("status") != "ok" and body.get("ok") is not True
+    ):
+        return {"error": True, "ok": False, "status": r.status_code, "body": body}
     return body
 
 

@@ -1,6 +1,8 @@
 """Read-class market data endpoints."""
 from __future__ import annotations
 
+import math
+
 from app.data.market_symbols_seed import (
     get_hot_symbols as seed_get_hot_symbols,
     search_symbols as seed_search_symbols,
@@ -136,19 +138,19 @@ def price():
     if not instrument_allowed(symbol):
         return error(403, f"Instrument not allowed: {symbol}", http=403)
     try:
-        rows = _kline_service.get_kline(market=market, symbol=symbol, timeframe="1m", limit=1) or []
-        if not rows:
-            return envelope({"market": market, "symbol": symbol, "price": None})
-        last = rows[-1]
-        # KlineService rows are typically dicts with 'close'/'c' keys.
-        close = (
-            last.get("close") if isinstance(last, dict) else None
-        ) or (last.get("c") if isinstance(last, dict) else None)
+        quote = _kline_service.get_realtime_price(market=market, symbol=symbol) or {}
+        close = float(quote.get("price") or 0)
+        if not math.isfinite(close) or close <= 0:
+            return error(503, "brokerAccounts.quoteUnavailable", retriable=True, http=503)
+        source = str(quote.get("source") or "unknown")
         return envelope({
             "market": market,
             "symbol": symbol,
             "price": close,
-            "raw": last,
+            "source": source,
+            "quote_type": "historical" if source == "kline_1d" else "latest_available",
+            "timestamp": quote.get("timestamp"),
+            "raw": quote,
         })
     except Exception as exc:
         logger.error(f"agent_v1/price failed: {exc}", exc_info=True)

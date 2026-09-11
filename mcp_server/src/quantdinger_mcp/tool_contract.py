@@ -44,7 +44,7 @@ def register_tool(server):
         @wraps(fn)
         def invoke(*args, **kwargs):
             value = fn(*args, **kwargs)
-            if isinstance(value, dict) and (value.get("error") or value.get("success") is False):
+            if isinstance(value, dict) and (value.get("error") or value.get("success") is False or value.get("ok") is False):
                 safe = redact_secrets(value)
                 return CallToolResult(
                     content=[TextContent(type="text", text=json.dumps(safe, ensure_ascii=False))],

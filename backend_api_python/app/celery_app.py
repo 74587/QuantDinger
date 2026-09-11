@@ -50,6 +50,7 @@ celery_app.conf.update(
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
         "quantdinger.tasks.agent_job": {"queue": "jobs"},
+        "quantdinger.tasks.expire_agent_jobs": {"queue": "maintenance"},
         "quantdinger.tasks.reflection": {"queue": "maintenance"},
         "quantdinger.tasks.ai_calibration": {"queue": "maintenance"},
         "quantdinger.tasks.market_catalog_sync": {"queue": "maintenance"},
@@ -57,6 +58,10 @@ celery_app.conf.update(
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
     beat_schedule={
+        "expire-billed-agent-jobs": {
+            "task": "quantdinger.tasks.expire_agent_jobs",
+            "schedule": 60.0,
+        },
         "reflection-cycle": {
             "task": "quantdinger.tasks.reflection",
             "schedule": max(300, int(os.getenv("REFLECTION_WORKER_INTERVAL_SEC", "86400"))),

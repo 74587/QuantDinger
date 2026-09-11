@@ -171,6 +171,8 @@ class FuturesDataSource(BaseDataSource):
                 yf_symbol = yf_symbol + "=F"
             t = yf.Ticker(yf_symbol)
             last = None
+            source = "yfinance"
+            timestamp = None
             try:
                 last = getattr(t, "fast_info", {}).get("last_price")
             except Exception:
@@ -179,7 +181,9 @@ class FuturesDataSource(BaseDataSource):
                 hist = t.history(period="2d", interval="1d")
                 if hist is not None and not hist.empty:
                     last = float(hist["Close"].iloc[-1])
-            return {"symbol": yf_symbol, "last": float(last or 0.0)}
+                    source = "kline_1d"
+                    timestamp = int(hist.index[-1].timestamp())
+            return {"symbol": yf_symbol, "last": float(last or 0.0), "source": source, "timestamp": timestamp}
         except Exception:
             return {"symbol": symbol, "last": 0.0}
 

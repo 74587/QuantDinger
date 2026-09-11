@@ -36,6 +36,39 @@ def test_mcp_tool_registry_complete(fresh_module):
         assert hasattr(fresh_module, name), f"missing tool function: {name}"
 
 
+@pytest.mark.parametrize("failure", ["http", "json_http", "timeout", "connection", "invalid", "business"])
+def test_health_failures_set_protocol_error(fresh_module, monkeypatch, failure):
+    from mcp.types import CallToolResult
+
+    def respond(request):
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        if failure == "connection":
+            raise httpx.ConnectError("connection failed", request=request)
+        if failure == "json_http":
+            return httpx.Response(503, json={"code": 0, "data": {"status": "ok"}})
+        if failure == "business":
+            return httpx.Response(200, json={"code": 0, "data": {"ok": False}})
+        return httpx.Response(503 if failure == "http" else 200, text="<html>unavailable</html>")
+
+    with httpx.Client(base_url="http://fixture.test", transport=httpx.MockTransport(respond)) as client:
+        monkeypatch.setattr(fresh_module, "_public_client", client)
+        result = asyncio.run(fresh_module.mcp.call_tool("check_health", {}))
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+
+
+def test_health_success_stays_success(fresh_module, monkeypatch):
+    from mcp.types import CallToolResult
+
+    with httpx.Client(base_url="http://fixture.test", transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, json={"code": 0, "data": {"status": "ok"}})
+    )) as client:
+        monkeypatch.setattr(fresh_module, "_public_client", client)
+        result = asyncio.run(fresh_module.mcp.call_tool("check_health", {}))
+    assert not isinstance(result, CallToolResult) or result.isError is False
+
+
 def test_mcp_tools_are_actually_registered(fresh_module):
     registered = set(fresh_module.mcp._tool_manager._tools)
     assert registered == set(fresh_module.MCP_TOOL_NAMES)
@@ -56,6 +89,7 @@ def test_every_tool_has_explicit_risk_annotations(fresh_module):
 
 
 @pytest.mark.parametrize('status,body', [
+    (402, {'code': 402, 'message': 'INSUFFICIENT_CREDITS', 'details': {'current': 12, 'required': 30, 'shortage': 18}}),
     (404, {'code': 404, 'message': 'Strategy not found', 'data': None}),
     (200, {'code': 400, 'message': 'Rejected', 'data': None}),
     (200, {'code': 0, 'data': {'error': 'UNSUPPORTED_TRADING_ENVIRONMENT', 'spot_positions': []}}),

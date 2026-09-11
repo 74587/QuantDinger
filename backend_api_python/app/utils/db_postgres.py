@@ -436,6 +436,7 @@ class PostgresCursor:
     def __init__(self, cursor):
         self._cursor = cursor
         self._last_insert_id = None
+        self._rowcount = None
         # INSERT ... RETURNING: execute() peeks the first row for lastrowid; callers
         # that also cur.fetchone() must see the same row (not a second fetch from PG).
         self._buffered_row: Optional[Dict[str, Any]] = None
@@ -472,6 +473,8 @@ class PostgresCursor:
             args = (args,)
 
         self._buffered_row = None
+        self._last_insert_id = None
+        self._rowcount = None
 
         is_insert = query.strip().upper().startswith('INSERT')
         has_returning = 'RETURNING' in query.upper()
@@ -490,6 +493,8 @@ class PostgresCursor:
                     result = self._cursor.execute(q_with_id, args)
                 else:
                     result = self._cursor.execute(q_with_id)
+                # RELEASE SAVEPOINT replaces the native rowcount with -1.
+                self._rowcount = self._cursor.rowcount
                 try:
                     row = self._cursor.fetchone()
                     if row and 'id' in row:
@@ -520,14 +525,18 @@ class PostgresCursor:
                         pass
                 # Retry without RETURNING id.  Leaves _last_insert_id as None.
                 if args:
-                    return self._cursor.execute(query, args)
-                return self._cursor.execute(query)
+                    result = self._cursor.execute(query, args)
+                else:
+                    result = self._cursor.execute(query)
+                self._rowcount = self._cursor.rowcount
+                return result
 
         # Non-INSERT, or INSERT with caller-supplied RETURNING
         if args:
             result = self._cursor.execute(query, args)
         else:
             result = self._cursor.execute(query)
+        self._rowcount = self._cursor.rowcount
 
         if is_insert and has_returning:
             try:
@@ -547,6 +556,7 @@ class PostgresCursor:
         query = self._convert_placeholders(query)
         self._buffered_row = None
         self._last_insert_id = None
+        self._rowcount = None
         if HAS_PSYCOPG2:
             return execute_batch(self._cursor, query, args_list, page_size=1000)
         return self._cursor.executemany(query, args_list)
@@ -583,7 +593,7 @@ class PostgresCursor:
     @property
     def rowcount(self) -> int:
         """Get affected row count"""
-        return self._cursor.rowcount
+        return self._cursor.rowcount if self._rowcount is None else self._rowcount
 
 
 class PostgresConnection:

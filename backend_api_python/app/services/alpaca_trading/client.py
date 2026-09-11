@@ -580,7 +580,7 @@ class AlpacaClient:
             logger.error(f"Alpaca get_account_summary failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def get_positions(self) -> List[Dict[str, Any]]:
+    def get_positions(self, *, raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """Get current positions."""
         try:
             self._ensure_connected()
@@ -606,9 +606,11 @@ class AlpacaClient:
             ]
         except Exception as e:
             logger.error(f"Alpaca get_positions failed: {e}")
+            if raise_on_error:
+                raise
             return []
 
-    def get_orders(self, status: str = "all", limit: int = 100) -> List[Dict[str, Any]]:
+    def get_orders(self, status: str = "all", limit: int = 100, *, raise_on_error: bool = False) -> List[Dict[str, Any]]:
         """Get recent orders, including filled orders by default."""
         try:
             self._ensure_connected()
@@ -628,6 +630,7 @@ class AlpacaClient:
                     "id": str(o.id),
                     "orderId": str(o.id),
                     "symbol": o.symbol,
+                    "asset_class": _enum_value(getattr(o, "asset_class", "")),
                     "side": _enum_value(getattr(o, "side", "")).lower(),
                     "action": _enum_value(getattr(o, "side", "")).upper(),
                     "quantity": _num(getattr(o, "qty", 0)),
@@ -652,6 +655,8 @@ class AlpacaClient:
             ]
         except Exception as e:
             logger.error(f"Alpaca get_orders failed: {e}")
+            if raise_on_error:
+                raise
             return []
 
     def get_open_orders(self) -> List[Dict[str, Any]]:

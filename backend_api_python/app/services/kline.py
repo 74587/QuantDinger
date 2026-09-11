@@ -157,7 +157,8 @@ class KlineService:
                     'low': ticker.get('low', 0),
                     'open': ticker.get('open', 0),
                     'previousClose': ticker.get('previousClose', 0),
-                    'source': 'ticker'
+                    'source': ticker.get('source') or 'ticker',
+                    'timestamp': ticker.get('timestamp'),
                 }
                 self.cache.set(cache_key, result, 30)
                 return result
@@ -184,7 +185,8 @@ class KlineService:
                     'low': latest.get('low', 0),
                     'open': latest.get('open', 0),
                     'previousClose': prev_close,
-                    'source': 'kline_1m'
+                    'source': 'kline_1m',
+                    'timestamp': latest.get('time'),
                 }
                 self.cache.set(cache_key, result, 30)
                 return result
@@ -216,7 +218,8 @@ class KlineService:
                     'low': latest.get('low', 0),
                     'open': latest.get('open', 0),
                     'previousClose': prev_close,
-                    'source': 'kline_1d'
+                    'source': 'kline_1d',
+                    'timestamp': latest.get('time'),
                 }
                 self.cache.set(cache_key, result, 300)
                 return result

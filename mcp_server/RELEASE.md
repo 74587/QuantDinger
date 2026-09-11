@@ -1,6 +1,10 @@
 # Release quantdinger-mcp to PyPI
 
-## This release: 0.6.0
+## This release: 0.6.1
+
+Health probes now report MCP protocol errors for HTTP failures, timeouts, connection failures, and malformed or unsuccessful health responses. Error details still pass through the redaction contract. The accompanying backend patch fixes idempotency row counts, Alpaca account snapshots, and best-effort futures quotes; deploying the MCP package alone does not update the backend.
+
+## Previous release: 0.6.0
 
 Gateway HTTP errors, application errors, validation failures, and confirmation denials now return MCP `isError=true` while preserving redacted structured details. All 58 tools declare read-only, destructive, idempotent, and open-world hints. Write hints remain conservatively non-idempotent so clients cannot infer that retries against older gateways are safe. Confirmation and server-side permission checks remain required.
 
@@ -33,10 +37,10 @@ py -3.13 -m build
 # 5. Upload (you run this -- needs your PyPI token)
 $env:TWINE_USERNAME = "__token__"
 $env:TWINE_PASSWORD = "pypi-Ag..."   # your API token
-py -3.13 -m twine upload dist/quantdinger_mcp-0.6.0*
+py -3.13 -m twine upload dist/quantdinger_mcp-0.6.1*
 
 # 6. Verify
-pip install --upgrade "quantdinger-mcp==0.6.0"
+pip install --upgrade "quantdinger-mcp==0.6.1"
 quantdinger-mcp
 ```
 

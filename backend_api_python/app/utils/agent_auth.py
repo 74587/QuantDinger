@@ -522,7 +522,7 @@ def _reserve_idempotency(token_id: int, key: str) -> tuple[str, Optional[dict]]:
             """,
             (int(token_id), request.method.upper(), request.path, key, request_hash),
         )
-        inserted = bool(cur.rowcount)
+        inserted = cur.rowcount > 0
         if inserted:
             db.commit()
             cur.close()
@@ -757,7 +757,7 @@ def with_idempotency(kind: str):
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT job_id, status, result, error
+                SELECT job_id, kind, status, request, result, error, created_at
                 FROM qd_agent_jobs
                 WHERE agent_token_id = %s AND kind = %s AND idempotency_key = %s
                 ORDER BY id DESC LIMIT 1

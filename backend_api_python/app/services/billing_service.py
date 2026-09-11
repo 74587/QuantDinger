@@ -18,6 +18,16 @@ from app.services.billing_config import FEATURE_NAMES, load_billing_config, load
 logger = get_logger(__name__)
 
 
+class BillingError(Exception):
+    """A charge could not be accepted; callers must roll back their transaction."""
+
+    def __init__(self, code: str, *, status: int = 503, details: Optional[dict] = None):
+        super().__init__(code)
+        self.code = code
+        self.status = status
+        self.details = details or {}
+
+
 class BillingService:
     """Billing and credit accounting service."""
     
@@ -595,6 +605,78 @@ class BillingService:
             # Best-effort; never break caller
             pass
     
+    def consume_in_transaction(self, cur, user_id: int, feature: str, reference_id: str) -> dict:
+        """Deduct and record credits using the caller's transaction, without committing."""
+        enabled = self.is_billing_enabled()
+        cost = max(0, int(self.get_feature_cost(feature) or 0))
+        cur.execute("SELECT credits FROM qd_users WHERE id = ? FOR UPDATE", (user_id,))
+        account = cur.fetchone()
+        if not account:
+            raise BillingError("BILLING_ACCOUNT_NOT_FOUND")
+        balance = Decimal(str(account.get("credits") or 0))
+        charge = {"enabled": enabled, "feature": feature, "cost": cost, "charged": 0,
+                  "refunded": 0, "remaining": float(balance), "referenceId": reference_id,
+                  "transactionId": None, "refundTransactionId": None, "status": "free"}
+        if reference_id:
+            cur.execute("""SELECT id, amount, balance_after FROM qd_credits_log
+                WHERE user_id = ? AND action = 'consume' AND feature = ? AND reference_id = ?
+                ORDER BY id DESC LIMIT 1""", (user_id, feature, reference_id))
+            existing = cur.fetchone()
+            if existing:
+                amount = abs(int(existing["amount"]))
+                return {**charge, "enabled": True, "cost": amount, "charged": amount,
+                        "transactionId": existing["id"], "status": "charged"}
+        if not enabled or cost == 0:
+            return charge
+        cur.execute("""UPDATE qd_users SET credits = credits - ?, updated_at = NOW()
+            WHERE id = ? AND credits >= ? RETURNING credits""", (cost, user_id, cost))
+        updated = cur.fetchone()
+        if not updated:
+            raise BillingError("INSUFFICIENT_CREDITS", status=402, details={
+                "feature": feature, "current": float(balance), "required": cost,
+                "shortage": max(0, float(Decimal(cost) - balance)),
+            })
+        remaining = float(updated["credits"])
+        cur.execute("""INSERT INTO qd_credits_log
+            (user_id, action, amount, balance_after, feature, reference_id, remark, created_at)
+            VALUES (?, 'consume', ?, ?, ?, ?, ?, ?) RETURNING id""",
+            (user_id, -cost, remaining, feature, reference_id,
+             f"Consume: {FEATURE_NAMES.get(feature, feature)}", datetime.now(timezone.utc)))
+        transaction_id = cur.fetchone()["id"]
+        return {**charge, "charged": cost, "remaining": remaining,
+                "transactionId": transaction_id, "status": "charged"}
+
+    def refund_in_transaction(self, cur, user_id: int, charge: dict) -> dict:
+        """Refund the recorded debit once, atomically with the caller's job transition."""
+        if int(charge.get("charged") or 0) <= 0:
+            return charge
+        reference = str(charge["referenceId"])
+        feature = str(charge["feature"])
+        cur.execute("SELECT credits FROM qd_users WHERE id = ? FOR UPDATE", (user_id,))
+        if not cur.fetchone():
+            raise BillingError("BILLING_ACCOUNT_NOT_FOUND")
+        cur.execute("""SELECT amount FROM qd_credits_log WHERE user_id = ?
+            AND action = 'consume' AND feature = ? AND reference_id = ?
+            ORDER BY id DESC LIMIT 1""", (user_id, feature, reference))
+        debit = cur.fetchone()
+        if not debit:
+            raise BillingError("BILLING_DEBIT_NOT_FOUND")
+        amount = abs(int(debit["amount"]))
+        cur.execute("""SELECT id, balance_after FROM qd_credits_log WHERE user_id = ?
+            AND action = 'refund' AND reference_id = ? ORDER BY id DESC LIMIT 1""", (user_id, reference))
+        refund = cur.fetchone()
+        if not refund:
+            cur.execute("""UPDATE qd_users SET credits = credits + ?, updated_at = NOW()
+                WHERE id = ? RETURNING credits""", (amount, user_id))
+            remaining = float(cur.fetchone()["credits"])
+            cur.execute("""INSERT INTO qd_credits_log
+                (user_id, action, amount, balance_after, feature, reference_id, remark, created_at)
+                VALUES (?, 'refund', ?, ?, ?, ?, ?, NOW()) RETURNING id""",
+                (user_id, amount, remaining, feature, reference, "Automatic refund: agent job did not complete"))
+            refund = {"id": cur.fetchone()["id"], "balance_after": remaining}
+        return {**charge, "refunded": amount, "remaining": float(refund["balance_after"]),
+                "refundTransactionId": refund["id"], "status": "refunded"}
+
     def check_and_consume(self, user_id: int, feature: str, reference_id: str = '') -> Tuple[bool, str]:
         """
         Check and consume credits for a feature.

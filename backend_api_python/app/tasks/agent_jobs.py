@@ -38,14 +38,15 @@ def execute_agent_job(job_id: str) -> None:
     row = agent_jobs.get_job_for_worker(job_id)
     if row is None:
         raise ValueError(f"Agent job does not exist: {job_id}")
-    if row.get("status") in {"succeeded", "cancelled"}:
+    if row.get("status") in {"succeeded", "failed", "cancelled"}:
         return
 
     kind = str(row.get("kind") or "")
     if not supports_kind(kind):
         raise ValueError(f"Unsupported durable agent job kind: {kind}")
 
-    agent_jobs._set_status(job_id, "running", started_at=datetime.utcnow())
+    if not agent_jobs._set_status(job_id, "running", started_at=datetime.utcnow()):
+        return
     agent_jobs._publish_progress(job_id, {"phase": "running", "ts": time.time()})
     try:
         request_payload = row.get("request") or {}
@@ -63,11 +64,7 @@ def execute_agent_job(job_id: str) -> None:
                 terminal=True,
             )
         else:
-            agent_jobs._publish_progress(
-                job_id,
-                {"phase": "cancelled", "ts": time.time()},
-                terminal=True,
-            )
+            agent_jobs._publish_terminal_state(job_id)
     except Exception as exc:
         if agent_jobs._set_failure(job_id, str(exc)):
             agent_jobs._publish_progress(
@@ -76,9 +73,12 @@ def execute_agent_job(job_id: str) -> None:
                 terminal=True,
             )
         else:
-            agent_jobs._publish_progress(
-                job_id,
-                {"phase": "cancelled", "ts": time.time()},
-                terminal=True,
-            )
+            agent_jobs._publish_terminal_state(job_id)
         raise
+
+
+@celery_app.task(name="quantdinger.tasks.expire_agent_jobs")
+def expire_agent_jobs() -> int:
+    from app.utils.agent_jobs import expire_billed_jobs
+
+    return expire_billed_jobs()
