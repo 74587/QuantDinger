@@ -150,6 +150,76 @@ def test_binance_futures_uses_futures_trade_history():
     assert signed.call_args.kwargs["params"]["orderId"] == "34"
 
 
+def test_binance_futures_open_orders_are_scoped_to_symbol():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    with patch.object(client, "_signed_request", return_value=[]) as signed:
+        assert client.get_open_orders(symbol="SOL/USDT") == []
+
+    signed.assert_called_once_with(
+        "GET",
+        "/fapi/v1/openOrders",
+        params={"symbol": "SOLUSDT"},
+    )
+
+
+def test_binance_zero_commission_fill_is_authoritative():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    order = {
+        "status": "FILLED",
+        "executedQty": "0.1",
+        "cumQuote": "6000",
+        "avgPrice": "60000",
+    }
+    trades = [{"commission": "0", "commissionAsset": "USDT"}]
+    with patch.object(client, "get_order", return_value=order), patch.object(
+        client,
+        "get_user_trades",
+        return_value=trades,
+    ), patch("time.sleep") as sleep:
+        result = client.wait_for_fill(
+            symbol="BTC/USDT",
+            order_id="34",
+            max_wait_sec=0,
+        )
+
+    assert result["fee"] == 0
+    assert result["fees_by_ccy"] == {"USDT": 0.0}
+    assert result["fee_status"] == "actual_zero"
+    sleep.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "client,history_method",
+    [
+        (BinanceSpotClient(api_key="key", secret_key="secret"), "get_my_trades"),
+        (BinanceFuturesClient(api_key="key", secret_key="secret"), "get_user_trades"),
+    ],
+)
+def test_binance_zero_wait_fill_does_not_block_on_fee_retries(client, history_method):
+    order = {
+        "status": "FILLED",
+        "executedQty": "0.1",
+        "cummulativeQuoteQty": "6000",
+        "cumQuote": "6000",
+        "avgPrice": "60000",
+    }
+    with patch.object(client, "get_order", return_value=order), patch.object(
+        client,
+        history_method,
+        return_value=[],
+    ) as history, patch("time.sleep") as sleep:
+        result = client.wait_for_fill(
+            symbol="BTC/USDT",
+            order_id="34",
+            max_wait_sec=0,
+        )
+
+    assert result["filled"] == pytest.approx(0.1)
+    assert result["fees_by_ccy"] == {}
+    history.assert_called_once()
+    sleep.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "client",
     [

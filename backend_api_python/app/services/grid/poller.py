@@ -218,6 +218,10 @@ class GridFillPoller:
                 )
 
                 fees = fee_breakdown_snapshot(details)
+                fee_status = str(
+                    details.get("fee_status")
+                    or ("actual" if fees else "pending")
+                )
                 commission, commission_ccy = fee_storage_values(fees)
                 fill_price = float(avg or order.price or 0.0)
                 commission_quote = (
@@ -230,7 +234,7 @@ class GridFillPoller:
                     if fees and fill_price > 0
                     else None
                 )
-                if fees:
+                if fees or fee_status == "actual_zero":
                     runner.engine.on_order_filled(
                         order,
                         new_fill,
@@ -238,7 +242,7 @@ class GridFillPoller:
                         commission=commission,
                         commission_ccy=commission_ccy,
                         commission_quote=commission_quote,
-                        fee_status="actual",
+                        fee_status=fee_status,
                         fee_source="rest",
                     )
                 else:

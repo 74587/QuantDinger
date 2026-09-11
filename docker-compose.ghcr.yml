@@ -30,6 +30,8 @@
 #   FRONTEND_IMAGE  - frontend image path (default: ghcr.io/openbyteinc/quantdinger-frontend)
 #   MOBILE_IMAGE    - mobile H5 image path (default: ghcr.io/openbyteinc/quantdinger-mobile)
 #   IMAGE_PREFIX    - postgres/redis registry prefix (e.g. docker.m.daocloud.io/library/)
+#   TRADING_DB_POOL_MAX - trading-worker pool limit (default: 32)
+#   PG_MAX_CONNECTIONS  - PostgreSQL server limit (default: 150)
 #
 # Normal use: set IMAGE_TAG once and both services move in lockstep.
 # Per-side overrides only kick in when BACKEND_TAG / FRONTEND_TAG are
@@ -247,8 +249,8 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - REDIS_CACHE_NAMESPACE=${REDIS_CACHE_NAMESPACE:-quantdinger:cache:v1}
       - CACHE_ENABLED=true
-      - DB_POOL_MIN=${WORKER_DB_POOL_MIN:-2}
-      - DB_POOL_MAX=${WORKER_DB_POOL_MAX:-12}
+      - DB_POOL_MIN=${TRADING_DB_POOL_MIN:-4}
+      - DB_POOL_MAX=${TRADING_DB_POOL_MAX:-32}
       - SKIP_AUTO_MIGRATE=true
       - ALLOW_LOCAL_DESKTOP_BROKERS=${ALLOW_LOCAL_DESKTOP_BROKERS:-true}
     networks:

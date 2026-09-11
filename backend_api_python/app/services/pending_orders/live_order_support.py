@@ -61,6 +61,7 @@ class FillAccumulator:
     total_fee: float = 0.0
     fee_ccy: str = ""
     fees_by_ccy: Dict[str, float] = field(default_factory=dict)
+    fee_status: str = "pending"
 
     def apply_fill(self, filled_qty: float, avg_px: float) -> None:
         fq = float(filled_qty or 0.0)
@@ -99,6 +100,11 @@ def apply_execution_result(fills: FillAccumulator, result: Any) -> None:
         return
     for fee_currency, fee_amount in breakdown.items():
         fills.apply_fee(float(fee_amount or 0.0), str(fee_currency or ""))
+    status = str(getattr(result, "fee_status", "") or "").strip().lower()
+    if status in {"actual", "actual_zero"}:
+        fills.fee_status = status
+    elif fills.fees_by_ccy:
+        fills.fee_status = "actual"
 
 
 @dataclass

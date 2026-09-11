@@ -168,3 +168,50 @@ def test_poller_posts_exchange_fee_with_rest_fallback():
         fee_status="actual",
         fee_source="rest",
     )
+
+
+def test_poller_persists_authoritative_zero_fee():
+    poller = GridFillPoller()
+    runner = MagicMock()
+    runner.exchange_config = {"exchange_id": "binance", "credential_id": 1}
+    order = GridRestingOrder(
+        id=14,
+        strategy_id=1,
+        symbol="BTC/USDT",
+        price=100.0,
+        quantity=1.0,
+        exchange_order_id="binance-14",
+        processed_fill_qty=0.0,
+        status="open",
+    )
+
+    def fake_wait(*args, **kwargs):
+        kwargs["details"].update(
+            {
+                "filled": 1.0,
+                "avg_price": 100.0,
+                "fees_by_ccy": {"USDT": 0.0},
+                "fee_status": "actual_zero",
+            }
+        )
+        return 1.0, 100.0
+
+    with patch(
+        "app.services.grid.poller.query_grid_order_fill",
+        return_value=(1.0, 100.0, "filled"),
+    ), patch(
+        "app.services.grid.poller.wait_grid_market_fill",
+        side_effect=fake_wait,
+    ), patch.object(poller._repo, "update_status"):
+        poller._poll_order(runner, MagicMock(), order, "swap")
+
+    runner.engine.on_order_filled.assert_called_once_with(
+        order,
+        1.0,
+        100.0,
+        commission=0.0,
+        commission_ccy="",
+        commission_quote=None,
+        fee_status="actual_zero",
+        fee_source="rest",
+    )

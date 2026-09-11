@@ -38,6 +38,7 @@ class FillSnapshot:
     status: str
     raw: Dict[str, Any] = field(default_factory=dict)
     fees_by_ccy: Dict[str, float] = field(default_factory=dict)
+    fee_status: str = "pending"
 
 
 @dataclass(frozen=True)

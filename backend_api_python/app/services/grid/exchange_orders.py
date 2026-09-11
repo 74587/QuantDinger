@@ -35,6 +35,7 @@ class GridMarketOrderExecution:
     commission_ccy: str = ""
     commission_quote: Optional[float] = None
     fees_by_ccy: Dict[str, float] = field(default_factory=dict)
+    fee_status: str = "pending"
     raw: Dict[str, Any] = field(default_factory=dict)
 
     def __iter__(self):
@@ -641,6 +642,10 @@ def execute_grid_market_order(
         commission_ccy=commission_ccy,
         commission_quote=commission_quote,
         fees_by_ccy=fees,
+        fee_status=str(
+            details.get("fee_status")
+            or ("actual" if fees else "pending")
+        ),
         raw=details,
     )
 

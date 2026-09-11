@@ -2314,8 +2314,12 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                         order_intent_id=int(payload.get("order_intent_id") or order_row.get("order_intent_id") or 0),
                         exchange_id=str(res.exchange_id or ""),
                         exchange_order_id=str(res.exchange_order_id or ""),
-                        fee_status="actual" if fills.fees_by_ccy else "pending",
-                        fee_source="rest" if fills.fees_by_ccy else "",
+                        fee_status=str(fills.fee_status or "pending"),
+                        fee_source=(
+                            "rest"
+                            if str(fills.fee_status or "pending") in {"actual", "actual_zero"}
+                            else ""
+                        ),
                         raw_fill=post_query or {},
                     )
                 logger.info(f"live record done: pending_id={order_id} strategy_id={strategy_id} symbol={symbol} signal={signal_type}")

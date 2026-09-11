@@ -83,6 +83,10 @@ def is_recoverable_position_error(reason: str) -> bool:
         "position_ownership_drift", "target_already_met",
         "below step/min", "below lot step/minqty", "below min/precision",
         "below mintradeusdt/precision",
+        '"code":-2022', "'code': -2022", "'code':-2022",
+        '"code":-4118', "'code': -4118", "'code':-4118",
+        "reduceonly order is rejected", "reduce only order is rejected",
+        "reduceonly order failed", "reduce only order failed",
     ))
 
 

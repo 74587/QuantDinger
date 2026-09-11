@@ -85,6 +85,9 @@ class GridEngine:
         self._last_entry_order_ts = 0.0
         self._entry_ownership_cache: Dict[str, Tuple[float, bool, Dict[str, Any]]] = {}
         self._ownership_check_errors: set[str] = set()
+        self._exchange_open_orders_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
+        self._exchange_reservation_logged: set[str] = set()
+        self._last_reduce_only_conflict_ts = 0.0
 
     @property
     def stop_requested(self) -> bool:
@@ -107,6 +110,10 @@ class GridEngine:
         from app.services.strategy_lifecycle import is_recoverable_position_error
 
         recoverable = is_recoverable_position_error(msg)
+        lower_msg = msg.lower()
+        if "-2022" in lower_msg or "reduceonly order is rejected" in lower_msg:
+            self._exchange_open_orders_cache = None
+            self._last_reduce_only_conflict_ts = time.time()
         append_strategy_log(self.strategy_id, "warning" if recoverable else "error", f"Grid limit failed {purpose}: {msg}")
         if recoverable:
             self._consecutive_order_errors = 0
@@ -356,6 +363,74 @@ class GridEngine:
             self._entry_ownership_cache[side] = (now, False, metadata)
             return False, metadata
 
+    @staticmethod
+    def _truthy_exchange_flag(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+    def _binance_reserved_exit_quantity(self, client: Any, pos_side: str) -> Optional[float]:
+        """Return quantity already reserved by Binance orders for this position leg."""
+        exchange_id = str(self.exchange_config.get("exchange_id") or "").strip().lower()
+        market_type = str(self.cfg.market_type or "swap").strip().lower()
+        if exchange_id != "binance" or market_type == "spot" or not hasattr(client, "get_open_orders"):
+            return None
+
+        now = time.time()
+        cached = self._exchange_open_orders_cache
+        rows: List[Dict[str, Any]]
+        if cached and now - float(cached[0] or 0.0) <= 2.0:
+            rows = cached[1]
+        else:
+            try:
+                raw = client.get_open_orders(symbol=self.symbol)
+                if isinstance(raw, dict):
+                    raw = raw.get("raw") or raw.get("data") or []
+                rows = [dict(row) for row in (raw or []) if isinstance(row, dict)]
+                self._exchange_open_orders_cache = (now, rows)
+                self._ownership_check_errors.discard("binance_open_orders")
+            except Exception as exc:
+                if "binance_open_orders" not in self._ownership_check_errors:
+                    logger.warning(
+                        "Binance open-order sync unavailable sid=%s symbol=%s: %s",
+                        self.strategy_id,
+                        self.symbol,
+                        exc,
+                    )
+                    self._ownership_check_errors.add("binance_open_orders")
+                return None
+
+        wanted_position = "LONG" if str(pos_side or "").lower() == "long" else "SHORT"
+        wanted_side = "SELL" if wanted_position == "LONG" else "BUY"
+        wanted_symbol = self.symbol.replace("/", "").replace("-", "").upper()
+        reserved = 0.0
+        for row in rows:
+            symbol = str(row.get("symbol") or "").replace("/", "").replace("-", "").upper()
+            if symbol and symbol != wanted_symbol:
+                continue
+            if str(row.get("side") or "").upper() != wanted_side:
+                continue
+            status = str(row.get("status") or "NEW").upper()
+            if status not in {"NEW", "PARTIALLY_FILLED", "PENDING_NEW"}:
+                continue
+            position_side = str(row.get("positionSide") or "BOTH").upper()
+            reduce_only = self._truthy_exchange_flag(row.get("reduceOnly"))
+            if position_side in {"LONG", "SHORT"}:
+                if position_side != wanted_position:
+                    continue
+            elif not reduce_only:
+                continue
+            try:
+                remaining = max(
+                    0.0,
+                    float(row.get("origQty") or row.get("quantity") or 0.0)
+                    - float(row.get("executedQty") or row.get("filled") or 0.0),
+                )
+            except (TypeError, ValueError):
+                continue
+            reserved += remaining
+        return reserved
+
     def _resolve_grid_exit_quantity(
         self,
         client: Any,
@@ -397,7 +472,8 @@ class GridEngine:
             )
 
             # Existing resting exits already reserve part of the safe strategy
-            # quantity.  New exits may only use the unreserved remainder.
+            # quantity. Binance may also retain orders that were placed before
+            # a worker restart but were not committed locally.
             existing = 0.0
             try:
                 for order in self._orders.list_open(self.strategy_id):
@@ -417,7 +493,20 @@ class GridEngine:
             elif float(meta.get("exchange_size") or 0.0) > 0:
                 budgets.append(max(0.0, float(meta.get("exchange_size") or 0.0)))
             safe_total = min(budgets) if budgets else 0.0
-            amount = min(max(0.0, float(resolved or 0.0)), max(0.0, safe_total - existing))
+            exchange_reserved = self._binance_reserved_exit_quantity(client, pos_side)
+            reserved = max(existing, float(exchange_reserved or 0.0)) if exchange_reserved is not None else existing
+            if exchange_reserved is not None and exchange_reserved > existing + 1e-10:
+                log_key = f"binance_reservation:{pos_side}"
+                if log_key not in self._exchange_reservation_logged:
+                    logger.info(
+                        "Binance open exits synchronized sid=%s symbol=%s side=%s reserved=%.8f",
+                        self.strategy_id,
+                        self.symbol,
+                        pos_side,
+                        exchange_reserved,
+                    )
+                    self._exchange_reservation_logged.add(log_key)
+            amount = min(max(0.0, float(resolved or 0.0)), max(0.0, safe_total - reserved))
 
             if market_type == "spot" and amount > 0:
                 from app.services.live_trading.spot_sizing import clamp_spot_close_quantity
@@ -542,7 +631,10 @@ class GridEngine:
             client_order_id=coid,
             exchange_id=str(self.exchange_config.get("exchange_id") or ""),
             user_id=self.user_id,
-            fee_status="actual" if fees else "pending",
+            fee_status=str(
+                details.get("fee_status")
+                or ("actual" if fees else "pending")
+            ),
             fee_source="rest",
         )
         append_strategy_log(
@@ -679,11 +771,7 @@ class GridEngine:
             client_order_id=str(getattr(execution, "client_order_id", coid) or coid),
             exchange_id=str(self.exchange_config.get("exchange_id") or ""),
             user_id=self.user_id,
-            fee_status=(
-                "actual"
-                if getattr(execution, "fees_by_ccy", None)
-                else "pending"
-            ),
+            fee_status=str(getattr(execution, "fee_status", "pending") or "pending"),
             fee_source="rest",
         )
         append_strategy_log(
@@ -1442,6 +1530,8 @@ class GridEngine:
     ) -> bool:
         px = float(price or 0)
         if px <= 0:
+            return False
+        if reduce_only and time.time() - float(self._last_reduce_only_conflict_ts or 0.0) < 5.0:
             return False
         usdt = self._grid_budget_usdt()
         qty = float(quantity) if quantity is not None else self._qty_from_usdt(usdt, px)

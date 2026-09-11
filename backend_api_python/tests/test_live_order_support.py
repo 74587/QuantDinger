@@ -187,6 +187,26 @@ def test_apply_execution_result_does_not_drop_exchange_fee():
     assert fills.total_base == 0.25
     assert fills.avg_price() == 64000.0
     assert fills.fees_by_ccy == {"USDT": 8.0, "BNB": 0.001}
+    assert fills.fee_status == "actual"
+
+
+def test_apply_execution_result_preserves_authoritative_zero_fee():
+    result = type(
+        "ExecutionResult",
+        (),
+        {
+            "filled_qty": 0.25,
+            "avg_price": 64000.0,
+            "fees_by_ccy": {},
+            "fee_status": "actual_zero",
+        },
+    )()
+    fills = FillAccumulator()
+
+    apply_execution_result(fills, result)
+
+    assert fills.fee_status == "actual_zero"
+    assert fills.fees_by_ccy == {}
 
 
 def test_maker_limit_price_offsets_buy_and_sell():

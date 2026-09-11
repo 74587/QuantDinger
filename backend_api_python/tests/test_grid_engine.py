@@ -890,6 +890,96 @@ def test_sync_exit_coverage_skips_when_exits_already_cover_position(monkeypatch)
     assert engine.sync_exit_coverage(676.8) == 0
 
 
+def test_binance_exchange_open_exits_reserve_restart_quantity(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    class FakeOrders:
+        def list_open(self, strategy_id):
+            return []
+
+    class FakeBinance:
+        def __init__(self):
+            self.calls = 0
+
+        def get_open_orders(self, *, symbol):
+            self.calls += 1
+            return [
+                {
+                    "symbol": "SOLUSDT",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "reduceOnly": False,
+                    "status": "NEW",
+                    "origQty": "0.80",
+                    "executedQty": "0.20",
+                },
+                {
+                    "symbol": "SOLUSDT",
+                    "side": "SELL",
+                    "positionSide": "BOTH",
+                    "reduceOnly": False,
+                    "status": "NEW",
+                    "origQty": "99",
+                    "executedQty": "0",
+                },
+            ]
+
+    client = FakeBinance()
+    engine = GridEngine(
+        574,
+        "SOL/USDT",
+        {"initial_capital": 1000, "market_type": "swap"},
+        {"exchange_id": "binance", "credential_id": 7},
+        create_client_fn=lambda: client,
+        enqueue_market=lambda *a, **k: False,
+    )
+    engine._orders = FakeOrders()
+    monkeypatch.setattr(
+        "app.services.live_trading.position_query.resolve_reduce_only_quantity",
+        lambda **kwargs: (
+            1.0,
+            {"db_size": 1.0, "exchange_strategy_available": 1.0},
+        ),
+    )
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a, **k: None)
+
+    assert engine._resolve_grid_exit_quantity(
+        client,
+        pos_side="long",
+        requested_qty=1.0,
+    ) == pytest.approx(0.4)
+    assert engine._resolve_grid_exit_quantity(
+        client,
+        pos_side="long",
+        requested_qty=1.0,
+    ) == pytest.approx(0.4)
+    assert client.calls == 1
+
+
+def test_binance_reduce_only_conflict_does_not_auto_stop_grid(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    engine = GridEngine(
+        574,
+        "SOL/USDT",
+        {"initial_capital": 1000, "market_type": "swap"},
+        {"exchange_id": "binance", "credential_id": 7},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *a, **k: False,
+    )
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a, **k: None)
+
+    error = RuntimeError(
+        'Binance HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}'
+    )
+    for _ in range(6):
+        engine._record_order_error("long_exit", error)
+
+    assert engine.stop_requested is False
+    assert engine._consecutive_order_errors == 0
+    assert engine._last_reduce_only_conflict_ts > 0
+
+
 def test_sync_exit_coverage_uses_a_distinct_cell_when_one_exit_is_already_open(monkeypatch):
     from app.services.grid.engine import GridEngine
     from app.services.grid.levels import generate_cells, generate_levels

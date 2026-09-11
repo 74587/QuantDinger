@@ -1,6 +1,9 @@
 """Tests for unified strategy auto-stop helpers."""
 
-from app.services.strategy_lifecycle import is_fatal_exchange_error
+from app.services.strategy_lifecycle import (
+    is_fatal_exchange_error,
+    is_recoverable_position_error,
+)
 
 
 def test_binance_auth_fatal():
@@ -22,6 +25,12 @@ def test_okx_missing_credentials_fatal():
 def test_internal_order_adapter_signature_error_is_fatal():
     assert is_fatal_exchange_error(
         "make_client_order_id() got an unexpected keyword argument 'market_type'"
+    )
+
+
+def test_binance_reduce_only_conflict_is_recoverable():
+    assert is_recoverable_position_error(
+        'Binance HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}'
     )
 
 

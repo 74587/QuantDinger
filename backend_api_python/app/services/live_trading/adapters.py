@@ -125,6 +125,10 @@ class LiveOrderPhaseAdapter:
             status=str((raw or {}).get("status") or (raw or {}).get("state") or ""),
             raw=dict(raw or {}),
             fees_by_ccy=fees_by_ccy,
+            fee_status=str(
+                (raw or {}).get("fee_status")
+                or ("actual" if fees_by_ccy else "pending")
+            ),
         )
 
     def query_position(self, intent: OrderIntent) -> PositionSnapshot:
