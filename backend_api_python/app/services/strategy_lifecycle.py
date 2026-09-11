@@ -77,6 +77,15 @@ def is_fatal_exchange_error(msg: str) -> bool:
     return any(t in m for t in tokens)
 
 
+def is_recoverable_position_error(reason: str) -> bool:
+    return not is_fatal_exchange_error(reason) and any(code in str(reason or "").lower() for code in (
+        "position_drift_detected", "minimum_trade_unit", "min_notional",
+        "position_ownership_drift", "target_already_met",
+        "below step/min", "below lot step/minqty", "below min/precision",
+        "below mintradeusdt/precision",
+    ))
+
+
 def maybe_auto_stop_on_exchange_error(
     strategy_id: int,
     msg: str,
@@ -98,6 +107,10 @@ def maybe_auto_stop_on_exchange_error(
     if is_fatal_exchange_error(reason):
         auto_stop_live_strategy(sid, reason, source=source)
         return True
+    if is_recoverable_position_error(reason):
+        # Reject the individual entry/undersized order while keeping position
+        # monitoring and reduce-only protection alive.
+        return False
     if consecutive_failures >= max(1, int(consecutive_threshold or 5)):
         auto_stop_live_strategy(
             sid,

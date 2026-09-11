@@ -493,13 +493,16 @@ class USStockDataSource(BaseDataSource):
                 start_date = end_date - timedelta(days=days)
             if after_time is not None:
                 floor = datetime.fromtimestamp(after_time)
-                start_date = min(start_date, floor)
+                start_date = floor
             
             
             klines = self._fetch_yahoo_chart(symbol, interval, start_date, end_date, effective_limit)
             if not klines:
                 if timeframe in ('1m', '3m', '5m', '15m', '30m', '1H', '4H'):
-                    klines = self._fetch_nasdaq_intraday_chart(symbol, timeframe, effective_limit)
+                    # Nasdaq's intraday chart is a latest-session feed, not a
+                    # historical range provider. Do not let it mask yfinance.
+                    if after_time is None and before_time is None:
+                        klines = self._fetch_nasdaq_intraday_chart(symbol, timeframe, effective_limit)
                 else:
                     klines = self._fetch_nasdaq_historical(symbol, start_date, end_date, effective_limit)
                     if timeframe == '1W' and klines:

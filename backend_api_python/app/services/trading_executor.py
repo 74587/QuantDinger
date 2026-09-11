@@ -1021,6 +1021,14 @@ class TradingExecutor:
             raise RuntimeError("strategyV2.spotShortUnsupported")
 
         closes_position = abs(target_amount) <= 1e-12 and abs(current_amount) > 1e-12
+        if (
+            str(member.get("market") or "") == "Crypto"
+            and symbol.upper().endswith(("/USDT", "/USDC", "/USD"))
+            and intent.kind.startswith("target_")
+            and current_amount * target_amount > 0
+            and abs(target_amount - current_amount) * price <= 10.0 + 1e-9
+        ):
+            return False
         if abs(target_amount - current_amount) * price < MIN_LIVE_ORDER_NOTIONAL and not closes_position:
             return False
 

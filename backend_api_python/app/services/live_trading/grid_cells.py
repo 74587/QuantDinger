@@ -298,7 +298,7 @@ class GridCellRepository:
             return False
 
     def release_cancelled_working_orders(self, strategy_id: int, symbol: Optional[str] = None) -> int:
-        """Release cell state after strategy stop cancels all exchange working orders.
+        """Release only cells whose working orders have been reconciled.
 
         Entry cells with cancelled limits become IDLE again so restart can re-hang
         them. Held inventory cells keep their held state and cost basis, but lose
@@ -334,6 +334,16 @@ class GridCellRepository:
                         last_event_ts = NOW()
                     WHERE {filters_sql}
                       AND state IN (%s, %s, %s, %s)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM qd_grid_resting_orders o
+                          WHERE o.strategy_id = qd_grid_cells.strategy_id
+                            AND o.symbol = qd_grid_cells.symbol
+                            AND o.cell_index = qd_grid_cells.cell_index
+                            AND (
+                                o.status IN ('pending', 'open', 'partial')
+                                OR o.filled_quantity > o.processed_fill_qty + 1e-12
+                            )
+                      )
                     """,
                     (
                         GridCellState.BUY_OPEN.value,

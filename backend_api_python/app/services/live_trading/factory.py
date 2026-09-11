@@ -111,6 +111,10 @@ def exchange_trading_environment(cfg: Dict[str, Any], exchange_id: str = "") -> 
                 "testnet",
             )
         )
+        if ex == "alpaca" and not any(
+            key in cfg for key in ("paper", "is_paper", "enable_demo_trading", "enableDemoTrading")
+        ):
+            legacy_demo = legacy_demo or _get(cfg, "api_key", "apiKey").upper().startswith("PK")
         if not legacy_demo:
             return "live"
         environment = "testnet" if ex == "gate" else "demo"
@@ -142,6 +146,7 @@ def validate_exchange_environment(exchange_id: str, environment: str, market_sco
         "bybit": {"live", "demo"},
         "gate": {"live", "testnet"},
         "htx": {"live"},
+        "alpaca": {"live", "demo"},
     }
     if env not in allowed.get(ex, {"live"}):
         if ex == "htx" and env != "live":
@@ -325,7 +330,7 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
     # Alpaca: REST broker for US stocks + crypto (no local terminal needed).
     # Caller is responsible for validating market_category in (USStock, Crypto).
     if exchange_id == "alpaca":
-        return create_alpaca_client(exchange_config)
+        return create_alpaca_client({**exchange_config, "paper": is_demo})
 
     raise LiveTradingError(f"Unsupported exchange_id: {exchange_id}")
 
@@ -432,7 +437,7 @@ def create_alpaca_client(exchange_config: Dict[str, Any]):
     else:
         paper = api_key.upper().startswith("PK")
 
-    base_url = _get(exchange_config, "base_url", "baseUrl") or None
+    base_url = "https://paper-api.alpaca.markets" if paper else (_get(exchange_config, "base_url", "baseUrl") or None)
 
     config = AlpacaConfig(
         api_key=api_key,

@@ -775,9 +775,23 @@ class MultiAssetSimulationBroker:
                 and abs(target_qty) <= 1e-12
                 and abs(current.amount) > 1e-12
             )
-            reconciles_swap_remainder = (
-                closes_position and self._is_crypto_swap_symbol(order.symbol)
+            reconciles_swap_remainder = closes_position and (
+                self._is_crypto_swap_symbol(order.symbol)
+                or str(order.symbol).lower().startswith("crypto:")
+                and str(order.symbol).split("@", 1)[0].upper().endswith(("/USDT", "/USDC", "/USD"))
             )
+            if (
+                str(order.symbol).lower().startswith("crypto:")
+                and str(order.symbol).split("@", 1)[0].upper().endswith(("/USDT", "/USDC", "/USD"))
+                and order.kind.startswith("target_")
+                and current.amount * target_qty > 0
+                and abs(delta * sizing_price) <= 10.0 + 1e-9
+            ):
+                batch_event_indexes.append(self._append_order_event(self._order_event(
+                    order_id, order, timestamp, "rejected", "target_already_met",
+                    requested_quantity=0.0,
+                )))
+                continue
             if abs(delta) <= 1e-12 or (abs(delta * sizing_price) < 0.01 and not closes_position):
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "target_already_met",
@@ -834,7 +848,7 @@ class MultiAssetSimulationBroker:
             lot_size = self._lot_size(order.symbol, rules)
             delta = self._round_to_lot(delta, lot_size)
             exact_close_remainder = False
-            if reconciles_swap_remainder and abs(delta) < lot_size - 1e-12:
+            if reconciles_swap_remainder and abs(delta) < lot_size - 1e-12 and abs(current.amount * fill_price) <= 10.0:
                 # A simulated position may contain a sub-lot numerical residue.
                 # A target-zero order reconciles that residue exactly instead of
                 # leaving an uncloseable position or silently writing it off.
@@ -849,9 +863,14 @@ class MultiAssetSimulationBroker:
             liquidity_cap = None if forced_liquidation else self._liquidity_cap(bar, lot_size)
             if liquidity_cap is not None and abs(delta) > liquidity_cap:
                 delta = math.copysign(liquidity_cap, delta)
+                exact_close_remainder = False
             if reconciles_swap_remainder and current.amount * delta < 0:
                 residual = current.amount + delta
-                if 0 < abs(residual) < lot_size - 1e-12:
+                if (
+                    0 < abs(residual) < lot_size - 1e-12
+                    and abs(residual * fill_price) <= 10.0
+                    and (liquidity_cap is None or abs(current.amount) <= liquidity_cap)
+                ):
                     delta = -current.amount
                     exact_close_remainder = True
             if forced_liquidation or exact_close_remainder:
@@ -887,6 +906,7 @@ class MultiAssetSimulationBroker:
                 and abs(delta) + 1e-12 < min_amount
                 and not forced_liquidation
                 and not swap_reduction
+                and not exact_close_remainder
             ):
                 batch_event_indexes.append(self._append_order_event(self._order_event(
                     order_id, order, timestamp, "rejected", "minimum_trade_unit",
@@ -898,6 +918,7 @@ class MultiAssetSimulationBroker:
                 and fill_price > 0
                 and not forced_liquidation
                 and not swap_reduction
+                and not exact_close_remainder
                 and abs(delta * fill_price) < min_notional
             ):
                 batch_event_indexes.append(self._append_order_event(self._order_event(
@@ -976,6 +997,7 @@ class MultiAssetSimulationBroker:
                 "limit_price": float(order.limit_price or 0.0) if is_limit_order else 0.0,
                 "status": execution_status,
                 "requested_quantity": abs(requested_delta),
+                "sub_lot_reconciled": exact_close_remainder,
             }
             self.executions.append(execution)
             reason = "margin_liquidation" if forced_liquidation else "filled"
@@ -1190,7 +1212,11 @@ class MultiAssetSimulationBroker:
     def _round_to_lot(value: float, lot_size: float) -> float:
         if lot_size <= 0:
             return value
-        units = math.floor(abs(value) / lot_size + 1e-12)
+        ratio = abs(value) / lot_size
+        nearest = round(ratio)
+        # Recover an integral lot count lost to binary arithmetic, without
+        # rounding genuine fractional lots up to a larger order.
+        units = nearest if abs(ratio - nearest) <= max(1e-12, 4 * math.ulp(ratio)) else math.floor(ratio)
         return math.copysign(units * lot_size, value) if units else 0.0
 
     @staticmethod

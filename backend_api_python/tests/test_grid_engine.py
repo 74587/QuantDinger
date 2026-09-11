@@ -576,7 +576,6 @@ def test_grid_shutdown_releases_cancelled_cell_states(monkeypatch):
 
     assert calls == [
         "exchange_cancel",
-        ("orders_cancel", 80, "SOL/USDT"),
         ("cells_release", 80, "SOL/USDT"),
     ]
 

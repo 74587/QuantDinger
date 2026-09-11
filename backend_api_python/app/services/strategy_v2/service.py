@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from time import perf_counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -90,7 +91,7 @@ class StrategyV2BacktestService:
             )
         frequency = manifest.driving_frequency
         warmup_bars = max(40, manifest.warmup_bars)
-        fetch_start = start_date - timedelta(days=backtest_warmup_calendar_days(frequency, warmup_bars))
+        fetch_start = start_date - timedelta(days=_warmup_calendar_days(frequency, warmup_bars, candidates))
         _enforce_backtest_range(
             candidates=candidates,
             timeframe=frequency,
@@ -168,7 +169,7 @@ class StrategyV2BacktestService:
         frequency = manifest.driving_frequency
         fetch_starts = {
             item: start_date
-            - timedelta(days=backtest_warmup_calendar_days(item, manifest.warmup_bars))
+            - timedelta(days=_warmup_calendar_days(item, manifest.warmup_bars, candidates))
             for item in manifest.frequencies
         }
         for item in manifest.frequencies:
@@ -190,6 +191,7 @@ class StrategyV2BacktestService:
         frames = frequency_frames.get(frequency, {})
         if not frames:
             raise StrategyV2ContractError("strategyV2.noMarketData")
+        _validate_warmup_history(frequency_frames, manifest.warmup_bars, start_date)
         if manifest.fundamental_dependencies:
             enricher = self.fundamental_enricher or get_fundamental_data_service().enrich_panel
             frames = enricher(frames, candidates)
@@ -330,6 +332,8 @@ class StrategyV2BacktestService:
             "leverage": float(leverage if leverage_enabled else 1.0),
             "commission": float(commission),
             "slippage": float(slippage),
+            "cryptoRebalanceToleranceQuote": 10.0,
+            "subLotClosePolicy": "reconcile_up_to_10_quote_with_cash_and_fees",
             "fundingMode": "not_modeled",
             "drivingFrequency": frequency,
             "frequencies": list(manifest.frequencies),
@@ -569,9 +573,30 @@ def _instrument_member(item: InstrumentSpec) -> dict[str, Any]:
     }
 
 
-def _warmup_calendar_days(frequency: str, warmup_bars: int) -> int:
+def _validate_warmup_history(frequency_frames, warmup_bars: int, start_date: datetime) -> None:
+    if warmup_bars <= 0:
+        return
+    start = pd.Timestamp(start_date)
+    start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
+    for frames in frequency_frames.values():
+        for frame in frames.values():
+            index = pd.to_datetime(frame.index, utc=True)
+            if int((index < start).sum()) < warmup_bars:
+                raise StrategyV2ContractError("strategyV2.insufficientWarmupData")
+
+
+def _warmup_calendar_days(frequency: str, warmup_bars: int, candidates=()) -> int:
     """Keep the legacy helper available for internal callers and tests."""
-    return backtest_warmup_calendar_days(frequency, warmup_bars)
+    days = backtest_warmup_calendar_days(frequency, warmup_bars)
+    normalized = str(frequency).lower()
+    if warmup_bars > 0 and normalized.endswith(("m", "h")) and any(
+        item.get("market") in {"USStock", "HKStock", "AStock"} for item in candidates
+    ):
+        hours = float(normalized[:-1]) / (60 if normalized.endswith("m") else 1)
+        # Four trading hours per session also covers the shortest stock market
+        # in a mixed universe; allow weekends and a holiday safety margin.
+        days = max(days, 7, math.ceil(warmup_bars * hours / 4 * 7 / 5 * 1.5))
+    return days
 
 
 def _benchmark_for_manifest(manifest: StrategyManifest) -> InstrumentSpec | None:

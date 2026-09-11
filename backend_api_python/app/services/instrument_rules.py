@@ -31,6 +31,7 @@ from app.services.live_trading.symbols import (
     to_okx_swap_inst_id,
 )
 from app.services.market_context import default_crypto_exchange_id, normalize_exchange_id
+from app.utils.numeric_precision import floor_decimal_to_step
 
 
 RULES_SCHEMA_VERSION = 1
@@ -112,7 +113,7 @@ class InstrumentRules:
         requested = _positive(amount)
         step = _positive(self.amount_step)
         if step > 0:
-            requested = (requested // step) * step
+            requested = floor_decimal_to_step(requested, step)
         if enforce_minimum and requested < _positive(self.min_amount):
             return 0.0
         return float(requested)
@@ -121,7 +122,7 @@ class InstrumentRules:
         requested = _positive(price)
         tick = _positive(self.price_tick)
         if tick > 0:
-            requested = (requested // tick) * tick
+            requested = floor_decimal_to_step(requested, tick)
         return float(requested)
 
     @classmethod

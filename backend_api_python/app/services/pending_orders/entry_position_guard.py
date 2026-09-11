@@ -10,6 +10,8 @@ from app.services.live_trading.position_ownership import (
     evaluate_and_record_ownership,
     normalize_market_type,
     ownership_log_message,
+    DEFAULT_DRIFT_QUOTE_TOLERANCE,
+    quote_drift_tolerance,
 )
 from app.services.live_trading.position_query import query_exchange_position_size
 from app.services.live_trading.records import (
@@ -62,11 +64,11 @@ def evaluate_entry_position_guard(
         dust_quote = float(
             trading_config.get("position_drift_tolerance_quote")
             or strategy_config.get("position_drift_tolerance_quote")
-            or 3.0
+            or DEFAULT_DRIFT_QUOTE_TOLERANCE
         )
     except (TypeError, ValueError):
-        dust_quote = 3.0
-    dust_quote = min(5.0, max(0.0, dust_quote))
+        dust_quote = DEFAULT_DRIFT_QUOTE_TOLERANCE
+    dust_quote = min(DEFAULT_DRIFT_QUOTE_TOLERANCE, max(0.0, dust_quote))
     try:
         shortfall_ratio = float(
             trading_config.get("position_shortfall_tolerance_ratio")
@@ -77,7 +79,7 @@ def evaluate_entry_position_guard(
         shortfall_ratio = DEFAULT_SHORTFALL_RELATIVE_TOLERANCE
     shortfall_ratio = min(0.02, max(0.001, shortfall_ratio))
     price = max(0.0, float(reference_price or 0.0))
-    absolute_tolerance = dust_quote / price if dust_quote > 0 and price > 0 else 0.0
+    absolute_tolerance = quote_drift_tolerance(symbol, price, dust_quote)
     snapshot = evaluate_and_record_ownership(
         user_id=int(user_id or 1),
         credential_id=int(credential_id or 0),

@@ -255,6 +255,13 @@ def reconcile_strategy_vs_account(
         if qty > eps:
             protected[(sym, side)] = protected.get((sym, side), 0.0) + qty
     acct: Dict[tuple, float] = aggregate(account_rows or [])
+    from app.services.live_trading.position_ownership import quote_drift_tolerance
+
+    prices = {}
+    for row in (account_rows or []) + (local_rows or []):
+        price = float(row.get("mark_price") or row.get("current_price") or 0.0)
+        if price > 0:
+            prices[normalize_strategy_symbol(str(row.get("symbol") or "")).upper()] = price
 
     notes: List[str] = []
     status = "ok"
@@ -264,6 +271,8 @@ def reconcile_strategy_vs_account(
         expected_size = allocated_size + protected_size
         account_size = float(acct.get(key, 0.0))
         sym, side = key
+        if abs(expected_size - account_size) <= max(eps, quote_drift_tolerance(sym, prices.get(sym, 0.0))):
+            continue
         if expected_size <= eps and account_size <= eps:
             continue
         if expected_size > eps and account_size <= eps:
@@ -332,7 +341,7 @@ def list_strategy_allocations_for_account(
         cur = db.cursor()
         cur.execute(
             """
-            SELECT p.strategy_id, p.symbol, p.side, p.size
+            SELECT p.strategy_id, s.strategy_name, s.status, p.symbol, p.side, p.size
             FROM qd_strategy_positions p
             JOIN qd_strategies_trading s ON s.id = p.strategy_id
             WHERE s.user_id = %s AND s.execution_mode = 'live'

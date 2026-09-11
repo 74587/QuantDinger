@@ -16,6 +16,7 @@ consume the protected quantity.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Any, Dict, Iterable, List, Tuple
 
 from app.services.live_trading.records import normalize_strategy_symbol
@@ -33,6 +34,18 @@ CRYPTO_COEXISTENCE_EXCHANGES = frozenset({
 })
 DEFAULT_DRIFT_RELATIVE_TOLERANCE = 0.001
 DEFAULT_SHORTFALL_RELATIVE_TOLERANCE = 0.005
+DEFAULT_DRIFT_QUOTE_TOLERANCE = 10.0
+
+
+def quote_drift_tolerance(symbol: str, price: float, quote_limit: float = DEFAULT_DRIFT_QUOTE_TOLERANCE) -> float:
+    symbol = canonical_symbol(symbol).split("@", 1)[0]
+    price = float(price or 0.0)
+    if not symbol.endswith(("/USDT", "/USDC", "/USD")) or not math.isfinite(price) or price <= 0:
+        return 0.0
+    limit = float(quote_limit)
+    if not math.isfinite(limit):
+        limit = DEFAULT_DRIFT_QUOTE_TOLERANCE
+    return min(DEFAULT_DRIFT_QUOTE_TOLERANCE, max(0.0, limit)) / price
 
 
 def normalize_market_type(value: str) -> str:
@@ -92,6 +105,7 @@ def calculate_position_ownership(
     previous_reason: str = "",
     absolute_tolerance: float = 0.0,
     shortfall_relative_tolerance: float = DEFAULT_SHORTFALL_RELATIVE_TOLERANCE,
+    reference_price: float = 0.0,
 ) -> OwnershipSnapshot:
     """Pure ownership calculation used by execution, APIs, and tests."""
     account = max(0.0, float(account_qty or 0.0))
@@ -121,8 +135,9 @@ def calculate_position_ownership(
         1e-8,
         expected * relative_tolerance,
         max(0.0, float(absolute_tolerance or 0.0)),
+        quote_drift_tolerance(symbol, reference_price),
     )
-    if abs(unknown) <= tolerance:
+    if abs(unknown) <= tolerance + 1e-12:
         status = STATUS_OK
         reason = ""
         allowed = True
@@ -318,12 +333,13 @@ def repair_position_ownership(
     strategy_qty: float,
     action: str,
     inst_id: str = "",
+    reference_price: float = 0.0,
 ) -> OwnershipSnapshot:
     """Apply an explicit user repair action and return the resulting snapshot."""
     action_name = str(action or "").strip().lower()
-    if action_name not in {"protect_manual", "strict_mode", "recheck"}:
+    if action_name not in {"protect_manual", "reset_protection", "strict_mode", "recheck"}:
         raise ValueError("positionOwnership.invalidRepairAction")
-    if action_name == "protect_manual" and not supports_position_coexistence(
+    if action_name in {"protect_manual", "reset_protection"} and not supports_position_coexistence(
         market_type, exchange_id
     ):
         raise ValueError("positionOwnership.coexistenceMarketUnsupported")
@@ -336,7 +352,9 @@ def repair_position_ownership(
     )
     mode = str(existing.get("coexistence_mode") or STRICT_MODE)
     manual = max(0.0, float(existing.get("manual_reserved_qty") or 0.0))
-    if action_name == "protect_manual":
+    if action_name in {"protect_manual", "reset_protection"}:
+        if action_name == "reset_protection" and mode != ADVANCED_MODE:
+            raise ValueError("positionOwnership.invalidRepairAction")
         if float(account_qty or 0.0) + 1e-8 < float(strategy_qty or 0.0):
             raise ValueError("positionOwnership.accountBelowStrategyAllocation")
         mode = ADVANCED_MODE
@@ -352,6 +370,7 @@ def repair_position_ownership(
         strategy_qty=strategy_qty,
         protected_qty=manual,
         coexistence_mode=mode,
+        reference_price=reference_price,
     )
     with get_db_connection() as db:
         cur = db.cursor()
@@ -424,6 +443,13 @@ def build_ownership_rows(
             values[key] = values.get(key, 0.0) + max(0.0, float(row.get("size") or 0.0))
         return values
 
+    account_rows = list(account_rows)
+    allocated_rows = list(allocated_rows)
+    prices = {}
+    for row in account_rows + allocated_rows:
+        price = float(row.get("mark_price") or row.get("current_price") or 0.0)
+        if math.isfinite(price) and price > 0:
+            prices[canonical_symbol(row.get("symbol") or "")] = price
     account = aggregate(account_rows)
     allocated = aggregate(allocated_rows)
     reservations = {
@@ -438,10 +464,24 @@ def build_ownership_rows(
             strategy_qty=allocated.get(key, 0.0),
             protected_qty=float(row.get("manual_reserved_qty") or 0.0),
             coexistence_mode=str(row.get("coexistence_mode") or STRICT_MODE),
+            reference_price=prices.get(key[0], 0.0),
         )
         item = snap.metadata()
         item["inst_id"] = str(row.get("inst_id") or "")
         item["updated_at"] = row.get("updated_at")
+        item["reference_price"] = prices.get(key[0], 0.0)
+        item["difference_quote"] = snap.unknown_qty * prices[key[0]] if key[0] in prices else None
+        item["repair_kind"] = (
+            "none" if snap.allowed else "protect_manual" if snap.unknown_qty > 0
+            else "reset_protection" if snap.account_qty >= snap.strategy_qty else "allocation_shortfall"
+        )
+        item["allocations"] = [
+            {"strategy_id": allocation.get("strategy_id"), "strategy_name": allocation.get("strategy_name"),
+             "status": allocation.get("status"), "quantity": float(allocation.get("size") or 0.0)}
+            for allocation in allocated_rows
+            if canonical_symbol(allocation.get("symbol") or "") == key[0]
+            and normalize_side(allocation.get("side") or "") == key[1]
+        ]
         output.append(item)
     return output
 

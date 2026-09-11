@@ -38,17 +38,19 @@ class TradingWorker:
         self._global_lease_key = "trading-global-services"
         self._global_services_leader = False
         self._last_global_lease_check = 0.0
+        self._last_restore_check = 0.0
 
     def run_forever(self) -> None:
         logger.info("Trading worker started: %s", self.worker_id)
         self._ensure_global_services()
         self._heartbeat()
-        self.restore_desired_strategies()
+        self._restore_if_due(force=True)
         try:
             while not self._stop.is_set():
                 self._heartbeat()
                 self._ensure_global_services()
                 self._renew_runtime_leases()
+                self._restore_if_due()
                 command = self.repository.claim_next(
                     owner_id=self.worker_id,
                     lease_seconds=self.command_lease_seconds,
@@ -77,18 +79,32 @@ class TradingWorker:
         rows = StrategyService().get_running_strategies_with_type()
         restored = 0
         for row in rows or []:
+            if self._stop.is_set():
+                break
             strategy_id = int(row["id"])
-            if not self._acquire_runtime(strategy_id):
+            if strategy_id in self._local_strategy_ids():
                 continue
-            if self.executor.start_strategy(strategy_id):
-                restored += 1
-            else:
-                self.repository.release_strategy_lease(
-                    strategy_id=strategy_id,
-                    owner_id=self.worker_id,
-                )
-                StrategyService().update_strategy_status(strategy_id, "stopped")
-        logger.info("Trading runtime restore completed: %s/%s", restored, len(rows or []))
+            try:
+                if self.repository.has_pending_stop(strategy_id):
+                    continue
+                result = self._start(strategy_id)
+                restored += int(result.get("status") == "running")
+            except Exception:
+                # A predecessor's lease or a temporary dependency failure must
+                # not erase the persisted intention to run after a restart.
+                logger.warning("Strategy restore will retry: %s", strategy_id, exc_info=True)
+        if restored:
+            logger.info("Trading runtime restore completed: %s/%s", restored, len(rows or []))
+
+    def _restore_if_due(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_restore_check < max(5.0, self.strategy_lease_seconds / 2):
+            return
+        self._last_restore_check = now
+        try:
+            self.restore_desired_strategies()
+        except Exception:
+            logger.warning("Desired strategy recovery check failed; retrying later", exc_info=True)
 
     def _execute(self, command: StrategyCommand) -> None:
         try:

@@ -13,6 +13,7 @@ from app.services.grid.exchange_orders import (
     make_grid_initial_client_order_id,
     normalize_grid_order_quantity,
     place_grid_limit_order,
+    query_grid_order_fill,
     wait_grid_market_fill,
 )
 from app.services.grid.fill_handler import record_grid_market_fill
@@ -102,7 +103,13 @@ class GridEngine:
             purpose,
             msg,
         )
-        append_strategy_log(self.strategy_id, "error", f"Grid limit failed {purpose}: {msg}")
+        from app.services.strategy_lifecycle import is_recoverable_position_error
+
+        recoverable = is_recoverable_position_error(msg)
+        append_strategy_log(self.strategy_id, "warning" if recoverable else "error", f"Grid limit failed {purpose}: {msg}")
+        if recoverable:
+            self._consecutive_order_errors = 0
+            return
         self._consecutive_order_errors += 1
         try:
             from app.services.strategy_lifecycle import maybe_auto_stop_on_exchange_error
@@ -1112,34 +1119,18 @@ class GridEngine:
             return True
 
         # A later partial entry can increase the held quantity. Replace the
-        # prior child exit atomically from the local engine's point of view so
-        # all confirmed inventory remains reduce-only covered.
+        # prior child exit only after its cancellation and fills are reconciled.
         client = None
         try:
             client = self._create_client()
         except Exception as exc:
             logger.warning("grid exit coverage client sid=%s: %s", self.strategy_id, exc)
+            return False
+        if client is None:
+            return False
         for item in open_orders:
-            if client:
-                try:
-                    cancel_grid_order(
-                        client,
-                        symbol=self.symbol,
-                        market_type=self.cfg.market_type,
-                        exchange_order_id=item.exchange_order_id,
-                        client_order_id=item.client_order_id,
-                        exchange_config=self.exchange_config,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "grid exit coverage cancel sid=%s cell=%s: %s",
-                        self.strategy_id,
-                        cell.index,
-                        exc,
-                    )
-                    return False
-            if item.id:
-                self._orders.update_status(int(item.id), status="cancelled")
+            if not self._cancel_confirmed_order(client, item):
+                return False
         return self._place_limit(
             cell,
             purpose,
@@ -1149,6 +1140,38 @@ class GridEngine:
             pos_side=pos_side,
             quantity=desired,
         )
+
+    def _cancel_confirmed_order(self, client: Any, order: GridRestingOrder) -> bool:
+        """Retain uncertain orders for polling; never discard unprocessed fills."""
+        if client is None or not order.id:
+            return False
+        try:
+            cancel_grid_order(
+                client,
+                symbol=self.symbol,
+                market_type=self.cfg.market_type,
+                exchange_order_id=order.exchange_order_id,
+                client_order_id=order.client_order_id,
+                exchange_config=self.exchange_config,
+            )
+            filled, _, status = query_grid_order_fill(
+                client,
+                symbol=self.symbol,
+                market_type=self.cfg.market_type,
+                exchange_order_id=order.exchange_order_id,
+                client_order_id=order.client_order_id,
+                exchange_config=self.exchange_config,
+            )
+            # A cancel acknowledgement is not a terminal order snapshot. The
+            # poller must post any racing fill before coverage is recalculated.
+            if status != "cancelled":
+                return False
+            if max(float(filled or 0.0), float(order.filled_quantity or 0.0)) > float(order.processed_fill_qty or 0.0) + 1e-12:
+                return False
+            return self._orders.update_status(int(order.id), status="cancelled") is True
+        except Exception as exc:
+            logger.warning("grid cancel unconfirmed sid=%s oid=%s: %s", self.strategy_id, order.id, exc)
+            return False
 
     def _normalize_grid_base_qty(self, qty: float, price: float) -> float:
         """Floor to exchange lot/min; return 0 when below tradable minimum."""
@@ -1185,18 +1208,11 @@ class GridEngine:
             for extra in orders[1:]:
                 try:
                     client = self._create_client()
-                    cancel_grid_order(
-                        client,
-                        symbol=self.symbol,
-                        market_type=self.cfg.market_type,
-                        exchange_order_id=extra.exchange_order_id,
-                        client_order_id=extra.client_order_id,
-                        exchange_config=self.exchange_config,
-                    )
                 except Exception as e:
                     logger.debug("grid entry dedupe cancel sid=%s cell=%s: %s", self.strategy_id, cell_idx, e)
-                if extra.id:
-                    self._orders.update_status(int(extra.id), status="cancelled")
+                    continue
+                if not self._cancel_confirmed_order(client, extra):
+                    continue
                 append_strategy_log(
                     self.strategy_id,
                     "warning",
@@ -1221,18 +1237,11 @@ class GridEngine:
             for extra in orders[1:]:
                 try:
                     client = self._create_client()
-                    cancel_grid_order(
-                        client,
-                        symbol=self.symbol,
-                        market_type=self.cfg.market_type,
-                        exchange_order_id=extra.exchange_order_id,
-                        client_order_id=extra.client_order_id,
-                        exchange_config=self.exchange_config,
-                    )
                 except Exception as e:
                     logger.debug("grid dedupe cancel sid=%s cell=%s: %s", self.strategy_id, cell_idx, e)
-                if extra.id:
-                    self._orders.update_status(int(extra.id), status="cancelled")
+                    continue
+                if not self._cancel_confirmed_order(client, extra):
+                    continue
                 append_strategy_log(
                     self.strategy_id,
                     "warning",
@@ -1264,6 +1273,10 @@ class GridEngine:
                 continue
             if direction in ("long", "neutral") and st == GridCellState.LONG_HELD:
                 if self._orders.has_open_for_cell(self.strategy_id, cell_idx, "long_exit"):
+                    self._ensure_cell_exit_coverage(
+                        spec, purpose="long_exit", side="sell", price=spec.upper_price,
+                        pos_side="long", quantity=float(cell.leg_size or 0.0),
+                    )
                     continue
                 leg = float(cell.leg_size or 0.0)
                 qty = self._normalize_grid_base_qty(leg, float(spec.upper_price or 0))
@@ -1281,6 +1294,10 @@ class GridEngine:
                     placed += 1
             elif direction in ("short", "neutral") and st == GridCellState.SHORT_HELD:
                 if self._orders.has_open_for_cell(self.strategy_id, cell_idx, "short_exit"):
+                    self._ensure_cell_exit_coverage(
+                        spec, purpose="short_exit", side="buy", price=spec.lower_price,
+                        pos_side="short", quantity=float(cell.leg_size or 0.0),
+                    )
                     continue
                 leg = float(cell.leg_size or 0.0)
                 qty = self._normalize_grid_base_qty(leg, float(spec.lower_price or 0))
@@ -1789,25 +1806,7 @@ class GridEngine:
                 continue
             if not client:
                 continue
-            try:
-                cancel_grid_order(
-                    client,
-                    symbol=self.symbol,
-                    market_type=self.cfg.market_type,
-                    exchange_order_id=o.exchange_order_id,
-                    client_order_id=o.client_order_id,
-                    exchange_config=self.exchange_config,
-                )
-            except Exception as e:
-                logger.warning(
-                    "cancel grid ownership order failed sid=%s oid=%s: %s",
-                    self.strategy_id,
-                    o.exchange_order_id or o.client_order_id,
-                    e,
-                )
-                continue
-            if o.id:
-                self._orders.update_status(int(o.id), status="cancelled")
+            self._cancel_confirmed_order(client, o)
 
     def cancel_entry_orders_on_exchange(self, *, pos_side: str = "") -> None:
         self._cancel_position_orders_on_exchange(pos_side=pos_side, exits=False)
@@ -1832,24 +1831,10 @@ class GridEngine:
             )
             client = None
         for o in open_orders:
-            if client:
-                try:
-                    cancel_grid_order(
-                        client,
-                        symbol=self.symbol,
-                        market_type=self.cfg.market_type,
-                        exchange_order_id=o.exchange_order_id,
-                        client_order_id=o.client_order_id,
-                        exchange_config=self.exchange_config,
-                    )
-                except Exception as e:
-                    logger.debug("cancel grid order: %s", e)
-            if o.id:
-                self._orders.update_status(int(o.id), status="cancelled")
+            self._cancel_confirmed_order(client, o)
 
     def shutdown(self) -> None:
         self.cancel_all_orders_on_exchange()
-        self._orders.cancel_all(self.strategy_id, self.symbol)
         released = self._cells.release_cancelled_working_orders(self.strategy_id, self.symbol)
         if released:
             append_strategy_log(self.strategy_id, "info", f"Grid released {released} local cell working state(s)")

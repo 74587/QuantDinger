@@ -52,22 +52,21 @@ def _load_ownership_rows(strategy_id: int, user_id: int, *, fresh: bool = False)
     )
     from app.services.live_trading.strategy_position_sync import sync_strategy_positions_from_exchange
 
-    if str(strategy.get("execution_mode") or "").lower() == "live":
-        if fresh:
-            from app.services.pending_orders.position_sync_cache import (
-                invalidate_position_sync_snapshot_for_exchange,
-            )
+    if fresh and str(strategy.get("execution_mode") or "").lower() == "live":
+        from app.services.live_trading.account_snapshot import fetch_account_snapshot
+        from app.services.live_trading.account_positions import snapshot_rows_to_account_legs
 
-            invalidate_position_sync_snapshot_for_exchange(
-                user_id=int(user_id),
-                exchange_id=str(resolved.get("exchange_id") or ""),
-                market_type=market_type,
-                exchange_config=resolved,
-            )
-        sync_strategy_positions_from_exchange(int(strategy_id))
-    account_rows = list_account_positions(
-        user_id=int(user_id), credential_id=credential_id or None, market_type=market_type
-    )
+        snapshot = fetch_account_snapshot(user_id=int(user_id), credential_id=credential_id)
+        if snapshot.get("error") or snapshot.get("partial") or snapshot.get("warnings"):
+            raise ValueError("positionOwnership.snapshotUnavailable")
+        bucket = "spot_positions" if market_type == "spot" else "swap_positions"
+        account_rows = snapshot_rows_to_account_legs(snapshot.get(bucket) or [])
+    else:
+        if str(strategy.get("execution_mode") or "").lower() == "live":
+            sync_strategy_positions_from_exchange(int(strategy_id))
+        account_rows = list_account_positions(
+            user_id=int(user_id), credential_id=credential_id or None, market_type=market_type
+        )
     allocated_rows = list_strategy_allocations_for_account(
         user_id=int(user_id), credential_id=credential_id, market_type=market_type,
         allowed_symbols=allowed,
@@ -109,7 +108,7 @@ def get_position_ownership():
     try:
         from app.services.live_trading.position_ownership import supports_position_coexistence
 
-        rows, context = _load_ownership_rows(int(strategy_id), int(g.user_id))
+        rows, context = _load_ownership_rows(int(strategy_id), int(g.user_id), fresh=True)
         status = "drift_blocked" if any(row.get("status") == "drift_blocked" for row in rows) else "ok"
         return jsonify({
             "code": 1,
@@ -127,6 +126,8 @@ def get_position_ownership():
         })
     except LookupError:
         return jsonify({"code": 0, "msg": "strategyV2.strategyNotFound", "data": {"items": []}}), 404
+    except ValueError:
+        return jsonify({"code": 0, "msg": "positionOwnership.snapshotUnavailable", "data": {"items": []}}), 409
     except Exception:
         logger.exception("get_position_ownership failed")
         return jsonify({"code": 0, "msg": "positionOwnership.loadFailed", "data": {"items": []}}), 500
@@ -167,12 +168,20 @@ def repair_position_ownership_route():
             strategy_qty=float(current.get("strategy_qty") or 0.0),
             action=action,
             inst_id=str(current.get("inst_id") or ""),
+            reference_price=float(current.get("reference_price") or 0.0),
         )
         return jsonify({"code": 1, "msg": "success", "data": result.metadata()})
     except LookupError:
         return jsonify({"code": 0, "msg": "strategyV2.strategyNotFound", "data": None}), 404
-    except ValueError:
-        return jsonify({"code": 0, "msg": "positionOwnership.invalidRepairRequest", "data": None}), 409
+    except ValueError as exc:
+        known = {
+            "positionOwnership.accountBelowStrategyAllocation",
+            "positionOwnership.coexistenceMarketUnsupported",
+            "positionOwnership.invalidRepairAction",
+            "positionOwnership.snapshotUnavailable",
+        }
+        message = str(exc) if str(exc) in known else "positionOwnership.invalidRepairRequest"
+        return jsonify({"code": 0, "msg": message, "data": None}), 409
     except Exception:
         logger.exception("repair_position_ownership failed")
         return jsonify({"code": 0, "msg": "positionOwnership.repairFailed", "data": None}), 500

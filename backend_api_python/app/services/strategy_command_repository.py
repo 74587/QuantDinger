@@ -228,6 +228,20 @@ class StrategyCommandRepository:
             finally:
                 cur.close()
 
+    def has_pending_stop(self, strategy_id: int) -> bool:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                cur.execute(
+                    """SELECT 1 FROM qd_strategy_commands
+                       WHERE strategy_id = %s AND command_type = 'stop'
+                         AND status IN ('pending', 'processing') LIMIT 1""",
+                    (int(strategy_id),),
+                )
+                return cur.fetchone() is not None
+            finally:
+                cur.close()
+
     def acquire_strategy_lease(self, *, strategy_id: int, owner_id: str, lease_seconds: int) -> int | None:
         with get_db_connection() as db:
             cur = db.cursor()

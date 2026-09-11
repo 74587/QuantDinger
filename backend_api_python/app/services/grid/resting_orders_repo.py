@@ -167,7 +167,7 @@ class GridRestingOrderRepository:
         avg_fill_price: Optional[float] = None,
         processed_fill_qty: Optional[float] = None,
         exchange_order_id: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         sets = ["status = %s", "updated_at = NOW()"]
         args: List[Any] = [str(status)]
         if filled_quantity is not None:
@@ -190,10 +190,13 @@ class GridRestingOrderRepository:
                     f"UPDATE qd_grid_resting_orders SET {', '.join(sets)} WHERE id = %s",
                     tuple(args),
                 )
+                updated = cur.rowcount == 1
                 db.commit()
                 cur.close()
+                return updated
         except Exception as e:
             logger.warning("grid resting update failed id=%s: %s", order_id, e)
+            return False
 
     def list_unprocessed(self, strategy_id: int) -> List[GridRestingOrder]:
         """Orders with exchange fills not yet written to the strategy trade ledger."""
