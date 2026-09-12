@@ -28,6 +28,7 @@ from .factor_research import FactorResearchEngine
 from .models import InstrumentSpec, StrategyManifest
 from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
+from .readiness import validate_universe_history, validate_warmup, validate_fundamentals
 from .snapshot import MarketDataSnapshotStore, canonical_frame_bytes
 from .storage import StrategyBacktestRepository
 
@@ -191,7 +192,7 @@ class StrategyV2BacktestService:
         frames = frequency_frames.get(frequency, {})
         if not frames:
             raise StrategyV2ContractError("strategyV2.noMarketData")
-        _validate_warmup_history(frequency_frames, manifest.warmup_bars, start_date)
+        validate_warmup(frequency_frames, manifest.warmup_bars, start_date, candidates)
         if manifest.fundamental_dependencies:
             enricher = self.fundamental_enricher or get_fundamental_data_service().enrich_panel
             frames = enricher(frames, candidates)
@@ -390,6 +391,7 @@ class StrategyV2BacktestService:
         universe = next((item for item in self.universe_service.list_universes(user_id) if _universe_matches(item, reference)), None)
         if not universe:
             raise StrategyV2ContractError(f"strategyV2.universeNotFound:{reference}")
+        validate_universe_history(universe, start_date)
         universe_id = int(universe.get("id") or 0)
         members = self.universe_service.candidate_members(
             user_id,
@@ -523,12 +525,7 @@ class StrategyV2BacktestService:
     @staticmethod
     def validate_fundamental_dependencies(frames: dict[str, pd.DataFrame], manifest: StrategyManifest) -> None:
         required = {_normalize_field(item) for item in manifest.fundamental_dependencies}
-        available = set()
-        for frame in frames.values():
-            available.update(str(column).strip().lower() for column in frame.columns)
-        missing = sorted(required - available)
-        if missing:
-            raise StrategyV2ContractError(f"strategyV2.fundamentalDataMissing:{','.join(missing)}")
+        validate_fundamentals(frames, required)
 
 
 def _enforce_backtest_range(
@@ -574,15 +571,7 @@ def _instrument_member(item: InstrumentSpec) -> dict[str, Any]:
 
 
 def _validate_warmup_history(frequency_frames, warmup_bars: int, start_date: datetime) -> None:
-    if warmup_bars <= 0:
-        return
-    start = pd.Timestamp(start_date)
-    start = start.tz_localize("UTC") if start.tzinfo is None else start.tz_convert("UTC")
-    for frames in frequency_frames.values():
-        for frame in frames.values():
-            index = pd.to_datetime(frame.index, utc=True)
-            if int((index < start).sum()) < warmup_bars:
-                raise StrategyV2ContractError("strategyV2.insufficientWarmupData")
+    validate_warmup(frequency_frames, warmup_bars, start_date)
 
 
 def _warmup_calendar_days(frequency: str, warmup_bars: int, candidates=()) -> int:

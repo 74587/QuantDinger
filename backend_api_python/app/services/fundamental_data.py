@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from datetime import date, timedelta
 from typing import Any, Mapping
 
@@ -16,6 +17,7 @@ logger = get_logger(__name__)
 FUNDAMENTAL_FIELDS = (
     "revenue",
     "net_income",
+    "net_income_ttm",
     "book_value",
     "shareholder_equity",
     "total_debt",
@@ -34,6 +36,7 @@ class FundamentalDataService:
     """Load only observations that were public at each simulated date."""
 
     @staticmethod
+    @lru_cache(maxsize=1)
     def ensure_schema() -> None:
         with get_db_connection() as db:
             cur = db.cursor()
@@ -79,9 +82,9 @@ class FundamentalDataService:
         if not rows:
             return frame
         enriched = frame.copy()
-        dates = pd.DatetimeIndex(enriched.index).normalize()
+        dates = pd.DatetimeIndex(pd.to_datetime(enriched.index, utc=True)).tz_localize(None).normalize()
         observations = pd.DataFrame(rows)
-        observations["available_at"] = pd.to_datetime(observations["available_at"])
+        observations["available_at"] = pd.to_datetime(observations["available_at"], utc=True).dt.tz_localize(None)
         observations = observations.sort_values(["available_at", "period_end"]).drop_duplicates("available_at", keep="last")
         observations = observations.set_index("available_at")
         for field in FUNDAMENTAL_FIELDS:
@@ -91,7 +94,9 @@ class FundamentalDataService:
         derived_market_cap = pd.to_numeric(enriched["close"], errors="coerce") * pd.to_numeric(
             enriched["shares_outstanding"], errors="coerce"
         )
-        enriched["market_cap"] = pd.to_numeric(enriched["market_cap"], errors="coerce").fillna(derived_market_cap)
+        enriched["market_cap"] = derived_market_cap.where(derived_market_cap > 0).fillna(
+            pd.to_numeric(enriched["market_cap"], errors="coerce")
+        )
         return enriched
 
     @staticmethod
@@ -258,8 +263,11 @@ class FundamentalDataService:
             auto_adjust=False,
         )
         stored = 0
+        stored_dates = []
         for index, period in enumerate(periods):
             available_at, availability_source = _availability_date(period, earnings_dates)
+            if availability_source != "reported_earnings_date":
+                continue
             revenue = _statement_value(income, period, "Total Revenue", "Revenue")
             net_income = _statement_value(
                 income,
@@ -267,6 +275,10 @@ class FundamentalDataService:
                 "Net Income",
                 "Net Income Common Stockholders",
             )
+            quarters = periods[max(0, index - 3):index + 1]
+            quarterly_income = [_statement_value(income, item, "Net Income", "Net Income Common Stockholders") for item in quarters]
+            contiguous = len(quarters) == 4 and all(60 <= (right - left).days <= 120 for left, right in zip(quarters, quarters[1:]))
+            net_income_ttm = sum(quarterly_income) if contiguous and all(value is not None for value in quarterly_income) else None
             equity = _statement_value(balance, period, "Stockholders Equity", "Total Equity Gross Minority Interest")
             debt = _statement_value(balance, period, "Total Debt")
             shares = _statement_value(
@@ -295,6 +307,7 @@ class FundamentalDataService:
                 "frequency": "quarterly",
                 "revenue": revenue,
                 "net_income": net_income,
+                "net_income_ttm": net_income_ttm,
                 "book_value": equity / shares if equity is not None and shares not in (None, 0.0) else None,
                 "shareholder_equity": equity,
                 "total_debt": debt,
@@ -315,14 +328,15 @@ class FundamentalDataService:
             if any(_finite_or_none(payload.get(field)) is not None for field in FUNDAMENTAL_FIELDS):
                 self.upsert(payload)
                 stored += 1
+                stored_dates.append(available_at)
         if not stored:
             raise ValueError("factor.fundamentalDataUnavailable")
         return {
             "market": normalized_market,
             "symbol": normalized_symbol,
             "observations": stored,
-            "firstAvailableAt": _availability_date(periods[0], earnings_dates)[0].isoformat(),
-            "lastAvailableAt": _availability_date(periods[-1], earnings_dates)[0].isoformat(),
+            "firstAvailableAt": min(stored_dates).isoformat(),
+            "lastAvailableAt": max(stored_dates).isoformat(),
         }
 
 
@@ -368,7 +382,9 @@ def _availability_date(period: pd.Timestamp, earnings_dates: list[date]) -> tupl
     period_date = period.date()
     candidates = [item for item in earnings_dates if period_date < item <= period_date + timedelta(days=120)]
     if candidates:
-        return candidates[0], "reported_earnings_date"
+        # Date-only observations cannot safely enter a pre-open handler on the
+        # earnings day: US companies commonly report after the market closes.
+        return candidates[0] + timedelta(days=1), "reported_earnings_date"
     return period_date + timedelta(days=60), "conservative_60_day_lag"
 
 

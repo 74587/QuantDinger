@@ -9,6 +9,7 @@ This worker polls `pending_orders` periodically and dispatches orders based on `
 from __future__ import annotations
 
 import json
+from app.services.strategy_runtime.cancellations import dispatch_requested_cancel
 import os
 import re
 import threading
@@ -528,6 +529,7 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
         if AlpacaClient is None or not isinstance(client, AlpacaClient):
             return
 
+        dispatch_requested_cancel(client, row, payload, exchange_config)
         result = client.get_order_status(exchange_order_id)
         status = str(result.status or "").strip().lower()
         cumulative_filled = float(result.filled or 0.0)
@@ -845,6 +847,7 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
         )
         try:
             client = create_client(exchange_config, market_type=market_type)
+            dispatch_requested_cancel(client, row, payload, exchange_config)
             sync_raw: Dict[str, Any] = {}
             if exchange_id == "ibkr" and hasattr(client, "get_order_status"):
                 broker_result = client.get_order_status(exchange_order_id)
@@ -1221,6 +1224,7 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                     SELECT *
                     FROM pending_orders
                     WHERE status = 'pending'
+                      AND COALESCE(last_error, '') <> 'strategyV2.cancellationNeedsReconciliation'
                       AND (attempts < max_attempts)
                       AND (COALESCE(last_error, '') NOT IN
                            ('positionOwnership.accountBusy', 'positionOwnership.ordersPending')
@@ -1265,6 +1269,9 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
             return False
 
     def _dispatch_one(self, order_row: Dict[str, Any]) -> None:
+        from app.services.strategy_runtime.cancellations import intercept_cancelled_dispatch
+        if intercept_cancelled_dispatch(order_row):
+            return
         order_id = int(order_row["id"])
         mode = (order_row.get("execution_mode") or "signal").strip().lower()
         payload_json = order_row.get("payload_json") or ""

@@ -240,12 +240,14 @@ def test_live_position_snapshot_keeps_both_owned_legs(monkeypatch):
         "_get_current_positions",
         lambda *_args: [
             {
+                "symbol": "BTC/USDT",
                 "side": "long",
                 "size": 1.25,
                 "entry_price": 100,
                 "current_price": 101,
             },
             {
+                "symbol": "BTC/USDT",
                 "side": "short",
                 "size": 2.5,
                 "entry_price": 102,

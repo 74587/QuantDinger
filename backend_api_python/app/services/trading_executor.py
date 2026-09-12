@@ -21,6 +21,8 @@ from app.services.strategy_runtime.health import record_runtime_heartbeat
 from app.services.strategy_runtime.identity import ensure_strategy_run, finish_strategy_run
 from app.services.strategy_runtime.order_intents import OrderIntentService
 from app.services.strategy_runtime.state import RuntimeStateStore
+from app.services.strategy_runtime.live_portfolio import refresh_members, positions_by_symbol, available_strategy_cash, pricing_members
+from app.services.strategy_runtime.cancellations import persist_cancellations
 from app.services.strategy_runtime.timeframes import (
     completed_bar_token,
     live_history_days,
@@ -352,7 +354,7 @@ class TradingExecutor:
             candidates, universe_id = service.resolve_candidates(
                 user_id=user_id,
                 manifest=program.manifest,
-                start_date=now - timedelta(days=7),
+                start_date=now,
                 end_date=now,
             )
             account_exchange = str(
@@ -367,6 +369,7 @@ class TradingExecutor:
             frequency = program.manifest.driving_frequency
 
             def fetch_runtime_frames() -> dict[str, dict[str, pd.DataFrame]]:
+                refresh_members(service, candidates, program.manifest, user_id, strategy_id, datetime.now(timezone.utc), account_exchange)
                 return load_live_frequency_frames(
                     service=service,
                     candidates=candidates,
@@ -394,11 +397,13 @@ class TradingExecutor:
             frames = frequency_frames[frequency]
             runtime_price_client: Dict[str, Any] = {}
 
+            positions = {}
             def runtime_prices() -> dict[str, float]:
+                priced = pricing_members(candidates, positions)
                 if execution_mode != "live":
-                    return self._live_prices(candidates)
+                    return self._live_prices(priced)
                 return self._execution_account_prices(
-                    candidates,
+                    priced,
                     exchange_config,
                     runtime_price_client,
                 )
@@ -567,6 +572,7 @@ class TradingExecutor:
                         session.context.update_order_statuses(
                             order_intent_service.statuses_by_client_order_ids(references)
                         )
+                    persist_cancellations(session.context, order_intent_service)
                     positions = self._positions_by_symbol(
                         strategy_id,
                         candidates,
@@ -619,6 +625,7 @@ class TradingExecutor:
                     session.synchronize_positions(
                         positions,
                         total_value=current_equity,
+                        available_cash=available_strategy_cash(current_equity, positions, candidates, leverage, active_prices),
                     )
                     risk_timestamp = pd.Timestamp.now(tz="UTC")
                     equity_intents, equity_messages, equity_stop_reason = (
@@ -2058,9 +2065,9 @@ class TradingExecutor:
                 SELECT id, symbol, side, size, entry_price, current_price,
                        highest_price, lowest_price, updated_at
                 FROM qd_strategy_positions
-                WHERE strategy_id = %s AND split_part(symbol, ':', 1) = split_part(%s, ':', 1)
+                WHERE strategy_id = %s AND (%s::text IS NULL OR split_part(symbol, ':', 1) = split_part(%s, ':', 1))
                 """,
-                (strategy_id, symbol),
+                (strategy_id, symbol, symbol),
             )
             rows = cur.fetchall() or []
             cur.close()
@@ -2073,30 +2080,7 @@ class TradingExecutor:
         *,
         strategy: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any]]:
-        from app.services.strategy_live_guard import resolve_strategy_direction_mode
-
-        output: dict[str, dict[str, Any]] = {}
-        strategy_row = strategy if isinstance(strategy, dict) else (self._load_strategy(strategy_id) or {})
-        owns_both_legs = resolve_strategy_direction_mode(strategy_row) in {"both", "neutral"}
-        for member in candidates:
-            key = str(member.get("key") or "")
-            rows = self._get_current_positions(strategy_id, str(member.get("symbol") or ""))
-            if not rows:
-                continue
-            selected_rows = rows if owns_both_legs else rows[:1]
-            for row in selected_rows:
-                side = str(row.get("side") or "long").strip().lower()
-                if side not in {"long", "short"}:
-                    side = "long"
-                position_key = f"{key}::{side}" if owns_both_legs else key
-                output[position_key] = {
-                    "amount": row.get("size") or 0,
-                    "side": side,
-                    "position_side": side if owns_both_legs else "",
-                    "avg_cost": row.get("entry_price") or 0,
-                    "last_price": row.get("current_price") or 0,
-                }
-        return output
+        return positions_by_symbol(self, strategy_id, candidates, strategy or self._load_strategy(strategy_id))
 
     @staticmethod
     def _live_prices(candidates: list[dict[str, Any]]) -> dict[str, float]:

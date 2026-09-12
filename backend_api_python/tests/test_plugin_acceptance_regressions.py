@@ -93,7 +93,7 @@ def test_stock_intraday_warmup_allows_closed_sessions():
 
 
 def test_warmup_counts_only_prior_bars_and_checks_each_frequency():
-    frames = {"1d": {"USStock:NVDA": pd.DataFrame(index=pd.bdate_range("2026-01-01", periods=40, tz="UTC"))}}
+    frames = {"1d": {"USStock:NVDA": pd.DataFrame(dict(open=100, high=101, low=99, close=100), index=pd.bdate_range("2026-01-01", periods=40, tz="UTC"))}}
     _validate_warmup_history(frames, 30, datetime(2026, 2, 12))
     with pytest.raises(StrategyV2ContractError, match="insufficientWarmupData"):
         _validate_warmup_history(frames, 31, datetime(2026, 2, 12))

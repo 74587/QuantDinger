@@ -6,6 +6,7 @@ from typing import Any
 
 from app.services.ai_generation_contracts import SCRIPT_STRATEGY_SYSTEM_PROMPT
 from app.services.factors.registry import list_factors
+from app.services.fundamental_data import FUNDAMENTAL_FIELDS
 from app.services.strategy_ai_capabilities import strategy_ai_capability_catalog
 from app.services.strategy_direction import DIRECTION_MODES
 
@@ -97,6 +98,14 @@ def get_strategy_authoring_contract() -> dict[str, Any]:
     return {
         "version": "strategy-api-v2-capability-packs-2026-09",
         "doc": "docs/trading/STRATEGY_DEV_GUIDE.md",
+        "dataRequirements": {
+            "fundamentalFields": list(FUNDAMENTAL_FIELDS),
+            "netIncomeBasis": "latest_reported_period",
+            "netIncomeTtmBasis": "four_consecutive_reported_quarters",
+            "historicalUniverseCoverageField": "history_from",
+            "historicalSnapshotBackfillAllowed": False,
+            "liveCancellationStatus": "cancel_pending_until_exchange_confirmation",
+        },
         "workflow": [
             "1. Fetch this contract before generating Strategy API V2 source.",
             "2. Generate complete Python source; never send natural language as code.",

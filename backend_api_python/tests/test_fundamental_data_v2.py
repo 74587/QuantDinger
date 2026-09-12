@@ -119,7 +119,10 @@ def test_sync_history_persists_reported_quarters_with_point_in_time_dates(monkey
     result = service.sync_history(market="USStock", symbol="aapl")
 
     assert result["observations"] == 5
-    assert persisted[0]["available_at"].isoformat() == "2025-05-01"
+    assert persisted[0]["available_at"].isoformat() == "2025-05-02"
     assert persisted[-1]["market_cap"] == 700.0
     assert persisted[-1]["revenue_growth"] == pytest.approx(0.4)
+    assert persisted[2]["net_income_ttm"] is None
+    assert persisted[3]["net_income_ttm"] == 46
+    assert persisted[4]["net_income_ttm"] == 50
     assert persisted[-1]["metadata"]["pointInTime"] is True

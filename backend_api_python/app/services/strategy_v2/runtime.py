@@ -221,6 +221,7 @@ class StrategyRuntimeContext:
         self._order_sequence = 0
         self._order_statuses: dict[str, dict[str, Any]] = {}
         self._cancelled_order_ids: set[str] = set()
+        self.live_order_cancellation = False
         self._last_exit_reasons: dict[str, str] = {}
         self.logger = StrategyRuntimeLogger(self.log)
 
@@ -284,9 +285,12 @@ class StrategyRuntimeContext:
         current = dict(self._order_statuses.get(reference) or {})
         if str(current.get("status") or "").strip().lower() == "filled":
             return False
+        queued = any(order.client_order_id == reference for order in self._orders)
+        if queued:
+            self._orders = [order for order in self._orders if order.client_order_id != reference]
         current.update({
             "client_order_id": reference,
-            "status": "cancelled",
+            "status": "cancel_pending" if self.live_order_cancellation and not queued else "cancelled",
             "reason": "cancelled_by_strategy",
         })
         self._order_statuses[reference] = current
@@ -2244,6 +2248,7 @@ class StrategyV2LiveSession:
         )
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
         self.context = StrategyRuntimeContext(portal=self.portal, portfolio=self.portfolio, params=params)
+        self.context.live_order_cancellation = True
         self.persist_strategy_state = (
             _truthy(self.program.namespace.get("PERSIST_RUNTIME_STATE"))
             or _truthy(self.context.params.get("persist_runtime_state"))
@@ -2518,6 +2523,8 @@ class StrategyV2LiveSession:
             "version": 3,
             "protection": self.protection_snapshot(),
         }
+        if self.context._cancelled_order_ids:
+            snapshot["cancelRequests"] = sorted(self.context._cancelled_order_ids)
         if self.persist_strategy_state:
             snapshot.update({
                 "strategyState": _snapshot_state_value(
@@ -2542,6 +2549,7 @@ class StrategyV2LiveSession:
         raw = dict(values or {})
         if not raw:
             return
+        self.context._cancelled_order_ids.update(str(ref) for ref in raw.get("cancelRequests", []))
         protection = raw.get("protection")
         if isinstance(protection, Mapping):
             self.restore_protection_snapshot(protection)

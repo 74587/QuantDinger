@@ -48,4 +48,4 @@ def test_fundamentals_enter_panel_only_when_public_and_market_cap_can_be_derived
     assert enriched.loc["2026-01-05", "net_income"] == 50
     assert enriched.loc["2026-01-05", "market_cap"] == 1_000
     assert enriched.loc["2026-01-10", "net_income"] == 60
-    assert enriched.loc["2026-01-10", "market_cap"] == 2_000
+    assert enriched.loc["2026-01-10", "market_cap"] == 1_100

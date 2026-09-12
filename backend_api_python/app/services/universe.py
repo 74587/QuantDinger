@@ -137,6 +137,7 @@ class UniverseService:
             cur.execute(
                 """
                 SELECT u.*,
+                       (SELECT MIN(m.valid_from) FROM qd_universe_members m WHERE m.universe_id = u.id) AS history_from,
                        CASE WHEN u.universe_type = 'watchlist' THEN
                          (SELECT COUNT(*) FROM qd_watchlist w WHERE w.user_id = ?)
                        ELSE
@@ -163,6 +164,11 @@ class UniverseService:
     def get_universe(self, user_id: int, universe_id: int) -> dict:
         with get_db_connection() as db:
             row = self._get_visible_universe(db, user_id, universe_id)
+            cur = db.cursor()
+            cur.execute("SELECT MIN(valid_from) AS history_from FROM qd_universe_members WHERE universe_id = ?", (universe_id,))
+            row = dict(row, **(cur.fetchone() or {}))
+            cur.close()
+        row['member_count'] = len(self.resolve_members(user_id, universe_id))
         return _serialize_universe(row)
 
     def create_manual(self, user_id: int, payload: dict) -> dict:
@@ -371,7 +377,8 @@ class UniverseService:
                 member["market"], member["symbol"], member["exchange_id"],
                 member["market_type"], member["instrument_id"],
             )
-            deduped[key] = member
+            if key not in deduped:
+                deduped[key] = member
         return [deduped[key] for key in sorted(deduped)]
 
     def create_snapshot(self, user_id: int, universe_id: int, *, as_of: Any = None) -> dict:
@@ -472,6 +479,7 @@ def _serialize_universe(row: dict) -> dict:
         "is_system": bool(row.get("is_system")),
         "status": str(row.get("status") or ""),
         "member_count": int(row.get("member_count") or 0),
+        "history_from": _iso(row.get("history_from")),
         "metadata": _json_value(row.get("metadata_json"), {}),
         "created_at": _iso(row.get("created_at")),
         "updated_at": _iso(row.get("updated_at")),
