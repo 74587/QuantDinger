@@ -10,7 +10,7 @@ from app.services.strategy_lifecycle import maybe_auto_stop_on_exchange_error
 from app.workers.trading import TradingWorker
 
 
-@pytest.mark.parametrize("difference,allowed", [(9.99, True), (10, True), (10.01, False), (-9.99, True), (-10, True), (-10.01, False)])
+@pytest.mark.parametrize("difference,allowed", [(9.99, True), (10, True), (10.01, True), (-9.99, True), (-10, True), (-10.01, False)])
 def test_quote_tolerance_covers_both_signs_and_boundary(difference, allowed):
     snap = ownership.calculate_position_ownership(symbol="BTC/USDT", side="long", account_qty=1 + difference / 100, strategy_qty=1, reference_price=100)
     assert snap.allowed is allowed
@@ -33,8 +33,8 @@ def test_ui_and_entry_ownership_agree_on_small_shortfall():
 
 @pytest.mark.parametrize("account_size,strategy_size,protected,kind", [
     (0.0045177, 0.0094404, 0.0012018, "allocation_shortfall"),
-    (0.02, 0.01, 0.015, "reset_protection"),
-    (0.02, 0.01, 0, "protect_manual"),
+    (0.02, 0.01, 0.015, "none"),
+    (0.02, 0.01, 0, "none"),
 ])
 def test_negative_difference_has_an_explicit_repair_kind(account_size, strategy_size, protected, kind):
     rows = ownership.build_ownership_rows(

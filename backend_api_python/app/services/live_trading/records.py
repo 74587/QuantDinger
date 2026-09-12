@@ -33,6 +33,11 @@ def normalize_strategy_symbol(symbol: str) -> str:
     if not s:
         return ""
     if "/" in s:
+        slash_at = s.find("/")
+        settlement_at = s.find(":", slash_at + 1)
+        venue_at = s.find("@", slash_at + 1)
+        if settlement_at >= 0 and (venue_at < 0 or settlement_at < venue_at):
+            return s[:settlement_at]
         return s
     for quote in ("USDT", "USDC", "USD", "BUSD", "EUR"):
         if s.endswith(quote) and len(s) > len(quote):
@@ -84,16 +89,25 @@ def fetch_allocated_position_size(
     if side_l not in ("long", "short"):
         return 0.0
 
-    clauses = ["side = %s", "market_type = %s", "size > 0"]
+    clauses = ["p.side = %s", "p.market_type = %s", "p.size > 0"]
     params: List[Any] = [side_l, mt]
     if cred > 0 and sid > 0:
-        clauses.append("(credential_id = %s OR strategy_id = %s)")
-        params.extend([cred, sid])
+        clauses.append(
+            "(p.strategy_id = %s OR p.credential_id = %s "
+            "OR (COALESCE(p.credential_id, 0) = 0 "
+            "AND COALESCE(NULLIF(s.exchange_config::jsonb->>'credential_id', ''), "
+            "s.exchange_config::jsonb->>'credentials_id') = %s))"
+        )
+        params.extend([sid, cred, str(cred)])
     elif cred > 0:
-        clauses.append("credential_id = %s")
-        params.append(cred)
+        clauses.append(
+            "(p.credential_id = %s OR (COALESCE(p.credential_id, 0) = 0 "
+            "AND COALESCE(NULLIF(s.exchange_config::jsonb->>'credential_id', ''), "
+            "s.exchange_config::jsonb->>'credentials_id') = %s))"
+        )
+        params.extend([cred, str(cred)])
     elif sid > 0:
-        clauses.append("strategy_id = %s")
+        clauses.append("p.strategy_id = %s")
         params.append(sid)
     else:
         return 0.0
@@ -102,9 +116,11 @@ def fetch_allocated_position_size(
         cur = db.cursor()
         cur.execute(
             f"""
-            SELECT strategy_id, symbol, symbol_canonical, size
-            FROM qd_strategy_positions
+            SELECT p.strategy_id, p.symbol, p.symbol_canonical, p.size
+            FROM qd_strategy_positions p
+            JOIN qd_strategies_trading s ON s.id = p.strategy_id
             WHERE {' AND '.join(clauses)}
+              AND s.execution_mode = 'live'
             """,
             params,
         )

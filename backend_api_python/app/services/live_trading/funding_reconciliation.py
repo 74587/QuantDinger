@@ -70,19 +70,32 @@ def _position_allocations(*, credential_id: int, symbol: str, fallback_strategy_
         cur = db.cursor()
         cur.execute(
             """
-            SELECT strategy_id, SUM(ABS(COALESCE(size, 0))) AS qty
-            FROM qd_strategy_positions
-            WHERE credential_id = %s
-              AND UPPER(COALESCE(symbol_canonical, symbol, '')) = %s
-              AND ABS(COALESCE(size, 0)) > 0
-            GROUP BY strategy_id
+            SELECT p.strategy_id, p.symbol, p.symbol_canonical, p.size
+            FROM qd_strategy_positions p
+            JOIN qd_strategies_trading s ON s.id = p.strategy_id
+            WHERE ABS(COALESCE(p.size, 0)) > 0
+              AND s.execution_mode = 'live'
+              AND (p.credential_id = %s
+                   OR (COALESCE(p.credential_id, 0) = 0
+                       AND COALESCE(NULLIF(s.exchange_config::jsonb->>'credential_id', ''),
+                                    s.exchange_config::jsonb->>'credentials_id') = %s))
             """,
-            (int(credential_id or 0), canon),
+            (int(credential_id or 0), str(credential_id or 0)),
         )
         rows = cur.fetchall() or []
         cur.close()
-    quantities = [(int(row.get("strategy_id") or 0), float(row.get("qty") or 0.0)) for row in rows]
-    quantities = [(sid, qty) for sid, qty in quantities if sid > 0 and qty > 0]
+    totals: Dict[int, float] = {}
+    for row in rows:
+        row_symbol = normalize_strategy_symbol(
+            str(row.get("symbol_canonical") or row.get("symbol") or "")
+        ).upper()
+        if row_symbol != canon:
+            continue
+        sid = int(row.get("strategy_id") or 0)
+        qty = abs(float(row.get("size") or 0.0))
+        if sid > 0 and qty > 0:
+            totals[sid] = totals.get(sid, 0.0) + qty
+    quantities = list(totals.items())
     total = sum(qty for _, qty in quantities)
     if total > 0:
         return [(sid, qty / total) for sid, qty in quantities]
@@ -108,6 +121,16 @@ def _insert_payments(
                     continue
             external_id = str(payment.get("id") or "").strip()
             if not external_id:
+                continue
+            cur.execute(
+                """
+                SELECT 1 FROM qd_strategy_funding_fees
+                WHERE credential_id = %s AND exchange_id = %s AND external_id = %s
+                LIMIT 1
+                """,
+                (credential_id, exchange_id, external_id),
+            )
+            if cur.fetchone():
                 continue
             amount = float(payment.get("amount") or 0.0)
             occurred_at = _utc_from_ms(payment.get("time"))
@@ -222,6 +245,7 @@ def sync_running_strategy_funding() -> int:
                 WHERE status = 'running' AND execution_mode = 'live'
                   AND LOWER(COALESCE(market_type, 'swap')) IN
                       ('swap', 'future', 'futures', 'perp', 'perpetual')
+                ORDER BY id
                 """
             )
             rows = cur.fetchall() or []

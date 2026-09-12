@@ -971,6 +971,7 @@ class GridEngine:
                 self.cancel_entry_orders_on_exchange(pos_side=pos_side)
                 if str(metadata.get("reason") or "") in {
                     "account_below_protected_allocation",
+                    "account_below_strategy_allocation",
                     "position_ownership_snapshot_failed",
                     "position_ownership_credential_missing",
                 }:
@@ -1551,6 +1552,7 @@ class GridEngine:
                     self.cancel_entry_orders_on_exchange(pos_side=pos_side)
                     if str(metadata.get("reason") or "") in {
                         "account_below_protected_allocation",
+                        "account_below_strategy_allocation",
                         "position_ownership_snapshot_failed",
                         "position_ownership_credential_missing",
                     }:

@@ -18,6 +18,7 @@ from app.services.live_trading.records import (
     fetch_allocated_position_size,
     fetch_position_size_for_side,
 )
+from app.services.grid.exchange_requirements import detect_hedge_position_mode
 from app.services.strategy_live_guard import resolve_strategy_direction_mode
 
 
@@ -118,8 +119,6 @@ def evaluate_entry_position_guard(
 
     opposite_side = "short" if str(side) == "long" else "long"
     local_opposite = fetch_position_size_for_side(int(strategy_id), str(symbol), opposite_side)
-    if local_opposite <= 1e-8:
-        return EntryPositionGuardResult(ownership=metadata)
     try:
         live_opposite = float(
             query_exchange_position_size(
@@ -139,6 +138,33 @@ def evaluate_entry_position_guard(
         )
     if live_opposite <= 1e-8:
         return EntryPositionGuardResult(ownership=metadata)
+    if local_opposite <= 1e-8:
+        try:
+            is_hedge, mode_label = detect_hedge_position_mode(
+                client,
+                symbol=str(symbol),
+                market_type=str(market_type),
+                exchange_config=exchange_config,
+            )
+        except Exception as exc:
+            return EntryPositionGuardResult(
+                ownership=metadata,
+                error=f"position_mode_snapshot_failed:{exc}",
+            )
+        if is_hedge is True:
+            return EntryPositionGuardResult(ownership=metadata)
+        return EntryPositionGuardResult(
+            ownership=metadata,
+            error=(
+                "opposite_account_inventory_would_be_netted:"
+                f"side={opposite_side},exchange={live_opposite},mode={mode_label}"
+            ),
+            log_level="warning",
+            log_message=(
+                f"Entry rejected because one-way position mode would net opposite "
+                f"account inventory: {symbol}"
+            ),
+        )
     return EntryPositionGuardResult(
         ownership=metadata,
         error=(

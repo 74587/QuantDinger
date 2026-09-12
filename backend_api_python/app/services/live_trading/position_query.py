@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.services.live_trading.records import (
+    fetch_allocated_position_size,
     fetch_position_size_for_side,
     normalize_strategy_symbol,
 )
@@ -325,26 +326,26 @@ def resolve_reduce_only_quantity(
         )
         meta["filled_from"] = "none"
 
-    # In advanced coexistence mode the manual baseline is a hard floor.  Even
-    # a reduce-only strategy exit may use only quantity above that floor.
-    if int(user_id or 0) > 0 and int(credential_id or 0) > 0:
-        from app.services.live_trading.position_ownership import protected_quantity
-
-        # Deliberately fail closed.  If the protection ledger cannot be read,
-        # the caller must reject the exit instead of risking manual inventory.
-        protected = protected_quantity(
-            user_id=int(user_id),
+    # Reserve the allocations of other strategies sharing this account leg.
+    # Account surplus belongs to the user automatically; this strategy may
+    # still close its own ledger quantity without registering a manual floor.
+    allocated = db_size
+    if int(credential_id or 0) > 0:
+        allocated = fetch_allocated_position_size(
+            strategy_id=int(strategy_id),
             credential_id=int(credential_id),
             market_type=market_type,
             symbol=symbol,
             side=pos_side,
         )
-        available = max(0.0, float(exch_size or 0.0) - float(protected or 0.0))
-        meta["protected_manual_qty"] = protected
-        meta["exchange_strategy_available"] = available
-        if amount > available:
-            amount = available
-            meta["capped_by"] = "protected_manual_position"
+    other_allocated = max(0.0, float(allocated or 0.0) - float(db_size or 0.0))
+    available = max(0.0, float(exch_size or 0.0) - other_allocated)
+    meta["account_allocated_size"] = allocated
+    meta["other_strategy_allocated_size"] = other_allocated
+    meta["exchange_strategy_available"] = available
+    if amount > available:
+        amount = available
+        meta["capped_by"] = "account_allocation"
 
     meta["resolved"] = amount
     return amount, meta

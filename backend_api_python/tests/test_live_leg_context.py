@@ -60,8 +60,8 @@ def test_grid_defaults_to_fill_ledger_without_explicit_flag():
     )
 
 
-def test_explicit_position_ledger_overrides_grid_default():
-    assert not strategy_uses_fill_ledger(
+def test_grid_cannot_disable_fill_ledger_ownership():
+    assert strategy_uses_fill_ledger(
         {
             "bot_type": "grid",
             "trading_config": {"position_ledger": "exchange"},

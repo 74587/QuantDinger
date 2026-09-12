@@ -403,7 +403,7 @@ def test_reconciliation_allocates_long_and_short_to_separate_strategies():
     }]
 
 
-def test_reconciliation_detects_manual_account_drift_without_blaming_other_leg():
+def test_reconciliation_accepts_user_surplus_without_blaming_other_leg():
     result = reconcile_strategy_vs_account(
         [{"symbol": "BTC/USDT", "side": "long", "size": 1.0}],
         [
@@ -415,8 +415,8 @@ def test_reconciliation_detects_manual_account_drift_without_blaming_other_leg()
             {"strategy_id": 2, "symbol": "BTC/USDT", "side": "short", "size": 2.0},
         ],
     )
-    assert result["status"] == "mismatch"
-    assert result["notes"] == ["size_mismatch:BTC/USDT:long:allocated=1.0:account=1.4"]
+    assert result["status"] == "ok"
+    assert result["notes"] == []
 
 
 def _risk_row(strategy_id: int, side: str, size: float, price: float = 100.0) -> dict:

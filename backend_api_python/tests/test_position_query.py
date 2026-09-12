@@ -109,7 +109,7 @@ def test_resolve_caps_to_db_when_smaller(monkeypatch):
     assert meta.get("capped_by") == "db"
 
 
-def test_resolve_preserves_advanced_manual_position_floor(monkeypatch):
+def test_resolve_account_surplus_does_not_reduce_strategy_exit(monkeypatch):
     monkeypatch.setattr(
         "app.services.live_trading.position_query.fetch_position_size_for_side",
         lambda *_a, **_k: 0.015,
@@ -119,8 +119,8 @@ def test_resolve_preserves_advanced_manual_position_floor(monkeypatch):
         lambda **_k: 0.02,
     )
     monkeypatch.setattr(
-        "app.services.live_trading.position_ownership.protected_quantity",
-        lambda **_k: 0.01,
+        "app.services.live_trading.position_query.fetch_allocated_position_size",
+        lambda **_k: 0.015,
     )
     amount, meta = resolve_reduce_only_quantity(
         strategy_id=1,
@@ -133,12 +133,12 @@ def test_resolve_preserves_advanced_manual_position_floor(monkeypatch):
         user_id=1,
         credential_id=2,
     )
-    assert amount == pytest.approx(0.01)
-    assert meta["protected_manual_qty"] == pytest.approx(0.01)
-    assert meta["capped_by"] == "protected_manual_position"
+    assert amount == pytest.approx(0.015)
+    assert meta["other_strategy_allocated_size"] == 0
+    assert meta["exchange_strategy_available"] == pytest.approx(0.02)
 
 
-def test_resolve_fails_closed_when_protected_position_lookup_fails(monkeypatch):
+def test_resolve_reserves_other_strategy_allocations(monkeypatch):
     monkeypatch.setattr(
         "app.services.live_trading.position_query.fetch_position_size_for_side",
         lambda *_a, **_k: 0.015,
@@ -148,26 +148,52 @@ def test_resolve_fails_closed_when_protected_position_lookup_fails(monkeypatch):
         lambda **_k: 0.025,
     )
 
-    def fail_protection(**_kwargs):
-        raise RuntimeError("ownership database unavailable")
-
     monkeypatch.setattr(
-        "app.services.live_trading.position_ownership.protected_quantity",
-        fail_protection,
+        "app.services.live_trading.position_query.fetch_allocated_position_size",
+        lambda **_k: 0.02,
     )
+    amount, meta = resolve_reduce_only_quantity(
+        strategy_id=1,
+        symbol="BTC/USDT",
+        pos_side="long",
+        requested_amount=0.015,
+        client=MagicMock(),
+        market_type="spot",
+        exchange_config={},
+        user_id=1,
+        credential_id=2,
+    )
+    assert amount == pytest.approx(0.015)
+    assert meta["other_strategy_allocated_size"] == pytest.approx(0.005)
+    assert meta["exchange_strategy_available"] == pytest.approx(0.02)
 
-    with pytest.raises(RuntimeError, match="ownership database unavailable"):
-        resolve_reduce_only_quantity(
-            strategy_id=1,
-            symbol="BTC/USDT",
-            pos_side="long",
-            requested_amount=0.015,
-            client=MagicMock(),
-            market_type="spot",
-            exchange_config={},
-            user_id=1,
-            credential_id=2,
-        )
+
+def test_resolve_caps_exit_when_account_cannot_cover_other_strategies(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.live_trading.position_query.fetch_position_size_for_side",
+        lambda *_a, **_k: 0.015,
+    )
+    monkeypatch.setattr(
+        "app.services.live_trading.position_query.query_exchange_position_size",
+        lambda **_k: 0.012,
+    )
+    monkeypatch.setattr(
+        "app.services.live_trading.position_query.fetch_allocated_position_size",
+        lambda **_k: 0.02,
+    )
+    amount, meta = resolve_reduce_only_quantity(
+        strategy_id=1,
+        symbol="BTC/USDT",
+        pos_side="long",
+        requested_amount=0.015,
+        client=MagicMock(),
+        market_type="spot",
+        exchange_config={},
+        user_id=1,
+        credential_id=2,
+    )
+    assert amount == pytest.approx(0.007)
+    assert meta["capped_by"] == "account_allocation"
 
 
 def test_spot_position_query_uses_total_inventory_including_locked():

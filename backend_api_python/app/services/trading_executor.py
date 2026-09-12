@@ -637,6 +637,7 @@ class TradingExecutor:
                             frames=frames,
                             candidates=candidates,
                             initial_capital=initial_capital,
+                            strategy_equity=current_equity,
                             leverage=leverage,
                             execution_mode=execution_mode,
                             notification_config=notification_config,
@@ -695,6 +696,7 @@ class TradingExecutor:
                             frames=frames,
                             candidates=candidates,
                             initial_capital=initial_capital,
+                            strategy_equity=current_equity,
                             leverage=leverage,
                             execution_mode=execution_mode,
                             notification_config=notification_config,
@@ -759,6 +761,7 @@ class TradingExecutor:
                                 frames=frames,
                                 candidates=candidates,
                                 initial_capital=initial_capital,
+                                strategy_equity=current_equity,
                                 leverage=leverage,
                                 execution_mode=execution_mode,
                                 notification_config=notification_config,
@@ -825,6 +828,7 @@ class TradingExecutor:
                                         frames=frames,
                                         candidates=candidates,
                                         initial_capital=initial_capital,
+                                        strategy_equity=current_equity,
                                         leverage=leverage,
                                         execution_mode=execution_mode,
                                         notification_config=notification_config,
@@ -980,6 +984,7 @@ class TradingExecutor:
         strategy_run_id: int = 0,
         current_price_override: float | None = None,
         direction_mode: str = "",
+        strategy_equity: float | None = None,
     ) -> bool:
         member = next(
             (item for item in candidates if str(item.get("key") or "") == str(intent.symbol)),
@@ -1008,10 +1013,14 @@ class TradingExecutor:
             for item in positions
         )
         market_type = str(member.get("market_type") or "spot").lower()
+        sizing_capital = max(
+            0.0,
+            float(initial_capital if strategy_equity is None else strategy_equity),
+        )
         target_amount = self._target_amount(
             intent,
             current_amount,
-            initial_capital,
+            sizing_capital,
             price,
             leverage=leverage,
             market_type=market_type,
@@ -1058,6 +1067,7 @@ class TradingExecutor:
                 current_positions=positions,
                 leverage=leverage,
                 initial_capital=initial_capital,
+                strategy_equity=sizing_capital,
                 market_type=market_type,
                 market_category=str(member.get("market") or ""),
                 execution_mode=execution_mode,
@@ -1141,8 +1151,12 @@ class TradingExecutor:
         quantity = float(values.get("script_base_qty") or 0)
         reference_price = float(values.get("current_price") or 0)
         initial_capital = float(values.get("initial_capital") or 0)
+        strategy_equity = max(
+            0.0,
+            float(values.get("strategy_equity") if values.get("strategy_equity") is not None else initial_capital),
+        )
         leverage = float(values.get("leverage") or 1)
-        nominal_capacity = initial_capital * max(1.0, leverage)
+        nominal_capacity = strategy_equity * max(1.0, leverage)
         entry_pct = ((quantity * reference_price) / nominal_capacity * 100.0) if nominal_capacity > 0 else 0.0
         from app.services.pending_orders.order_budget import strategy_order_budget_snapshot
 
@@ -1150,7 +1164,7 @@ class TradingExecutor:
             action=str(values.get("signal_type") or ""),
             quantity=quantity,
             price=reference_price,
-            initial_capital=initial_capital,
+            initial_capital=strategy_equity,
             leverage=leverage,
             market_type=str(values.get("market_type") or "spot"),
             current_positions=values.get("current_positions") or (),
@@ -1197,6 +1211,11 @@ class TradingExecutor:
                 "entry_pct": entry_pct,
                 "leverage": leverage,
                 "source": "strategy_v2",
+                **(
+                    {"current_equity": strategy_equity}
+                    if values.get("strategy_equity") is not None
+                    else {}
+                ),
             },
         )
         inflight_check = getattr(self.order_gateway, "has_inflight", None)
@@ -1822,10 +1841,21 @@ class TradingExecutor:
                 cur = db.cursor()
                 cur.execute(
                     """
-                    SELECT COALESCE(SUM(COALESCE(profit, 0) - COALESCE(commission_quote, 0)), 0) AS realized_pnl
-                    FROM qd_strategy_trades WHERE strategy_id = %s
+                    SELECT
+                      COALESCE((
+                        SELECT SUM(COALESCE(profit, 0) - COALESCE(commission_quote, commission, 0))
+                        FROM qd_strategy_trades WHERE strategy_id = %s
+                      ), 0)
+                      + COALESCE((
+                        SELECT SUM(COALESCE(amount, 0))
+                        FROM qd_strategy_funding_fees WHERE strategy_id = %s
+                      ), 0)
+                      + COALESCE((
+                        SELECT SUM(COALESCE(amount, 0))
+                        FROM qd_strategy_broker_activities WHERE strategy_id = %s
+                      ), 0) AS realized_pnl
                     """,
-                    (strategy_id,),
+                    (strategy_id, strategy_id, strategy_id),
                 )
                 realized = float((cur.fetchone() or {}).get("realized_pnl") or 0)
                 cur.close()

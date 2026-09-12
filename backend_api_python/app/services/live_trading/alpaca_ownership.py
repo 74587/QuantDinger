@@ -8,7 +8,7 @@ from app.utils.logger import get_logger
 from app.services.live_trading.leg_context import credential_id_from_exchange_config
 from app.services.live_trading.account_positions import list_strategy_allocations_for_account
 from app.services.live_trading.position_ownership import (
-    canonical_symbol, evaluate_and_record_ownership, protected_quantity,
+    canonical_symbol, evaluate_and_record_ownership,
 )
 
 logger = get_logger(__name__)
@@ -116,10 +116,7 @@ def guarded_alpaca_quantity(*, client, strategy_id, user_id, credential_id, symb
         return amount
     if not signal.startswith(("close_", "reduce_")):
         raise ValueError("positionOwnership.invalidRepairRequest")
-    reserved = protected_quantity(
-        user_id=user_id, credential_id=credential_id, market_type="spot", symbol=symbol, side=side,
-    )
-    available = max(0.0, account[side] - reserved - max(0.0, total - own))
+    available = max(0.0, account[side] - max(0.0, total - own))
     quantity = min(amount, own, available)
     if quantity <= 1e-8:
         raise ValueError("positionOwnership.noStrategyInventory")

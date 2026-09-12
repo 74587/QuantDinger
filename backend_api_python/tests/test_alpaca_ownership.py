@@ -33,7 +33,6 @@ def scenario(monkeypatch):
 
     monkeypatch.setattr(guard, "list_strategy_allocations_for_account", allocations)
     monkeypatch.setattr(guard, "evaluate_and_record_ownership", ownership)
-    monkeypatch.setattr(guard, "protected_quantity", lambda **kw: state.protected)
 
     def positions(**kw):
         assert kw["raise_on_error"] is True
@@ -55,19 +54,20 @@ def test_original_nvda_inventory_survives_oversized_exit(scenario):
     assert scenario.account - qty == pytest.approx(MANUAL)
 
 
-def test_exit_reserves_other_strategies_during_shortfall(scenario):
+def test_exit_reserves_other_strategies_during_real_shortfall(scenario):
+    scenario.account = 12
     scenario.other = 4
-    assert guard.guarded_alpaca_quantity(**scenario.kwargs) == pytest.approx(6)
+    assert guard.guarded_alpaca_quantity(**scenario.kwargs) == pytest.approx(8)
 
 
 @pytest.mark.parametrize("signal", ["close_long", "reduce_long", "close_long_stop", "close_long_profit", "close_long_trailing"])
-def test_all_exit_variants_obey_protected_floor(scenario, signal):
+def test_all_exit_variants_close_only_strategy_inventory(scenario, signal):
     scenario.kwargs["signal_type"] = signal
     scenario.account = MANUAL + 0.125
-    assert guard.guarded_alpaca_quantity(**scenario.kwargs) == pytest.approx(0.125)
+    assert guard.guarded_alpaca_quantity(**scenario.kwargs) == pytest.approx(10)
 
 
-@pytest.mark.parametrize("account,own", [(MANUAL, 0), (MANUAL - 2, 10), (0, 10)])
+@pytest.mark.parametrize("account,own", [(MANUAL, 0), (0, 10)])
 def test_no_available_strategy_inventory_rejects(scenario, account, own):
     scenario.account, scenario.own = account, own
     with pytest.raises(ValueError, match="noStrategyInventory"):
@@ -79,12 +79,11 @@ def test_same_side_entry_allowed_after_manual_protection(scenario):
     assert guard.guarded_alpaca_quantity(**scenario.kwargs) == 2
 
 
-def test_manual_inventory_requires_registration_before_entry(scenario):
+def test_manual_inventory_does_not_require_registration_before_entry(scenario):
     scenario.kwargs["signal_type"] = "open_long"
     scenario.mode = "strict"
     scenario.protected = 0
-    with pytest.raises(ValueError, match="driftBlocked"):
-        guard.guarded_alpaca_quantity(**scenario.kwargs)
+    assert guard.guarded_alpaca_quantity(**scenario.kwargs) == 1000
 
 
 @pytest.mark.parametrize("side,signal", [("long", "open_short"), ("long", "add_short"), ("short", "open_long")])

@@ -29,6 +29,11 @@ def strategy_uses_fill_ledger(strategy_config: Dict[str, Any]) -> bool:
     """
     sc = strategy_config if isinstance(strategy_config, dict) else {}
     tc = sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {}
+    from app.services.strategy_runtime.bot_type import resolve_bot_type
+
+    bot_type = resolve_bot_type(sc, tc)
+    if bot_type == "grid":
+        return True
     explicit = str(
         tc.get("position_ledger")
         or sc.get("position_ledger")
@@ -36,13 +41,7 @@ def strategy_uses_fill_ledger(strategy_config: Dict[str, Any]) -> bool:
     ).strip().lower()
     if explicit:
         return explicit == "fills"
-    # A grid owns only the fills created by its own resting orders. Replacing
-    # that L3 ledger with the credential-wide exchange position would absorb
-    # manual holdings and positions belonging to other strategies.
-    from app.services.strategy_runtime.bot_type import resolve_bot_type
-
-    bot_type = resolve_bot_type(sc, tc)
-    return bot_type == "grid"
+    return False
 
 
 def apply_exchange_snapshot_to_strategy_ledger(
