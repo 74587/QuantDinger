@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
 from app.services.live_trading.symbols import to_gate_currency_pair
+from app.services.live_trading.gate_spot_fill import parse_gate_spot_fill
 from app.utils.numeric_precision import floor_decimal_to_step
 
 logger = logging.getLogger(__name__)
@@ -304,16 +305,7 @@ class GateSpotClient(_GateBase):
             avg_price = 0.0
             fee = 0.0
             fee_ccy = ""
-            try:
-                filled = float(last.get("filled_amount") or 0.0)
-            except Exception:
-                filled = 0.0
-            try:
-                filled_total = float(last.get("filled_total") or 0.0)
-                if filled > 0 and filled_total > 0:
-                    avg_price = filled_total / filled
-            except Exception:
-                avg_price = 0.0
+            filled, avg_price = parse_gate_spot_fill(last)
             # Extract fee from Gate API
             try:
                 fee = abs(float(last.get("fee") or 0.0))

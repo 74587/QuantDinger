@@ -4,6 +4,8 @@ Binance Spot (direct REST) client.
 
 from __future__ import annotations
 
+from app.services.live_trading.binance_fees import aggregate_commissions
+
 import hashlib
 import hmac
 import logging
@@ -800,17 +802,7 @@ class BinanceSpotClient(BaseRestClient):
                 trades = self.get_my_trades(symbol=symbol, order_id=oid, limit=200) if oid else []
                 if not isinstance(trades, list):
                     trades = []
-                fees: Dict[str, float] = {}
-                for t in trades:
-                    if not isinstance(t, dict):
-                        continue
-                    try:
-                        c = float(t.get("commission") or 0.0)
-                    except (ValueError, TypeError):
-                        c = 0.0
-                    ccy = str(t.get("commissionAsset") or "").strip()
-                    key = ccy.upper() if ccy else "UNKNOWN"
-                    fees[key] = fees.get(key, 0.0) + abs(c)
+                fees = aggregate_commissions(trades, oid, filled)
                 if fees:
                     fee_ccy = next(iter(fees)) if len(fees) == 1 else "MIXED"
                     total_fee = sum(fees.values()) if len(fees) == 1 else 0.0

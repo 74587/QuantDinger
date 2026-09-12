@@ -831,6 +831,11 @@ def _parse_grid_order_fill(data: Dict[str, Any]) -> Tuple[float, float, str]:
     if not data:
         return 0.0, 0.0, "unknown"
     from app.services.grid.fill_units import order_status_from_data
+    from app.services.live_trading.gate_spot_fill import parse_gate_spot_fill
+
+    if "filled_amount" in data:
+        filled, avg = parse_gate_spot_fill(data)
+        return filled, avg, order_status_from_data(data)
 
     filled = float(
         data.get("baseVolume")

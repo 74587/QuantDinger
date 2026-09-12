@@ -7,6 +7,8 @@ API docs (reference):
 
 from __future__ import annotations
 
+from app.services.live_trading.binance_fees import aggregate_commissions
+
 import hashlib
 import hmac
 import logging
@@ -439,7 +441,7 @@ class BinanceFuturesClient(BaseRestClient):
         """
         return self._signed_request("GET", "/fapi/v2/account", params={})
 
-    def get_user_trades(self, *, symbol: str, order_id: str = "", limit: int = 100) -> Any:
+    def get_user_trades(self, *, symbol: str, order_id: str = "", limit: int = 100, end_time_ms: int = 0) -> Any:
         """
         Fetch user trades (fills).
 
@@ -459,6 +461,9 @@ class BinanceFuturesClient(BaseRestClient):
         except Exception:
             lim = 100
         lim = max(1, min(1000, lim))
+        if end_time_ms > 0:
+            params["endTime"] = int(end_time_ms)
+            params["startTime"] = max(0, int(end_time_ms) - 7 * 86400000 + 1)
         params["limit"] = lim
         data = self._signed_request("GET", "/fapi/v1/userTrades", params=params)
         return data
@@ -699,6 +704,7 @@ class BinanceFuturesClient(BaseRestClient):
                     avg_price=avg_price,
                     max_attempts=1 if float(max_wait_sec or 0.0) <= 0 else 3,
                     warn_missing=float(max_wait_sec or 0.0) > 0,
+                    order_time_ms=int(last.get("updateTime") or last.get("time") or 0),
                 )
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "fee_status": self._fee_status(fees), "status": status, "order": last}
 
@@ -712,6 +718,7 @@ class BinanceFuturesClient(BaseRestClient):
                         avg_price=avg_price,
                         max_attempts=1 if float(max_wait_sec or 0.0) <= 0 else 3,
                         warn_missing=float(max_wait_sec or 0.0) > 0,
+                        order_time_ms=int(last.get("updateTime") or last.get("time") or 0),
                     )
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "fee_status": self._fee_status(fees), "status": status, "order": last}
 
@@ -725,6 +732,7 @@ class BinanceFuturesClient(BaseRestClient):
                         avg_price=avg_price,
                         max_attempts=1 if float(max_wait_sec or 0.0) <= 0 else 3,
                         warn_missing=float(max_wait_sec or 0.0) > 0,
+                        order_time_ms=int(last.get("updateTime") or last.get("time") or 0),
                     )
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees, "fee_status": self._fee_status(fees), "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
@@ -738,26 +746,18 @@ class BinanceFuturesClient(BaseRestClient):
         avg_price: float,
         max_attempts: int = 3,
         warn_missing: bool = True,
+        order_time_ms: int = 0,
     ) -> Tuple[float, str, Dict[str, float]]:
         """Fetch authoritative per-fill commission from USD-M futures trades."""
         oid = str(order_id or "").strip()
         attempts = max(1, int(max_attempts or 1))
         for attempt in range(attempts):
             try:
-                trades = self.get_user_trades(symbol=symbol, order_id=oid, limit=200) if oid else []
+                window = {"end_time_ms": order_time_ms + 60000} if order_time_ms > 0 else {}
+                trades = self.get_user_trades(symbol=symbol, order_id=oid, limit=1000, **window) if oid else []
                 if not isinstance(trades, list):
                     trades = []
-                fees: Dict[str, float] = {}
-                for t in trades:
-                    if not isinstance(t, dict):
-                        continue
-                    try:
-                        c = float(t.get("commission") or 0.0)
-                    except (ValueError, TypeError):
-                        c = 0.0
-                    ccy = str(t.get("commissionAsset") or "").strip()
-                    key = ccy.upper() if ccy else "UNKNOWN"
-                    fees[key] = fees.get(key, 0.0) + abs(c)
+                fees = aggregate_commissions(trades, oid, filled)
                 if fees:
                     fee_ccy = next(iter(fees)) if len(fees) == 1 else "MIXED"
                     total_fee = sum(fees.values()) if len(fees) == 1 else 0.0

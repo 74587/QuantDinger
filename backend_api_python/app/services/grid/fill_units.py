@@ -27,6 +27,7 @@ from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient, to_gate_currency_pair
+from app.services.live_trading.gate_spot_fill import parse_gate_spot_fill
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id
@@ -173,7 +174,7 @@ def extract_grid_fill_base_qty(
         return abs(contracts) * _gate_quanto_multiplier(client, symbol)
 
     if isinstance(client, GateSpotClient):
-        return _float(data.get("filled_amount") or data.get("filledAmount"))
+        return parse_gate_spot_fill(data)[0]
 
     if isinstance(client, HtxClient):
         if mt == "spot":
@@ -187,11 +188,8 @@ def extract_grid_fill_base_qty(
             return 0.0
         return abs(contracts) * _htx_contract_size(client, symbol)
 
-    if client is None and data.get("filled_total") and data.get("filled_amount"):
-        filled_amt = _float(data.get("filled_amount"))
-        filled_total = _float(data.get("filled_total"))
-        if filled_amt > 0 and filled_total > 0:
-            return filled_total / filled_amt
+    if client is None and "filled_amount" in data:
+        return parse_gate_spot_fill(data)[0]
 
     # Generic fallback: legacy path, may be wrong for contract-denominated exchanges.
     return _float(
@@ -227,13 +225,7 @@ def extract_grid_fill_avg_price(
         return _float(data.get("avgPx") or data.get("fillPx"))
 
     if isinstance(client, GateSpotClient):
-        avg = _float(data.get("fill_price") or data.get("fillPrice") or data.get("price"))
-        if avg <= 0:
-            filled_amt = _float(data.get("filled_amount") or data.get("filledAmount"))
-            filled_total = _float(data.get("filled_total") or data.get("filledTotal"))
-            if filled_amt > 0 and filled_total > 0:
-                return filled_total / filled_amt
-        return avg
+        return parse_gate_spot_fill(data)[1]
 
     if isinstance(client, (GateUsdtFuturesClient,)):
         return _float(data.get("fill_price") or data.get("fillPrice") or data.get("price"))
@@ -247,6 +239,9 @@ def extract_grid_fill_avg_price(
         if turnover > 0 and vol > 0:
             return turnover / vol
         return _float(data.get("price"))
+
+    if client is None and "filled_amount" in data:
+        return parse_gate_spot_fill(data)[1]
 
     avg = _float(
         data.get("avgPx")

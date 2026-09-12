@@ -142,7 +142,7 @@ def get_trades():
                 """
                 SELECT id, strategy_id, symbol, type, price, amount, value,
                        commission, commission_ccy, commission_quote, profit, close_reason,
-                       matched_entry_price, grid_matched_profit, created_at
+                       matched_entry_price, grid_matched_profit, fee_status, fee_source, created_at
                 FROM qd_strategy_trades
                 WHERE strategy_id = ?
                 ORDER BY id DESC

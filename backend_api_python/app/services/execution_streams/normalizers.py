@@ -8,6 +8,7 @@ expense, negative means a rebate/credit.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from app.services.live_trading.binance_fees import aggregate_commissions
 from typing import Any, Dict, Iterable, List
 
 from app.services.execution_streams.events import (
@@ -46,6 +47,10 @@ def parse_binance(
     if qty <= 0 and not trade_id:
         return []
     status = normalize_status(data.get("X"))
+    fees = aggregate_commissions([
+        {"commission": data.get("n"), "commissionAsset": data.get("N")},
+    ], trade_id, qty)
+    fee_status = "pending" if not fees else ("actual" if any(fees.values()) else "actual_zero")
     return [
         ExecutionEvent(
             exchange_id="binance",
@@ -62,7 +67,7 @@ def parse_binance(
             cumulative_quantity=as_float(data.get("z")),
             realized_pnl=as_float(data.get("rp")) if data.get("rp") is not None else None,
             maker=bool(data.get("m")) if data.get("m") is not None else None,
-            fee_status="actual" if data.get("N") else "actual_zero",
+            fee_status=fee_status,
             occurred_at=as_millis_datetime(data.get("T") or payload.get("E")),
             fees=_fee(data.get("N"), data.get("n")),
             raw=payload,

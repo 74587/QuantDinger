@@ -142,7 +142,8 @@ def backfill_zero_commission_trades(
                 UPDATE qd_strategy_trades
                 SET commission = CASE WHEN COALESCE(commission, 0) = 0 THEN %s ELSE commission END,
                     commission_ccy = CASE WHEN COALESCE(commission, 0) = 0 THEN %s ELSE commission_ccy END,
-                    commission_quote = CASE WHEN COALESCE(commission_quote, 0) = 0 THEN %s ELSE commission_quote END
+                    commission_quote = CASE WHEN COALESCE(commission_quote, 0) = 0 THEN %s ELSE commission_quote END,
+                    fee_status = 'actual', fee_source = 'rest'
                 WHERE id = %s
                   AND (COALESCE(commission, 0) = 0 OR COALESCE(commission_quote, 0) = 0)
                 """,
