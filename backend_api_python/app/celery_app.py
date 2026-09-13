@@ -46,6 +46,7 @@ celery_app.conf.update(
         "app.tasks.agent_jobs",
         "app.tasks.fast_analysis",
         "app.tasks.maintenance",
+        "app.tasks.fundamental_sync",
     ),
     task_routes={
         "quantdinger.tasks.fast_analysis": {"queue": "ai"},
@@ -54,10 +55,15 @@ celery_app.conf.update(
         "quantdinger.tasks.reflection": {"queue": "maintenance"},
         "quantdinger.tasks.ai_calibration": {"queue": "maintenance"},
         "quantdinger.tasks.market_catalog_sync": {"queue": "maintenance"},
+        "quantdinger.tasks.fundamental_sync_tick": {"queue": "maintenance"},
         "quantdinger.tasks.worker_heartbeat": {"queue": "maintenance"},
         "quantdinger.tasks.cleanup_runtime_metadata": {"queue": "maintenance"},
     },
     beat_schedule={
+        "fundamental-sync": {
+            "task": "quantdinger.tasks.fundamental_sync_tick",
+            "schedule": 60.0,
+        },
         "expire-billed-agent-jobs": {
             "task": "quantdinger.tasks.expire_agent_jobs",
             "schedule": 60.0,

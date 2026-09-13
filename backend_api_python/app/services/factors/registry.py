@@ -213,9 +213,9 @@ _FACTORS = {
         _technical("amihud_illiquidity", "liquidity", ("close", "volume"), {"period": 20}, "lower_is_bullish", lambda f, p: _amihud_illiquidity(f, p)),
         _fundamental("market_cap", "size", ("market_cap",), "lower_is_bullish", lambda f, p: _last_value(f, "market_cap")),
         _fundamental("earnings_yield", "valuation", ("net_income", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "net_income", "market_cap")),
-        _fundamental("book_to_price", "valuation", ("book_value", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "book_value", "market_cap")),
+        _fundamental("book_to_price", "valuation", ("shareholder_equity", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "shareholder_equity", "market_cap")),
         _fundamental("return_on_equity", "quality", ("net_income", "shareholder_equity"), "higher_is_bullish", lambda f, p: _ratio_last(f, "net_income", "shareholder_equity")),
-        _fundamental("revenue_growth", "growth", ("revenue",), "higher_is_bullish", lambda f, p: _growth_last(f, "revenue")),
+        _fundamental("revenue_growth", "growth", ("revenue_growth",), "higher_is_bullish", lambda f, p: _last_value(f, "revenue_growth")),
         _fundamental("debt_to_equity", "quality", ("total_debt", "shareholder_equity"), "lower_is_bullish", lambda f, p: _ratio_last(f, "total_debt", "shareholder_equity")),
         _fundamental("free_cash_flow_yield", "cashflow", ("free_cash_flow", "market_cap"), "higher_is_bullish", lambda f, p: _ratio_last(f, "free_cash_flow", "market_cap")),
     )
@@ -354,8 +354,8 @@ def _growth_last(frame: pd.DataFrame, field: str) -> float:
 
 
 def _last_value(frame: pd.DataFrame, field: str) -> float:
-    values = _numeric(frame[field])
-    if values.empty:
+    values = pd.to_numeric(frame[field], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if values.empty or pd.isna(values.iloc[-1]):
         raise FactorError("factor.insufficientHistory")
     return float(values.iloc[-1])
 

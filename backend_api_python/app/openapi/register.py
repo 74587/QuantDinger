@@ -64,6 +64,7 @@ def register_human_blueprints(api: Api) -> None:
     from app.routes.market import market_blp
     from app.routes.universe import universe_blp
     from app.routes.factors import factors_blp
+    import app.routes.fundamental_sync  # noqa: F401
     from app.routes.market_modules import market_modules_blp
     from app.routes.ai_chat import ai_chat_blp
     from app.routes.indicator import indicator_blp

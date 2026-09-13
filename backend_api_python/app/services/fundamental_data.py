@@ -279,6 +279,13 @@ class FundamentalDataService:
             quarterly_income = [_statement_value(income, item, "Net Income", "Net Income Common Stockholders") for item in quarters]
             contiguous = len(quarters) == 4 and all(60 <= (right - left).days <= 120 for left, right in zip(quarters, quarters[1:]))
             net_income_ttm = sum(quarterly_income) if contiguous and all(value is not None for value in quarterly_income) else None
+            year_ago = periods[index - 4] if index >= 4 else None
+            previous_revenue = _statement_value(income, year_ago, "Total Revenue", "Revenue") if year_ago is not None else None
+            revenue_growth = (
+                revenue / previous_revenue - 1.0
+                if revenue is not None and previous_revenue not in (None, 0)
+                and 330 <= (period - year_ago).days <= 400 else None
+            )
             equity = _statement_value(balance, period, "Stockholders Equity", "Total Equity Gross Minority Interest")
             debt = _statement_value(balance, period, "Total Debt")
             shares = _statement_value(
@@ -308,6 +315,7 @@ class FundamentalDataService:
                 "revenue": revenue,
                 "net_income": net_income,
                 "net_income_ttm": net_income_ttm,
+                "revenue_growth": revenue_growth,
                 "book_value": equity / shares if equity is not None and shares not in (None, 0.0) else None,
                 "shareholder_equity": equity,
                 "total_debt": debt,
@@ -315,7 +323,6 @@ class FundamentalDataService:
                 "shares_outstanding": shares,
                 "market_cap": market_cap,
                 "return_on_equity": roe,
-                "revenue_growth": revenue_growth,
                 "debt_to_equity": debt / equity if debt is not None and equity not in (None, 0.0) else None,
                 "source": "yfinance_quarterly",
                 "source_version": date.today().isoformat(),
