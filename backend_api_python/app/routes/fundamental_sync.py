@@ -18,9 +18,10 @@ def invoke(fn):
 @login_required
 @admin_required
 def universe_fundamentals(universe_id):
+    raw_fields = request.args.get('fields')
     return invoke(lambda: dict(**status_for(g.user_id, universe_id), coverage=coverage_for(
         g.user_id, universe_id,
-        request.args.get('fields', 'market_cap,net_income').split(','), request.args.get('as_of'))))
+        raw_fields.split(',') if raw_fields else None, request.args.get('as_of'), request.args.get('mode'))))
 
 
 @factors_blp.route('/fundamentals/universe/<int:universe_id>/sync', methods=['POST'])

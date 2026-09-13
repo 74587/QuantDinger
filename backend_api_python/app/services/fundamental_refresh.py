@@ -13,6 +13,11 @@ def refresh_due(coverage, attempt, fields, mode, now):
     if same_fields and attempt['status'] == 'failed' and age(attempt['updated_at']) < timedelta(days=1):
         return False
     if not coverage['ready']:
+        if same_fields and attempt['status'] == 'success':
+            period_end = coverage.get('period_end')
+            old_period = bool(period_end and (now.date() - period_end).days >= 100)
+            interval = timedelta(days=1 if mode == 'current' or old_period else 7)
+            return age(attempt['updated_at']) >= interval
         return True
     interval = timedelta(days=1 if mode == 'current' or (now.date() - coverage['period_end']).days >= 100 else 7)
     checked_age = age(coverage['ingested_at'])

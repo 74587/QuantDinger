@@ -32,3 +32,10 @@ def test_successful_check_without_new_report_delays_next_poll():
                     ingested_at=NOW-timedelta(days=30))
     attempt = dict(status='success', fields_json=['net_income'], updated_at=NOW)
     assert not refresh_due(coverage, attempt, ['net_income'], 'history', NOW)
+
+
+def test_successful_partial_collection_is_not_retried_immediately():
+    coverage = dict(ready=False, period_end=NOW.date()-timedelta(days=60))
+    attempt = dict(status='success', fields_json=['net_income'], updated_at=NOW)
+    assert not refresh_due(coverage, attempt, ['net_income'], 'history', NOW)
+    assert refresh_due(coverage, attempt, ['net_income'], 'history', NOW+timedelta(days=7))

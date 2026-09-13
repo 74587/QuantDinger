@@ -43,7 +43,8 @@ def test_batch_job_persists_then_supplies_live_panel(pool, monkeypatch):
         calls.append(kw['symbol'])
         write_snapshot(**kw)
     monkeypatch.setattr(sync, 'get_fundamental_data_service', lambda: SimpleNamespace(sync_history=provider))
-    initial = coverage_for(uid, universe)
+    accepted = ['market_cap', 'net_income']
+    initial = coverage_for(uid, universe, accepted)
     assert initial['ready'] == 0
     job = sync.start_job(uid, universe)
     assert not sync.start_job(uid, universe)['started']
@@ -54,7 +55,7 @@ def test_batch_job_persists_then_supplies_live_panel(pool, monkeypatch):
     assert result['job']['id'] == job['job_id']
     assert result['job']['status'] == 'complete'
     assert sorted(calls) == sorted(symbols)
-    assert coverage_for(uid, universe)['ready'] == 2
+    assert coverage_for(uid, universe, accepted)['ready'] == 2
     service = FundamentalDataService()
     members = [dict(key='USStock:' + symbol, market='USStock', symbol=symbol) for symbol in symbols]
     frames = {item['key']: pd.DataFrame({'close': [105]}, index=[pd.Timestamp(date.today())]) for item in members}
@@ -82,7 +83,7 @@ def test_failure_retry_and_new_job_only_contains_failed_symbols(pool, monkeypatc
     assert len(sync.status_for(uid, universe)['job']['items']) == 1
     assert sync.run_one()
     assert sync.status_for(uid, universe)['job']['id'] == retry['job_id']
-    assert coverage_for(uid, universe)['ready'] == 2
+    assert coverage_for(uid, universe, ['market_cap', 'net_income'])['ready'] == 2
 
 
 def test_expired_claim_recovers_and_concurrent_ticks_do_not_duplicate(pool, monkeypatch):
@@ -104,10 +105,23 @@ def test_current_snapshot_does_not_backfill_and_missing_is_not_profit_zero(pool)
     uid, universe, symbols = pool
     write_snapshot('USStock', symbols[0], available=date.today(), net_income=0)
     write_snapshot('USStock', symbols[1], available=date.today(), net_income=None)
-    assert coverage_for(uid, universe, as_of=date.today()-timedelta(days=1))['ready'] == 0
-    result = coverage_for(uid, universe)
+    accepted = ['market_cap', 'net_income']
+    assert coverage_for(uid, universe, accepted, as_of=date.today()-timedelta(days=1))['ready'] == 0
+    result = coverage_for(uid, universe, accepted)
     assert result['ready'] == 1
     assert next(row for row in result['items'] if row['symbol'] == symbols[1])['missing'] == ['net_income']
+
+
+def test_successful_provider_collection_is_not_failed_by_optional_field_coverage(pool, monkeypatch):
+    uid, universe, symbols = pool
+    monkeypatch.setattr(sync, 'get_fundamental_data_service', lambda: SimpleNamespace(
+        sync_history=lambda **kw: write_snapshot(**kw, source='yfinance_quarterly')))
+    job = sync.start_job(uid, universe)
+    assert sync.run_one() and sync.run_one()
+    status = sync.status_for(uid, universe)['job']
+    assert status['status'] == 'complete'
+    assert all(item['status'] == 'success' and item['attempts'] == 1 for item in status['items'])
+    assert coverage_for(uid, universe)['ready'] == 0
 
 
 def test_schedule_persists_and_permission_does_not_cross_private_universes(pool):

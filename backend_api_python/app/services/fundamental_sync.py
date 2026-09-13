@@ -1,15 +1,13 @@
 """Persistent universe fundamental jobs; external IO never holds a DB connection."""
 import json
 import uuid
-from datetime import date
-
 from app.services.fundamental_data import FUNDAMENTAL_FIELDS, get_fundamental_data_service
 from app.services.universe import get_universe_service
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-DEFAULT_FIELDS = ['market_cap', 'net_income']
+DEFAULT_FIELDS = list(FUNDAMENTAL_FIELDS)
 
 
 def query(sql, params=(), many=False):
@@ -123,21 +121,19 @@ def run_one():
         return False
     job = query("UPDATE qd_fundamental_sync_jobs SET status='running',updated_at=NOW() WHERE id=%s RETURNING *", (row['job_id'],))
     error = ''
+    error_detail = ''
     try:
         service = get_fundamental_data_service()
         method = service.sync_history if job['mode'] == 'history' else service.sync_current
         method(market=row['market'], symbol=row['symbol'])
-        from app.services.fundamental_coverage import member_coverage
-        result = member_coverage([row], job['fields_json'], date.today())[0]
-        if result['missing'] or result['stale']:
-            error = 'fundamentalSync.incomplete'
-    except Exception:
+    except Exception as exc:
         logger.exception('Fundamental sync failed job=%s market=%s symbol=%s', row['job_id'], row['market'], row['symbol'])
         error = 'fundamentalSync.providerFailed'
+        error_detail = f'{type(exc).__name__}: {exc}'[:500]
     status = ('failed' if row['attempts'] >= 3 else 'pending') if error else 'success'
-    query('''UPDATE qd_fundamental_sync_items SET status=%s,error=%s,token=NULL,lease_until=NULL,
+    query('''UPDATE qd_fundamental_sync_items SET status=%s,error=%s,error_detail=%s,token=NULL,lease_until=NULL,
         retry_at=NOW()+INTERVAL '60 seconds',updated_at=NOW() WHERE id=%s AND token=%s''',
-        (status, error, row['id'], token))
+        (status, error, error_detail, row['id'], token))
     finish_jobs()
     return True
 
@@ -155,6 +151,6 @@ def status_for(user_id, universe_id):
     members_for(user_id, universe_id)
     job = query('SELECT * FROM qd_fundamental_sync_jobs WHERE universe_id=%s ORDER BY id DESC LIMIT 1', (universe_id,))
     if job:
-        job['items'] = query('SELECT market,symbol,status,attempts,error,updated_at FROM qd_fundamental_sync_items WHERE job_id=%s ORDER BY id', (job['id'],), True)
+        job['items'] = query('SELECT market,symbol,status,attempts,error,error_detail,updated_at FROM qd_fundamental_sync_items WHERE job_id=%s ORDER BY id', (job['id'],), True)
     schedule = query('SELECT enabled,mode,fields_json,next_at FROM qd_fundamental_sync_schedules WHERE universe_id=%s', (universe_id,))
     return dict(job=job, schedule=schedule)

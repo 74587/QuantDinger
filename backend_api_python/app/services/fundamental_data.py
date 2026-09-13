@@ -197,6 +197,7 @@ class FundamentalDataService:
         values = {
             "revenue": income.get("total_revenue") if income.get("total_revenue") is not None else raw.get("revenue"),
             "net_income": income.get("net_income") if income.get("net_income") is not None else raw.get("net_income"),
+            "net_income_ttm": raw.get("net_income_ttm") if raw.get("net_income_ttm") is not None else raw.get("trailing_net_income"),
             "book_value": raw.get("book_value"),
             "shareholder_equity": raw.get("shareholder_equity") or balance.get("total_equity"),
             "total_debt": raw.get("total_debt") or raw.get("debt") or balance.get("debt"),
@@ -251,6 +252,7 @@ class FundamentalDataService:
                 for frame in (income, balance, cashflow)
                 if frame is not None and not frame.empty
                 for column in frame.columns
+                if pd.Timestamp(column).date() <= date.today()
             }
         )
         if not periods:
@@ -266,8 +268,6 @@ class FundamentalDataService:
         stored_dates = []
         for index, period in enumerate(periods):
             available_at, availability_source = _availability_date(period, earnings_dates)
-            if availability_source != "reported_earnings_date":
-                continue
             revenue = _statement_value(income, period, "Total Revenue", "Revenue")
             net_income = _statement_value(
                 income,
@@ -295,17 +295,12 @@ class FundamentalDataService:
                 "Share Issued",
             ) or _statement_value(income, period, "Diluted Average Shares", "Basic Average Shares")
             free_cash_flow = _statement_value(cashflow, period, "Free Cash Flow")
-            previous_revenue = None
-            if index >= 4:
-                previous_revenue = _statement_value(income, periods[index - 4], "Total Revenue", "Revenue")
             close = _close_as_of(prices, available_at)
             market_cap = close * shares if close is not None and shares is not None else None
-            roe = (net_income * 4.0 / equity) if net_income is not None and equity not in (None, 0.0) else None
-            revenue_growth = (
-                revenue / previous_revenue - 1.0
-                if revenue is not None and previous_revenue not in (None, 0.0)
-                else None
-            )
+            annual_income = net_income_ttm if net_income_ttm is not None else net_income * 4.0 if net_income is not None else None
+            roe = annual_income / equity if annual_income is not None and equity not in (None, 0.0) else None
+            pe_ratio = market_cap / net_income_ttm if market_cap is not None and net_income_ttm not in (None, 0.0) else None
+            pb_ratio = market_cap / equity if market_cap is not None and equity not in (None, 0.0) else None
             payload = {
                 "market": normalized_market,
                 "symbol": normalized_symbol,
@@ -322,6 +317,8 @@ class FundamentalDataService:
                 "free_cash_flow": free_cash_flow,
                 "shares_outstanding": shares,
                 "market_cap": market_cap,
+                "pe_ratio": pe_ratio,
+                "pb_ratio": pb_ratio,
                 "return_on_equity": roe,
                 "debt_to_equity": debt / equity if debt is not None and equity not in (None, 0.0) else None,
                 "source": "yfinance_quarterly",
@@ -392,7 +389,10 @@ def _availability_date(period: pd.Timestamp, earnings_dates: list[date]) -> tupl
         # Date-only observations cannot safely enter a pre-open handler on the
         # earnings day: US companies commonly report after the market closes.
         return candidates[0] + timedelta(days=1), "reported_earnings_date"
-    return period_date + timedelta(days=60), "conservative_60_day_lag"
+    conservative_date = period_date + timedelta(days=91)
+    if conservative_date <= date.today():
+        return conservative_date, "conservative_91_day_lag"
+    return date.today(), "observed_at_sync"
 
 
 def _close_as_of(prices: pd.DataFrame, available_at: date) -> float | None:

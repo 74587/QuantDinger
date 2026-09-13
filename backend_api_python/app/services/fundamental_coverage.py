@@ -1,9 +1,12 @@
 """Field-level coverage at a user-selected observation date."""
+import json
 import math
 from datetime import date
 
 from app.services.fundamental_data import FUNDAMENTAL_FIELDS, get_fundamental_data_service
 from app.services.fundamental_sync import fields_for, members_for, query
+
+STALE_REPORT_AGE_DAYS = 200
 
 
 def member_coverage(members, fields, as_of, source=None):
@@ -26,16 +29,30 @@ def member_coverage(members, fields, as_of, source=None):
                 valid = valid and value > 0
             if not valid:
                 missing.append(field)
-        stale = bool(row and (as_of - row['period_end']).days > 200)
+        period_end = row.get('period_end')
+        age_days = (as_of - period_end).days if period_end else None
+        stale = age_days is not None and age_days > STALE_REPORT_AGE_DAYS
+        state = 'no_data' if not row else 'stale' if stale else 'partial' if missing else 'ready'
+        metadata = row.get('metadata_json') or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                metadata = {}
         result.append(dict(market=member['market'], symbol=member['symbol'], missing=missing, stale=stale,
-            available_at=row.get('available_at'), period_end=row.get('period_end'), source=row.get('source'),
-            ingested_at=row.get('ingested_at'), ready=not missing and not stale))
+            age_days=age_days, stale_after_days=STALE_REPORT_AGE_DAYS, state=state,
+            available_at=row.get('available_at'), period_end=period_end, source=row.get('source'),
+            availability_basis=metadata.get('availabilitySource') or 'provider_snapshot' if row else None,
+            ingested_at=row.get('ingested_at'), ready=state == 'ready'))
     return result
 
 
-def coverage_for(user_id, universe_id, fields=None, as_of=None):
+def coverage_for(user_id, universe_id, fields=None, as_of=None, mode=None):
     fields = fields_for(fields)
     members = members_for(user_id, universe_id)
-    rows = member_coverage(members, fields, as_of or date.today())
-    return dict(as_of=str(as_of or date.today()), fields=fields, available_fields=list(FUNDAMENTAL_FIELDS),
-        total=len(rows), ready=sum(item['ready'] for item in rows), items=rows)
+    source = 'yfinance_quarterly' if mode == 'history' else None
+    rows = member_coverage(members, fields, as_of or date.today(), source=source)
+    return dict(as_of=str(as_of or date.today()), fields=fields, acceptance_fields=fields,
+        collected_fields=list(FUNDAMENTAL_FIELDS), available_fields=list(FUNDAMENTAL_FIELDS),
+        stale_after_days=STALE_REPORT_AGE_DAYS, total=len(rows),
+        ready=sum(item['ready'] for item in rows), items=rows)
