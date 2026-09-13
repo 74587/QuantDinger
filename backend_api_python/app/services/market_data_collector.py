@@ -413,12 +413,77 @@ class MarketDataCollector:
             return {}
     
     
-    def _get_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get fundamentals with a short-lived per-process cache.
+    @staticmethod
+    def _merge_fundamental_payloads(
+        persisted: Optional[Dict[str, Any]],
+        provider: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Merge provider evidence over a persisted fallback without losing valid fields."""
+        if not persisted and not provider:
+            return None
+        merged = copy.deepcopy(persisted or {})
+        for key, value in (provider or {}).items():
+            if value in (None, ""):
+                continue
+            if key in {"field_metadata", "data_quality", "identity"} and isinstance(value, dict):
+                current = merged.get(key) if isinstance(merged.get(key), dict) else {}
+                merged[key] = {**current, **copy.deepcopy(value)}
+                continue
+            merged[key] = copy.deepcopy(value)
+        return merged
 
-        Fundamentals do not change by chart timeframe.  Fast analysis requests
-        several timeframes for the same symbol, so fetching the same statements
-        repeatedly only adds latency and increases provider failure risk.
+    @staticmethod
+    def _fundamental_db_ttl_seconds() -> int:
+        try:
+            return max(300, int(os.getenv("AI_FUNDAMENTAL_DB_TTL_SEC", "86400")))
+        except (TypeError, ValueError):
+            return 86_400
+
+    def _load_persisted_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Load the latest point-in-time snapshot without making provider requests."""
+        from app.services.fundamental_data import get_fundamental_data_service
+
+        return get_fundamental_data_service().latest_for_analysis(
+            market=market,
+            symbol=symbol,
+            max_age_seconds=self._fundamental_db_ttl_seconds(),
+        )
+
+    @staticmethod
+    def _persist_fundamental_payload(market: str, symbol: str, payload: Dict[str, Any]) -> None:
+        """Write provider evidence back to the shared point-in-time store."""
+        from app.services.fundamental_data import get_fundamental_data_service
+
+        get_fundamental_data_service().persist_analysis_payload(
+            market=market,
+            symbol=symbol,
+            raw=payload,
+        )
+
+    @staticmethod
+    def _mark_fundamental_storage(
+        payload: Dict[str, Any],
+        *,
+        served_from: str,
+        writeback: Optional[str] = None,
+        refresh_failed: bool = False,
+    ) -> None:
+        data_quality = payload.get("data_quality") if isinstance(payload.get("data_quality"), dict) else {}
+        storage = data_quality.get("storage") if isinstance(data_quality.get("storage"), dict) else {}
+        storage["served_from"] = served_from
+        if writeback:
+            storage["writeback"] = writeback
+        if refresh_failed:
+            storage["refresh_failed"] = True
+        data_quality["storage"] = storage
+        payload["data_quality"] = data_quality
+
+    def _get_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get fundamentals from memory, persisted snapshots, then providers.
+
+        The database is the cross-process cache used by professional analysis.
+        Provider calls are reserved for missing or stale snapshots and their
+        results are written back with the richer statement and earnings payload.
         """
         cache = getattr(self, "_fundamental_cache", None)
         if cache is None:
@@ -437,7 +502,55 @@ class MarketDataCollector:
             if cached and float(cached.get("expires_at") or 0) > now:
                 return copy.deepcopy(cached.get("value"))
 
-        result = self._fetch_fundamental_uncached(market, normalized_symbol)
+        persisted_state: Optional[Dict[str, Any]] = None
+        try:
+            persisted_state = self._load_persisted_fundamental(market, normalized_symbol)
+        except Exception as exc:
+            logger.warning(
+                "Persisted fundamental load failed for %s:%s: %s",
+                market,
+                normalized_symbol,
+                exc,
+            )
+        persisted = (
+            persisted_state.get("payload")
+            if isinstance(persisted_state, dict) and isinstance(persisted_state.get("payload"), dict)
+            else None
+        )
+        persisted_is_complete = bool(
+            persisted
+            and not persisted_state.get("refresh_required", not persisted_state.get("fresh"))
+            and persisted_state.get("has_provider_payload")
+        )
+        if persisted_is_complete:
+            result = copy.deepcopy(persisted)
+            self._mark_fundamental_storage(result, served_from="database")
+        else:
+            provider = self._fetch_fundamental_uncached(market, normalized_symbol)
+            result = self._merge_fundamental_payloads(persisted, provider)
+            if provider and result:
+                writeback = "success"
+                try:
+                    self._persist_fundamental_payload(market, normalized_symbol, result)
+                except Exception as exc:
+                    writeback = "failed"
+                    logger.warning(
+                        "Fundamental writeback failed for %s:%s: %s",
+                        market,
+                        normalized_symbol,
+                        exc,
+                    )
+                self._mark_fundamental_storage(
+                    result,
+                    served_from="provider_refresh",
+                    writeback=writeback,
+                )
+            elif result:
+                self._mark_fundamental_storage(
+                    result,
+                    served_from="database_fallback",
+                    refresh_failed=True,
+                )
         if result:
             try:
                 ttl_seconds = max(60, int(os.getenv("AI_FUNDAMENTAL_CACHE_TTL_SEC", "1800")))
@@ -464,10 +577,10 @@ class MarketDataCollector:
     def _get_cn_hk_fundamental(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
         """
         CN/HK fundamentals — multi-tier:
-          Tier 1: Twelve Data /statistics (globally stable, paid)
-          Tier 2: AkShare / Eastmoney (fragile overseas)
-          Tier 3: AkShare financial statements (revenue growth, debt, FCF)
-          + Tencent quote for live price fields
+          - Tencent quote for current price fields
+          - Twelve Data for licensed global statistics and statements when configured
+          - AkShare/Eastmoney for domestic valuation and financial statements
+          - Yahoo Finance to fill remaining canonical fields and rich analysis data
         """
         try:
             from app.data_sources.tencent import (
@@ -615,11 +728,18 @@ class MarketDataCollector:
                 except Exception as e:
                     logger.debug("TwelveData earnings failed %s:%s: %s", market, symbol, e)
 
+            self._enrich_cn_hk_fundamental_with_yfinance(result, code, is_hk=is_hk)
+
             # Fallback: build earnings from financial_statements if /earnings failed
             if "earnings" not in result and "financial_statements" in result:
                 result["earnings"] = self._build_earnings_from_statements(result["financial_statements"])
 
-            if not parts and not td and not has_valuation:
+            usable = any(
+                value not in (None, "", {}, [])
+                for key, value in result.items()
+                if key != "source"
+            )
+            if not usable:
                 return None
             return result
         except Exception as e:
@@ -664,6 +784,189 @@ class MarketDataCollector:
                 earnings["financial_summary"] = "; ".join(summary_parts)
 
         return earnings if earnings else {}
+
+    def _enrich_cn_hk_fundamental_with_yfinance(
+        self,
+        result: Dict[str, Any],
+        code: str,
+        *,
+        is_hk: bool,
+    ) -> None:
+        """Fill missing CN/HK metrics and rich statements through Yahoo Finance."""
+        from app.data_sources.asia_stock_kline import yf_symbol_from_tencent
+
+        yahoo_symbol = yf_symbol_from_tencent(code, is_hk)
+        provider_source = "yfinance_hk" if is_hk else "yfinance_cn"
+        market_label = "HK" if is_hk else "CN"
+        try:
+            ticker = yf.Ticker(yahoo_symbol)
+            info = ticker.info or {}
+        except Exception as exc:
+            logger.debug("%s yfinance info failed %s: %s", market_label, yahoo_symbol, exc)
+            return
+
+        reported_symbol = str(info.get("symbol") or "").strip().upper()
+        if reported_symbol and reported_symbol != yahoo_symbol.upper():
+            logger.warning(
+                "Rejected mismatched %s yfinance fundamentals requested=%s reported=%s",
+                market_label,
+                yahoo_symbol,
+                reported_symbol,
+            )
+            return
+
+        field_metadata = result.get("field_metadata")
+        if not isinstance(field_metadata, dict):
+            field_metadata = {}
+            result["field_metadata"] = field_metadata
+        filled = False
+
+        def fill(key: str, value: Any, *, unit: str, period_type: str, transform=None) -> None:
+            nonlocal filled
+            if result.get(key) is not None or value in (None, ""):
+                return
+            try:
+                clean = transform(value) if transform else float(value)
+            except (TypeError, ValueError, OverflowError):
+                return
+            if pd.isna(clean):
+                return
+            result[key] = clean
+            field_metadata[key] = {
+                "source": provider_source,
+                "unit": unit,
+                "period_type": period_type,
+            }
+            filled = True
+
+        for key, info_key, unit, period_type, transform in (
+            ("market_cap", "marketCap", "currency", "current", None),
+            ("pe_ratio", "trailingPE", "multiple", "ttm", None),
+            ("pb_ratio", "priceToBook", "multiple", "current", None),
+            ("roe", "returnOnEquity", "percent", "ttm", lambda value: float(value) * 100.0),
+            ("revenue_growth", "revenueGrowth", "percent", "ttm_yoy", lambda value: float(value) * 100.0),
+            ("debt_to_equity", "debtToEquity", "multiple", "latest_quarter", lambda value: float(value) / 100.0),
+            ("revenue", "totalRevenue", "currency", "ttm", None),
+            ("net_income", "netIncomeToCommon", "currency", "ttm", None),
+            ("net_income_ttm", "netIncomeToCommon", "currency", "ttm", None),
+            ("book_value", "bookValue", "currency_per_share", "latest_quarter", None),
+            ("total_debt", "totalDebt", "currency", "latest_quarter", None),
+            ("free_cash_flow", "freeCashflow", "currency", "ttm", None),
+            ("shares_outstanding", "sharesOutstanding", "shares", "current", None),
+            ("dividend_yield", "dividendYield", "percent", "annualized", lambda value: float(value) * 100.0),
+            ("eps", "trailingEps", "currency_per_share", "ttm", None),
+        ):
+            fill(key, info.get(info_key), unit=unit, period_type=period_type, transform=transform)
+
+        fast_info: Any = {}
+        try:
+            fast_info = ticker.fast_info or {}
+        except Exception as exc:
+            logger.debug("%s yfinance fast info failed %s: %s", market_label, yahoo_symbol, exc)
+        fill(
+            "shares_outstanding",
+            fast_info.get("shares"),
+            unit="shares",
+            period_type="current",
+        )
+        if result.get("market_cap") is None:
+            shares = result.get("shares_outstanding")
+            price = (
+                info.get("currentPrice")
+                or info.get("regularMarketPrice")
+                or result.get("last")
+                or fast_info.get("last_price")
+            )
+            if shares is not None and price is not None:
+                fill(
+                    "market_cap",
+                    float(shares) * float(price),
+                    unit="currency",
+                    period_type="current_derived",
+                )
+
+        if result.get("shareholder_equity") is None:
+            book_value = result.get("book_value")
+            shares = result.get("shares_outstanding")
+            if book_value is not None and shares is not None:
+                fill(
+                    "shareholder_equity",
+                    float(book_value) * float(shares),
+                    unit="currency",
+                    period_type="latest_quarter",
+                )
+
+        statements = self._get_financial_statements(
+            yahoo_symbol,
+            ticker=ticker,
+            currency=info.get("financialCurrency") or info.get("currency") or ("HKD" if is_hk else "CNY"),
+        )
+        if statements:
+            yahoo_period = ((statements.get("latest_quarter") or {}).get("period_end"))
+            local_period = ((result.get("financial_statements") or {}).get("latest_quarter") or {}).get("period_end")
+            if yahoo_period or not local_period:
+                result["financial_statements"] = statements
+            latest_quarter = statements.get("latest_quarter") or {}
+            latest_income = latest_quarter.get("income_statement") or statements.get("income_statement") or {}
+            latest_balance = latest_quarter.get("balance_sheet") or statements.get("balance_sheet") or {}
+            ttm = statements.get("ttm") or {}
+            ttm_income = ttm.get("income_statement") or {}
+            cash_flow_candidates = (
+                latest_quarter.get("cash_flow") or {},
+                ttm.get("cash_flow") or {},
+                statements.get("cash_flow") or {},
+                (statements.get("latest_annual") or {}).get("cash_flow") or {},
+            )
+            cash_flow = next(
+                (candidate for candidate in cash_flow_candidates if candidate.get("free_cash_flow") is not None),
+                {},
+            )
+            derived = latest_quarter.get("derived") or {}
+            fill("revenue", latest_income.get("total_revenue"), unit="currency", period_type="latest_quarter")
+            fill("net_income", latest_income.get("net_income"), unit="currency", period_type="latest_quarter")
+            fill("net_income_ttm", ttm_income.get("net_income"), unit="currency", period_type="ttm")
+            fill("shareholder_equity", latest_balance.get("total_equity"), unit="currency", period_type="latest_quarter")
+            fill("total_debt", latest_balance.get("debt"), unit="currency", period_type="latest_quarter")
+            fill(
+                "free_cash_flow",
+                cash_flow.get("free_cash_flow"),
+                unit="currency",
+                period_type=str(cash_flow.get("period_type") or "latest_available"),
+            )
+            fill("revenue_growth", derived.get("revenue_growth"), unit="percent", period_type="latest_quarter_yoy")
+            filled = True
+        if result.get("debt_to_equity") is None:
+            debt = result.get("total_debt")
+            equity = result.get("shareholder_equity")
+            if debt is not None and equity not in (None, 0):
+                fill(
+                    "debt_to_equity",
+                    float(debt) / float(equity),
+                    unit="multiple",
+                    period_type="latest_quarter",
+                )
+        earnings = self._get_earnings_data(yahoo_symbol, ticker=ticker)
+        if earnings:
+            result["earnings"] = earnings
+            filled = True
+
+        result["identity"] = {
+            "requested_symbol": yahoo_symbol,
+            "reported_symbol": reported_symbol or None,
+            "company_name": info.get("longName") or info.get("shortName"),
+            "industry": info.get("industry"),
+            "sector": info.get("sector"),
+            "country": info.get("country"),
+            "exchange": info.get("exchange") or info.get("fullExchangeName"),
+            "quote_type": info.get("quoteType"),
+            "verified": bool(reported_symbol and reported_symbol == yahoo_symbol.upper()),
+        }
+        if filled and provider_source not in str(result.get("source") or ""):
+            result["source"] = "+".join(filter(None, (str(result.get("source") or ""), provider_source)))
+
+    def _enrich_hk_fundamental_with_yfinance(self, result: Dict[str, Any], code: str) -> None:
+        """Backward-compatible wrapper for HK-specific callers and tests."""
+        self._enrich_cn_hk_fundamental_with_yfinance(result, code, is_hk=True)
 
     def _get_us_fundamental(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Collect US equity fundamentals with explicit units and reporting periods.

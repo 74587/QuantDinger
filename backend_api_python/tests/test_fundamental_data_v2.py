@@ -9,7 +9,7 @@ from app.services.fundamental_data import FUNDAMENTAL_FIELDS, FundamentalDataSer
 
 def _install_collector(monkeypatch, payload):
     class FakeMarketDataCollector:
-        def _get_fundamental(self, *_args):
+        def _fetch_fundamental_uncached(self, *_args):
             return payload
 
     module = types.ModuleType("app.services.market_data_collector")
@@ -47,6 +47,7 @@ def test_sync_current_persists_real_provider_values(monkeypatch):
     assert result["revenue"] == 1000.0
     assert result["net_income"] == 250.0
     assert result["shareholder_equity"] == 400.0
+    assert result["metadata"]["analysisPayload"]["financial_statements"] == provider_payload["financial_statements"]
     assert persisted == result
 
 

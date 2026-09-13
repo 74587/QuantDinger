@@ -11,6 +11,7 @@ import pytest
 from app.services import fundamental_sync as sync
 from app.services.fundamental_coverage import coverage_for
 from app.services.fundamental_data import FundamentalDataService
+from app.services.market_data_collector import MarketDataCollector
 from app.services.universe import get_universe_service
 
 pytestmark = [pytest.mark.integration, pytest.mark.skipif(
@@ -112,6 +113,27 @@ def test_current_snapshot_does_not_backfill_and_missing_is_not_profit_zero(pool)
     assert next(row for row in result['items'] if row['symbol'] == symbols[1])['missing'] == ['net_income']
 
 
+def test_same_day_provider_correction_replaces_older_coverage_row(pool):
+    _, universe, symbols = pool
+    symbol = symbols[0]
+    today = date.today()
+    FundamentalDataService.upsert(dict(
+        market='USStock', symbol=symbol, period_end=today, available_at=today,
+        source='old-incomplete', market_cap=1000, net_income=None,
+    ))
+    FundamentalDataService.upsert(dict(
+        market='USStock', symbol=symbol, period_end=today-timedelta(days=60), available_at=today,
+        source='corrected-provider', market_cap=1000, net_income=25,
+    ))
+
+    result = coverage_for(pool[0], universe, ['market_cap', 'net_income'])
+    corrected = next(row for row in result['items'] if row['symbol'] == symbol)
+
+    assert corrected['ready'] is True
+    assert corrected['source'] == 'corrected-provider'
+    assert corrected['period_end'] == today-timedelta(days=60)
+
+
 def test_successful_provider_collection_is_not_failed_by_optional_field_coverage(pool, monkeypatch):
     uid, universe, symbols = pool
     monkeypatch.setattr(sync, 'get_fundamental_data_service', lambda: SimpleNamespace(
@@ -206,3 +228,67 @@ def test_automatic_failures_cool_down_and_explicit_retry_bypasses_wait(pool, mon
     assert sync.status_for(uid, universe)['job']['skipped_count'] == 2
     sync.start_job(uid, universe, retry_job=job['job_id'])
     assert [i['symbol'] for i in sync.status_for(uid, universe)['job']['items']] == [symbols[0]]
+
+
+def test_ai_fundamentals_write_through_and_reuse_rich_snapshot(pool, monkeypatch):
+    _, _, symbols = pool
+    symbol = symbols[0]
+    provider_payload = {
+        'source': 'integration-provider',
+        'market_cap': 1_500_000_000.0,
+        'net_income': 125_000_000.0,
+        'roe': 18.5,
+        'financial_statements': {
+            'latest_quarter': {
+                'period_end': (date.today() - timedelta(days=30)).isoformat(),
+                'currency': 'USD',
+                'income_statement': {
+                    'total_revenue': 450_000_000.0,
+                    'net_income': 125_000_000.0,
+                },
+            },
+        },
+        'earnings': {
+            'history': [
+                {
+                    'date': (date.today() - timedelta(days=30)).isoformat(),
+                    'eps_actual': 2.1,
+                    'eps_estimate': 1.9,
+                },
+            ],
+        },
+    }
+
+    writer = MarketDataCollector.__new__(MarketDataCollector)
+    monkeypatch.setattr(writer, '_fetch_fundamental_uncached', lambda market, requested: provider_payload)
+    first = writer._get_fundamental('USStock', symbol)
+    assert first['data_quality']['storage']['writeback'] == 'success'
+
+    row = sync.query(
+        '''SELECT metadata_json FROM qd_fundamental_snapshots
+           WHERE market=%s AND symbol=%s ORDER BY ingested_at DESC LIMIT 1''',
+        ('USStock', symbol),
+    )
+    stored = row['metadata_json']['analysisPayload']
+    assert stored['financial_statements']['latest_quarter']['income_statement']['net_income'] == 125_000_000.0
+    assert stored['earnings']['history'][0]['eps_actual'] == 2.1
+
+    write_snapshot(
+        'USStock',
+        symbol,
+        available=date.today(),
+        source='yfinance_quarterly',
+    )
+
+    provider_calls = []
+    reader = MarketDataCollector.__new__(MarketDataCollector)
+    monkeypatch.setattr(
+        reader,
+        '_fetch_fundamental_uncached',
+        lambda market, requested: provider_calls.append((market, requested)),
+    )
+    second = reader._get_fundamental('USStock', symbol)
+    assert provider_calls == []
+    assert second['data_quality']['storage']['served_from'] == 'database'
+    assert second['financial_statements'] == provider_payload['financial_statements']
+    assert second['earnings'] == provider_payload['earnings']

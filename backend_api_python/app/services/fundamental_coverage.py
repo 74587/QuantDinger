@@ -15,7 +15,7 @@ def member_coverage(members, fields, as_of, source=None):
     as_of = date.fromisoformat(str(as_of)[:10])
     rows = query('''SELECT DISTINCT ON (market,symbol) * FROM qd_fundamental_snapshots
         WHERE symbol=ANY(%s) AND available_at<=%s AND (%s IS NULL OR source=%s)
-        ORDER BY market,symbol,available_at DESC,period_end DESC,ingested_at DESC''',
+        ORDER BY market,symbol,available_at DESC,ingested_at DESC,period_end DESC''',
         ([item['symbol'] for item in members], as_of, source, source), True)
     found = {(r['market'], r['symbol']): r for r in rows}
     result = []

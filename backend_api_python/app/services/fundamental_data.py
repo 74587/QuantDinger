@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 import pandas as pd
@@ -30,6 +30,27 @@ FUNDAMENTAL_FIELDS = (
     "revenue_growth",
     "debt_to_equity",
 )
+
+_ANALYSIS_FIELD_ALIASES = {
+    "return_on_equity": "roe",
+}
+
+_ANALYSIS_FIELD_UNITS = {
+    "revenue": "currency",
+    "net_income": "currency",
+    "net_income_ttm": "currency",
+    "book_value": "currency_per_share",
+    "shareholder_equity": "currency",
+    "total_debt": "currency",
+    "free_cash_flow": "currency",
+    "shares_outstanding": "shares",
+    "market_cap": "currency",
+    "pe_ratio": "multiple",
+    "pb_ratio": "multiple",
+    "return_on_equity": "percent",
+    "revenue_growth": "percent",
+    "debt_to_equity": "multiple",
+}
 
 
 class FundamentalDataService:
@@ -175,14 +196,124 @@ class FundamentalDataService:
             "markets": rows,
         }
 
-    def sync_current(self, *, market: str, symbol: str) -> dict[str, Any]:
+    def latest_for_analysis(
+        self,
+        *,
+        market: str,
+        symbol: str,
+        as_of: date | None = None,
+        max_age_seconds: int = 86_400,
+        stale_report_days: int = 200,
+    ) -> dict[str, Any] | None:
+        """Return the newest persisted payload and its refresh state for AI analysis."""
+        normalized_market = str(market or "").strip()
+        normalized_symbol = str(symbol or "").strip().upper()
+        if normalized_market not in {"USStock", "CNStock", "HKStock"} or not normalized_symbol:
+            return None
+        self.ensure_schema()
+        cutoff = as_of or date.today()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"""
+                SELECT period_end, available_at, frequency, currency,
+                       {', '.join(FUNDAMENTAL_FIELDS)}, source, source_version,
+                       metadata_json, ingested_at
+                FROM qd_fundamental_snapshots
+                WHERE market = ? AND symbol = ? AND available_at <= ?
+                ORDER BY CASE
+                           WHEN jsonb_typeof(metadata_json -> 'analysisPayload') = 'object'
+                            AND metadata_json -> 'analysisPayload' <> '{{}}'::jsonb
+                           THEN 0 ELSE 1
+                         END,
+                         ingested_at DESC, available_at DESC, period_end DESC
+                LIMIT 1
+                """,
+                (normalized_market, normalized_symbol, cutoff),
+            )
+            row = cur.fetchone()
+            cur.close()
+        if not row:
+            return None
+
+        row = dict(row)
+        metadata = _mapping_value(row.get("metadata_json"))
+        stored_payload = metadata.get("analysisPayload")
+        has_provider_payload = isinstance(stored_payload, dict) and bool(stored_payload)
+        payload = _json_safe(stored_payload) if has_provider_payload else {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        source = str(payload.get("source") or row.get("source") or "local_snapshot")
+        period_end = _date_value(row.get("period_end"))
+        available_at = _date_value(row.get("available_at"))
+        is_history = str(row.get("source") or "") == "yfinance_quarterly"
+        field_metadata = dict(payload.get("field_metadata") or {})
+        for field in FUNDAMENTAL_FIELDS:
+            value = _finite_or_none(row.get(field))
+            if value is None:
+                continue
+            analysis_key = _ANALYSIS_FIELD_ALIASES.get(field, field)
+            if analysis_key not in payload or payload.get(analysis_key) is None:
+                if is_history and field in {"return_on_equity", "revenue_growth"}:
+                    value *= 100.0
+                payload[analysis_key] = value
+            field_metadata.setdefault(
+                analysis_key,
+                {
+                    "source": str(row.get("source") or "local_snapshot"),
+                    "unit": _ANALYSIS_FIELD_UNITS.get(field),
+                    "period_type": str(row.get("frequency") or "snapshot"),
+                    "period_end": period_end.isoformat() if period_end else None,
+                    "as_of": available_at.isoformat() if available_at else None,
+                    "currency": str(row.get("currency") or "") or None,
+                },
+            )
+        payload["field_metadata"] = field_metadata
+        payload["source"] = source
+
+        ingested_at = _datetime_value(row.get("ingested_at"))
+        now = datetime.now(timezone.utc)
+        cache_age_seconds = max(0.0, (now - ingested_at).total_seconds()) if ingested_at else None
+        report_age_days = (cutoff - period_end).days if period_end else None
+        stale_reasons = []
+        if cache_age_seconds is None or cache_age_seconds > max(60, int(max_age_seconds)):
+            stale_reasons.append("snapshot_age")
+        if report_age_days is None or report_age_days > max(1, int(stale_report_days)):
+            stale_reasons.append("report_age")
+        refresh_required = "snapshot_age" in stale_reasons
+
+        data_quality = dict(payload.get("data_quality") or {})
+        data_quality["storage"] = {
+            "source": "qd_fundamental_snapshots",
+            "persisted_source": str(row.get("source") or ""),
+            "ingested_at": ingested_at.isoformat() if ingested_at else None,
+            "available_at": available_at.isoformat() if available_at else None,
+            "period_end": period_end.isoformat() if period_end else None,
+            "cache_age_seconds": cache_age_seconds,
+            "report_age_days": report_age_days,
+            "fresh": not stale_reasons,
+            "stale_reasons": stale_reasons,
+            "refresh_required": refresh_required,
+        }
+        payload["data_quality"] = data_quality
+        return {
+            "payload": payload,
+            "fresh": not stale_reasons,
+            "has_provider_payload": has_provider_payload,
+            "stale_reasons": stale_reasons,
+            "refresh_required": refresh_required,
+        }
+
+    def persist_analysis_payload(self, *, market: str, symbol: str, raw: dict[str, Any]) -> dict[str, Any]:
+        """Persist an externally collected analysis payload as the current snapshot."""
         normalized_market = str(market or "").strip()
         normalized_symbol = str(symbol or "").strip().upper()
         if normalized_market not in {"USStock", "CNStock", "HKStock"} or not normalized_symbol:
             raise ValueError("factor.fundamentalMarketUnsupported")
-        from app.services.market_data_collector import MarketDataCollector
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError("factor.fundamentalDataUnavailable")
 
-        raw = MarketDataCollector()._get_fundamental(normalized_market, normalized_symbol) or {}
         statements = raw.get("financial_statements") if isinstance(raw.get("financial_statements"), dict) else {}
         latest_quarter = statements.get("latest_quarter") if isinstance(statements.get("latest_quarter"), dict) else {}
         income = latest_quarter.get("income_statement") if isinstance(latest_quarter.get("income_statement"), dict) else {}
@@ -193,20 +324,30 @@ class FundamentalDataService:
             balance = statements.get("balance_sheet") if isinstance(statements.get("balance_sheet"), dict) else {}
             cashflow = statements.get("cash_flow") if isinstance(statements.get("cash_flow"), dict) else {}
         today = date.today()
-        period_end = latest_quarter.get("period_end") or income.get("latest_date") or balance.get("latest_date") or cashflow.get("latest_date") or today
+        period_end = (
+            latest_quarter.get("period_end")
+            or income.get("latest_date")
+            or balance.get("latest_date")
+            or cashflow.get("latest_date")
+            or today
+        )
         values = {
             "revenue": income.get("total_revenue") if income.get("total_revenue") is not None else raw.get("revenue"),
             "net_income": income.get("net_income") if income.get("net_income") is not None else raw.get("net_income"),
             "net_income_ttm": raw.get("net_income_ttm") if raw.get("net_income_ttm") is not None else raw.get("trailing_net_income"),
             "book_value": raw.get("book_value"),
-            "shareholder_equity": raw.get("shareholder_equity") or balance.get("total_equity"),
-            "total_debt": raw.get("total_debt") or raw.get("debt") or balance.get("debt"),
+            "shareholder_equity": _first_present(
+                raw.get("shareholder_equity"),
+                balance.get("total_equity"),
+                balance.get("stockholders_equity"),
+            ),
+            "total_debt": _first_present(raw.get("total_debt"), raw.get("debt"), balance.get("debt")),
             "free_cash_flow": cashflow.get("free_cash_flow") if cashflow.get("free_cash_flow") is not None else raw.get("free_cash_flow"),
             "shares_outstanding": raw.get("shares_outstanding"),
             "market_cap": raw.get("market_cap"),
             "pe_ratio": raw.get("pe_ratio"),
             "pb_ratio": raw.get("pb_ratio"),
-            "return_on_equity": raw.get("return_on_equity") or raw.get("roe"),
+            "return_on_equity": raw.get("return_on_equity") if raw.get("return_on_equity") is not None else raw.get("roe"),
             "revenue_growth": raw.get("revenue_growth"),
             "debt_to_equity": raw.get("debt_to_equity"),
         }
@@ -220,19 +361,34 @@ class FundamentalDataService:
             "available_at": today,
             "frequency": "quarterly" if latest_quarter else "snapshot",
             "currency": latest_quarter.get("currency") or (statements.get("_meta") or {}).get("currency") or "",
-            "source": str(raw.get("source") or "market_data_collector"),
+            "source": str(raw.get("source") or "market_data_collector")[:80],
             "source_version": today.isoformat(),
             "metadata": {
                 "pointInTime": True,
                 "collectedAt": pd.Timestamp.now(tz="UTC").isoformat(),
                 "periodBasis": "latest_reported_quarter" if latest_quarter else "provider_latest",
-                "dataQuality": raw.get("data_quality") or {},
-                "identity": raw.get("identity") or {},
+                "dataQuality": _json_safe(raw.get("data_quality") or {}),
+                "identity": _json_safe(raw.get("identity") or {}),
+                "analysisPayload": _json_safe(raw),
             },
             **usable,
         }
         self.upsert(payload)
         return payload
+
+    def sync_current(self, *, market: str, symbol: str) -> dict[str, Any]:
+        normalized_market = str(market or "").strip()
+        normalized_symbol = str(symbol or "").strip().upper()
+        if normalized_market not in {"USStock", "CNStock", "HKStock"} or not normalized_symbol:
+            raise ValueError("factor.fundamentalMarketUnsupported")
+        from app.services.market_data_collector import MarketDataCollector
+
+        raw = MarketDataCollector()._fetch_fundamental_uncached(normalized_market, normalized_symbol) or {}
+        return self.persist_analysis_payload(
+            market=normalized_market,
+            symbol=normalized_symbol,
+            raw=raw,
+        )
 
     def sync_history(self, *, market: str, symbol: str) -> dict[str, Any]:
         normalized_market = str(market or "").strip()
@@ -342,6 +498,62 @@ class FundamentalDataService:
             "firstAvailableAt": min(stored_dates).isoformat(),
             "lastAvailableAt": max(stored_dates).isoformat(),
         }
+
+
+def _mapping_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _first_present(*values: Any) -> Any:
+    return next((value for value in values if value is not None), None)
+
+
+def _date_value(value: Any) -> date | None:
+    if value in (None, ""):
+        return None
+    try:
+        return pd.Timestamp(value).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _datetime_value(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    else:
+        stamp = stamp.tz_convert("UTC")
+    return stamp.to_pydatetime().astimezone(timezone.utc)
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and abs(value) != float("inf") else None
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(child) for child in value]
+    if isinstance(value, (date, datetime, pd.Timestamp)):
+        return pd.Timestamp(value).isoformat()
+    finite = _finite_or_none(value)
+    if finite is not None:
+        return finite
+    return str(value)
 
 
 def _finite_or_none(value: Any) -> float | None:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Optional
@@ -54,6 +55,9 @@ def _bypass_proxy() -> Generator[None, None, None]:
 _TD_TIMEOUT = 15
 _TD_MAX_ATTEMPTS = 2
 _TD_BACKOFF_SEC = 2.0
+_HK_INDICATOR_CACHE_TTL_SEC = 1_800
+_HK_INDICATOR_CACHE: Dict[str, tuple[float, Any]] = {}
+_HK_INDICATOR_CACHE_LOCK = threading.Lock()
 
 
 def _float_clean(x: Any) -> Optional[float]:
@@ -66,6 +70,30 @@ def _float_clean(x: Any) -> Optional[float]:
         return v
     except (TypeError, ValueError):
         return None
+
+
+def _hk_financial_indicator_frame(hk5: str):
+    now = time.monotonic()
+    with _HK_INDICATOR_CACHE_LOCK:
+        cached = _HK_INDICATOR_CACHE.get(hk5)
+        if cached and cached[0] > now:
+            return cached[1].copy(deep=True)
+    try:
+        import akshare as ak  # type: ignore
+
+        with _bypass_proxy():
+            frame = ak.stock_hk_financial_indicator_em(symbol=hk5)
+    except Exception as exc:
+        logger.debug("stock_hk_financial_indicator_em failed %s: %s", hk5, exc)
+        return None
+    if frame is None or frame.empty:
+        return frame
+    with _HK_INDICATOR_CACHE_LOCK:
+        _HK_INDICATOR_CACHE[hk5] = (
+            now + _HK_INDICATOR_CACHE_TTL_SEC,
+            frame.copy(deep=True),
+        )
+    return frame
 
 
 # ---------------------------------------------------------------------------
@@ -426,13 +454,7 @@ def fetch_hk_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
     if not hk5:
         return {}
     result: Dict[str, Any] = {"source": "akshare_em"}
-    try:
-        import akshare as ak  # type: ignore
-        with _bypass_proxy():
-            df = ak.stock_hk_financial_indicator_em(symbol=hk5)
-    except Exception as e:
-        logger.debug("stock_hk_financial_indicator_em failed %s: %s", hk5, e)
-        return result
+    df = _hk_financial_indicator_frame(hk5)
     if df is None or df.empty:
         return result
     r = df.iloc[0]
@@ -445,6 +467,13 @@ def fetch_hk_fundamental_akshare(tencent_code: str) -> Dict[str, Any]:
     if mcap is not None:
         result["market_cap"] = mcap
     result["dividend_yield"] = _float_clean(r.get("股息率TTM(%)"))
+    result["revenue"] = _float_clean(r.get("营业总收入(元)")) or _float_clean(r.get("营业总收入"))
+    result["net_income"] = _float_clean(r.get("净利润(元)")) or _float_clean(r.get("净利润"))
+    result["book_value"] = _float_clean(r.get("每股净资产(元)"))
+    result["shares_outstanding"] = _float_clean(r.get("总股本(股)")) or _float_clean(r.get("已发行股本(股)"))
+    if result.get("book_value") is not None and result.get("shares_outstanding") is not None:
+        result["shareholder_equity"] = result["book_value"] * result["shares_outstanding"]
+    result["revenue_growth"] = _float_clean(r.get("营业总收入滚动环比增长(%)"))
     return result
 
 
@@ -671,23 +700,40 @@ def fetch_hk_financial_indicators(tencent_code: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
 
     try:
-        import akshare as ak  # type: ignore
-        with _bypass_proxy():
-            df = ak.stock_hk_financial_indicator_em(symbol=hk5)
+        df = _hk_financial_indicator_frame(hk5)
         if df is None or df.empty:
             return result
 
         curr = df.iloc[0]
         prev = df.iloc[1] if len(df) > 1 else None
 
-        rev_curr = _float_clean(curr.get("营业总收入(元)")) or _float_clean(curr.get("营业收入(元)"))
+        rev_curr = (
+            _float_clean(curr.get("营业总收入(元)"))
+            or _float_clean(curr.get("营业收入(元)"))
+            or _float_clean(curr.get("营业总收入"))
+            or _float_clean(curr.get("营业收入"))
+        )
+        direct_growth = _float_clean(curr.get("营业总收入滚动环比增长(%)"))
+        if direct_growth is not None:
+            result["revenue_growth"] = direct_growth
+        direct_margin = _float_clean(curr.get("销售净利率(%)"))
+        if direct_margin is not None:
+            result["profit_margin"] = direct_margin
         if prev is not None:
-            rev_prev = _float_clean(prev.get("营业总收入(元)")) or _float_clean(prev.get("营业收入(元)"))
-            result["revenue_growth"] = _pct_change(rev_curr, rev_prev)
+            rev_prev = (
+                _float_clean(prev.get("营业总收入(元)"))
+                or _float_clean(prev.get("营业收入(元)"))
+                or _float_clean(prev.get("营业总收入"))
+                or _float_clean(prev.get("营业收入"))
+            )
+            if result.get("revenue_growth") is None:
+                result["revenue_growth"] = _pct_change(rev_curr, rev_prev)
 
-            net_curr = _float_clean(curr.get("净利润(元)"))
-            net_prev = _float_clean(prev.get("净利润(元)"))
+            net_curr = _float_clean(curr.get("净利润(元)")) or _float_clean(curr.get("净利润"))
+            net_prev = _float_clean(prev.get("净利润(元)")) or _float_clean(prev.get("净利润"))
             result["earnings_growth"] = _pct_change(net_curr, net_prev)
+        else:
+            result["earnings_growth"] = _float_clean(curr.get("净利润滚动环比增长(%)"))
 
         de = _float_clean(curr.get("资产负债率(%)"))
         if de is not None:
@@ -697,7 +743,7 @@ def fetch_hk_financial_indicators(tencent_code: str) -> Dict[str, Any]:
         result["quick_ratio"] = _float_clean(curr.get("速动比率"))
 
         op_cf = _float_clean(curr.get("每股经营现金流(元)"))
-        shares = _float_clean(curr.get("总股本(股)"))
+        shares = _float_clean(curr.get("总股本(股)")) or _float_clean(curr.get("已发行股本(股)"))
         if op_cf is not None and shares and shares > 0:
             result["operating_cash_flow"] = round(op_cf * shares, 2)
 
@@ -717,9 +763,7 @@ def fetch_hk_financial_statements(tencent_code: str) -> Dict[str, Any]:
     statements: Dict[str, Any] = {}
 
     try:
-        import akshare as ak  # type: ignore
-        with _bypass_proxy():
-            df = ak.stock_hk_financial_indicator_em(symbol=hk5)
+        df = _hk_financial_indicator_frame(hk5)
         if df is None or df.empty:
             return {}
 
@@ -730,8 +774,13 @@ def fetch_hk_financial_statements(tencent_code: str) -> Dict[str, Any]:
         )
         report_date = str(curr[date_col])[:10] if date_col and curr.get(date_col) is not None else None
 
-        rev = _float_clean(curr.get("营业总收入(元)")) or _float_clean(curr.get("营业收入(元)"))
-        net_income = _float_clean(curr.get("净利润(元)"))
+        rev = (
+            _float_clean(curr.get("营业总收入(元)"))
+            or _float_clean(curr.get("营业收入(元)"))
+            or _float_clean(curr.get("营业总收入"))
+            or _float_clean(curr.get("营业收入"))
+        )
+        net_income = _float_clean(curr.get("净利润(元)")) or _float_clean(curr.get("净利润"))
         total_assets = _float_clean(curr.get("总资产(元)"))
         de_pct = _float_clean(curr.get("资产负债率(%)"))
 
@@ -760,7 +809,7 @@ def fetch_hk_financial_statements(tencent_code: str) -> Dict[str, Any]:
         }
 
         op_cf_per_share = _float_clean(curr.get("每股经营现金流(元)"))
-        shares = _float_clean(curr.get("总股本(股)"))
+        shares = _float_clean(curr.get("总股本(股)")) or _float_clean(curr.get("已发行股本(股)"))
         op_cf = round(op_cf_per_share * shares, 2) if op_cf_per_share is not None and shares and shares > 0 else None
         statements["cash_flow"] = {
             "latest_date": report_date,
