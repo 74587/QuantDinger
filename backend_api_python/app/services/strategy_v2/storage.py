@@ -9,6 +9,7 @@ from typing import Any, Optional
 from app.utils.db import get_db_connection
 
 from .contract import strategy_source_code_hash
+from .curve_sampling import sample_equity_curve
 
 
 class StrategyBacktestRepository:
@@ -372,8 +373,13 @@ def _compact_backtest_result(result: dict[str, Any]) -> dict[str, Any]:
     )
     compact.pop("trades", None)
     compact.pop("rawTrades", None)
+    compact["equityCurve"] = sample_equity_curve(
+        result.get("equityCurve") or [], 2400,
+        _number(result.get("initialCapital"), _number(
+            (result.get("executionAssumptions") or {}).get("initialCapital"),
+        )),
+    )
     for field, limit in (
-        ("equityCurve", 2400),
         ("benchmarkCurve", 2400),
         ("holdingSnapshots", 1200),
         ("rebalanceRecords", 1500),

@@ -452,12 +452,14 @@ def test_explicit_backtest_quantity_is_not_scaled_by_leverage():
     assert target == 2.5
 
 
-def test_leveraged_backtest_force_closes_and_stops_after_insolvency():
+@pytest.mark.parametrize("leverage", [5, 20])
+@pytest.mark.parametrize("commission,slippage", [(0, 0), (0.0005, 0.0005)])
+def test_leveraged_backtest_force_closes_and_stops_after_insolvency(leverage, commission, slippage):
     code = """
 def initialize(context):
     context.set_universe(["Crypto:BTC/USDT@swap"])
     context.subscribe(frequency="1d")
-    context.allow_leverage(max_leverage=5)
+    context.allow_leverage(max_leverage=20)
 
 def handle_data(context, data):
     if get_position("Crypto:BTC/USDT@swap").amount == 0:
@@ -468,15 +470,22 @@ def handle_data(context, data):
         frames={"Crypto:BTC/USDT@swap": _frame([100, 100, 70, 60, 50, 40])},
         initial_capital=10_000,
         leverage_enabled=True,
-        leverage=5,
-        commission=0,
-        slippage=0,
+        leverage=leverage,
+        commission=commission,
+        slippage=slippage,
     ).run()
 
     assert result["liquidated"] is True
     assert result["finalEquity"] == pytest.approx(0.0)
     assert result["totalReturn"] == pytest.approx(-100.0)
     assert result["annualizedReturn"] == pytest.approx(-100.0)
+    assert result["maxDrawdown"] == pytest.approx(-100.0)
+    assert result["maxDrawdownTroughEquity"] == pytest.approx(0.0)
+    assert result["maxDrawdownTroughTime"] == result["liquidationEvents"][0]["time"]
+    assert min(point["drawdown"] for point in result["equityCurve"]) == pytest.approx(-100.0)
+    liquidation_time = result["liquidationEvents"][0]["time"]
+    assert all(point["value"] == 0 and point["drawdown"] == -100
+               for point in result["equityCurve"] if point["time"] >= liquidation_time)
     assert result["totalExecutions"] == 2
     assert result["totalTrades"] == 1
     assert result["closedTrades"][0]["close_reason"] == "margin_liquidation"

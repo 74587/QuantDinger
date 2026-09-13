@@ -147,6 +147,47 @@ class StrategyV2StorageCompatibilityTests(unittest.TestCase):
         self.assertEqual(snapshot["candles"][0], candles[500])
         self.assertEqual(compact["historyStorage"]["limits"]["reviewCandlesPerSymbol"], 3000)
 
+    def test_history_curve_preserves_drawdown_peak_and_trough_after_recovery(self):
+        rows = [{"time": index, "value": 100.0} for index in range(10000)]
+        rows[1]["value"] = 150.0
+        rows[2]["value"] = 75.0
+        rows[-1]["value"] = 200.0
+        result = {"initialCapital": 100.0, "maxDrawdown": -50.0, "equityCurve": rows}
+        original = copy.deepcopy(result)
+
+        compact = _compact_backtest_result(result)
+
+        curve = compact["equityCurve"]
+        self.assertIn(rows[1], curve)
+        self.assertIn(rows[2], curve)
+        peak, drawdown = 100.0, 0.0
+        for point in curve:
+            peak = max(peak, point["value"])
+            drawdown = min(drawdown, (point["value"] / peak - 1) * 100)
+        self.assertEqual(drawdown, compact["maxDrawdown"])
+        self.assertLessEqual(len(curve), 2400)
+        self.assertEqual(result, original)
+        self.assertEqual(_compact_backtest_result(compact)["equityCurve"], curve)
+
+    def test_history_curve_preserves_liquidation_time_and_preceding_equity(self):
+        rows = [
+            {"time": index, "value": 100.0 if index < 5001 else 0.0,
+             "drawdown": 0.0 if index < 5001 else -100.0}
+            for index in range(10000)
+        ]
+
+        curve = _compact_backtest_result({
+            "initialCapital": 100.0, "equityCurve": rows,
+            "maxDrawdown": -100.0, "liquidated": True,
+        })["equityCurve"]
+
+        self.assertIn(rows[5000], curve)
+        self.assertIn(rows[5001], curve)
+        self.assertEqual(next(point["time"] for point in curve if point["value"] == 0), 5001)
+        self.assertEqual(curve[0], rows[0])
+        self.assertEqual(curve[-1], rows[-1])
+        self.assertLessEqual(len(curve), 2400)
+
     def test_postgres_cursor_bulk_path_converts_placeholders_without_returning_ids(self):
         raw = _RawCursor()
         cursor = PostgresCursor(raw)
