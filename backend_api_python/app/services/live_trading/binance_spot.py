@@ -162,11 +162,12 @@ class BinanceSpotClient(BaseRestClient):
         if st <= 0:
             return None
         try:
-            normalized = st.normalize()
-            step_str = str(normalized)
-            if "." in step_str:
-                return min(18, max(0, len(step_str.split(".")[1])))
-            return 0
+            # normalize() renders small steps in scientific notation ("1E-8"),
+            # so derive the decimal places from the exponent instead.
+            exp = st.normalize().as_tuple().exponent
+            if not isinstance(exp, int):
+                return None
+            return min(18, max(0, -exp))
         except Exception:
             return None
 

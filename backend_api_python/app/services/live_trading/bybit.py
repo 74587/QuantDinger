@@ -528,21 +528,14 @@ class BybitClient(BaseRestClient):
         if step > 0:
             q = self._floor_to_step(q, step)
         
-        # Infer precision from qtyStep
+        # Infer precision from qtyStep. Decimal.normalize() renders small steps in
+        # scientific notation, so derive precision from the Decimal exponent.
         qty_precision = None
         if step > 0:
             try:
-                step_normalized = step.normalize()
-                step_str = str(step_normalized)
-                if '.' in step_str:
-                    decimal_part = step_str.split('.')[1]
-                    qty_precision = len(decimal_part)
-                    if qty_precision < 0:
-                        qty_precision = 0
-                    if qty_precision > 18:
-                        qty_precision = 18
-                else:
-                    qty_precision = 0
+                exp = step.normalize().as_tuple().exponent
+                if isinstance(exp, int):
+                    qty_precision = min(max(0, -exp), 18)
             except Exception:
                 pass
         
@@ -637,16 +630,9 @@ class BybitClient(BaseRestClient):
         price_precision = None
         if tick > 0:
             try:
-                tick_normalized = tick.normalize()
-                tick_str = str(tick_normalized)
-                if "." in tick_str:
-                    price_precision = len(tick_str.split(".")[1])
-                    if price_precision < 0:
-                        price_precision = 0
-                    if price_precision > 18:
-                        price_precision = 18
-                else:
-                    price_precision = 0
+                exp = tick.normalize().as_tuple().exponent
+                if isinstance(exp, int):
+                    price_precision = min(max(0, -exp), 18)
             except Exception:
                 pass
         return (p, price_precision)
