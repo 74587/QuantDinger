@@ -535,17 +535,9 @@ class BitgetMixClient(BaseRestClient):
             # Infer precision from step if not already set
             if size_precision is None:
                 try:
-                    step_normalized = step.normalize()
-                    step_str = str(step_normalized)
-                    if '.' in step_str:
-                        decimal_part = step_str.split('.')[1]
-                        size_precision = len(decimal_part)
-                        if size_precision < 0:
-                            size_precision = 0
-                        if size_precision > 18:
-                            size_precision = 18
-                    else:
-                        size_precision = 0
+                    exp = step.normalize().as_tuple().exponent
+                    if isinstance(exp, int):
+                        size_precision = min(max(0, -exp), 18)
                 except Exception:
                     pass
 
@@ -645,16 +637,9 @@ class BitgetMixClient(BaseRestClient):
             px = self._floor_to_step(px, step)
             if price_precision is None:
                 try:
-                    step_normalized = step.normalize()
-                    step_str = str(step_normalized)
-                    if "." in step_str:
-                        price_precision = len(step_str.split(".")[1])
-                        if price_precision < 0:
-                            price_precision = 0
-                        if price_precision > 18:
-                            price_precision = 18
-                    else:
-                        price_precision = 0
+                    exp = step.normalize().as_tuple().exponent
+                    if isinstance(exp, int):
+                        price_precision = min(max(0, -exp), 18)
                 except Exception:
                     pass
 
