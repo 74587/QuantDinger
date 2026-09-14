@@ -19,6 +19,15 @@ from app.services.strategy_v2.models import StrategyManifest
 from app.services.strategy_v2.service import StrategyV2BacktestService
 
 
+_STOCK_INTRADAY_HISTORY_DAY_CAPS = {
+    "1m": 7,
+    "3m": 7,
+    "5m": 59,
+    "15m": 59,
+    "30m": 59,
+}
+
+
 def live_history_days(
     frequency: str,
     warmup_bars: int,
@@ -39,6 +48,9 @@ def live_history_days(
         hours = float(normalized[:-1]) / (60 if normalized.endswith("m") else 1)
         session_days = math.ceil(max(1, warmup_bars) * 3 * hours / 4 * 7 / 5 * 1.5)
         days = max(days, 7, session_days)
+        provider_cap = _STOCK_INTRADAY_HISTORY_DAY_CAPS.get(normalized)
+        if provider_cap is not None:
+            days = min(days, provider_cap)
     return days
 
 

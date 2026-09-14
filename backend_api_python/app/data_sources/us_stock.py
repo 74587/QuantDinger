@@ -61,6 +61,10 @@ class USStockDataSource(BaseDataSource):
         '3m': 3,
     }
 
+    INTRADAY_INTERVALS = frozenset({
+        '1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h', '4h'
+    })
+
     TIMEFRAME_ALIASES = {
         '1h': '1H',
         '1hour': '1H',
@@ -743,11 +747,16 @@ class USStockDataSource(BaseDataSource):
         limit: int,
     ) -> List[Dict[str, Any]]:
         try:
+            request_end = (
+                end_date
+                if interval in self.INTRADAY_INTERVALS
+                else end_date + timedelta(days=1)
+            )
             resp = requests.get(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{self._yahoo_symbol(symbol)}",
                 params={
                     "period1": int(start_date.timestamp()),
-                    "period2": int((end_date + timedelta(days=1)).timestamp()),
+                    "period2": int(request_end.timestamp()),
                     "interval": interval,
                     "includePrePost": "false",
                     "events": "history",
@@ -797,12 +806,17 @@ class USStockDataSource(BaseDataSource):
         """使用 yfinance 获取数据"""
         try:
             ticker = yf.Ticker(self._yahoo_symbol(symbol))
-            
-            end_date_inclusive = end_date + timedelta(days=1)
-            
+
+            if interval in self.INTRADAY_INTERVALS:
+                start_arg = start_date
+                end_arg = end_date
+            else:
+                start_arg = start_date.strftime('%Y-%m-%d')
+                end_arg = (end_date + timedelta(days=1)).strftime('%Y-%m-%d')
+
             df = ticker.history(
-                start=start_date.strftime('%Y-%m-%d'),
-                end=end_date_inclusive.strftime('%Y-%m-%d'),
+                start=start_arg,
+                end=end_arg,
                 interval=interval
             )
             return df
