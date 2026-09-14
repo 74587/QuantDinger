@@ -59,10 +59,11 @@ def quote_cache_key(
     *,
     exchange_id: str = "",
     market_type: str = "",
+    instrument_id: str = "",
     stale: bool = False,
 ) -> str:
     prefix = "watchlist_quote_stale" if stale else "watchlist_quote"
-    return f"{prefix}:{QUOTE_CACHE_VERSION}:{market}:{exchange_id}:{market_type}:{symbol}".upper()
+    return f"{prefix}:{QUOTE_CACHE_VERSION}:{market}:{exchange_id}:{market_type}:{instrument_id}:{symbol}".upper()
 
 
 def empty_price(
@@ -185,6 +186,7 @@ def _store_price(
     *,
     cache_exchange_id: str,
     cache_market_type: str,
+    instrument_id: str = "",
     source_exchange_id: str,
     source_market_type: str,
 ) -> dict:
@@ -199,6 +201,7 @@ def _store_price(
             symbol,
             exchange_id=cache_exchange_id,
             market_type=cache_market_type,
+            instrument_id=instrument_id,
         ),
         decorated,
         QUOTE_CACHE_TTL_SEC,
@@ -209,6 +212,7 @@ def _store_price(
             symbol,
             exchange_id=cache_exchange_id,
             market_type=cache_market_type,
+            instrument_id=instrument_id,
             stale=True,
         ),
         decorated,
@@ -222,6 +226,7 @@ def _fetch_price_data(
     symbol: str,
     source_exchange_id: str,
     source_market_type: str,
+    instrument_id: str = "",
 ) -> dict:
     return guarded_cached(
         cache_key(
@@ -229,6 +234,7 @@ def _fetch_price_data(
             market,
             source_exchange_id,
             source_market_type,
+            instrument_id,
             symbol,
         ),
         lambda: kline_service.get_realtime_price(
@@ -236,6 +242,7 @@ def _fetch_price_data(
             symbol,
             exchange_id=source_exchange_id or None,
             market_type=source_market_type or None,
+            instrument_id=instrument_id or None,
         ),
         ttl_sec=QUOTE_CACHE_TTL_SEC,
         stale_ttl_sec=QUOTE_STALE_TTL_SEC,
@@ -251,6 +258,7 @@ def get_single_price(
     symbol: str,
     exchange_id: str = "",
     market_type: str = "",
+    instrument_id: str = "",
     *,
     resolved_crypto_exchange_id: str = "",
 ) -> dict:
@@ -267,6 +275,7 @@ def get_single_price(
             symbol,
             exchange_id=source_exchange_id,
             market_type=source_market_type,
+            instrument_id=instrument_id,
         )
         cached = _market_cache.get(fresh_key)
         if _has_price(cached):
@@ -282,6 +291,7 @@ def get_single_price(
                     cached,
                     cache_exchange_id=primary_exchange_id,
                     cache_market_type=primary_market_type,
+                    instrument_id=instrument_id,
                     source_exchange_id=actual_exchange_id,
                     source_market_type=actual_market_type,
                 )
@@ -302,6 +312,7 @@ def get_single_price(
                 symbol,
                 source_exchange_id,
                 source_market_type,
+                instrument_id,
             )
         except RequestGuardError as exc:
             logger.info(
@@ -333,6 +344,7 @@ def get_single_price(
             price_data,
             cache_exchange_id=source_exchange_id,
             cache_market_type=source_market_type,
+            instrument_id=instrument_id,
             source_exchange_id=source_exchange_id,
             source_market_type=source_market_type,
         )
@@ -343,6 +355,7 @@ def get_single_price(
                 decorated,
                 cache_exchange_id=primary_exchange_id,
                 cache_market_type=primary_market_type,
+                instrument_id=instrument_id,
                 source_exchange_id=source_exchange_id,
                 source_market_type=source_market_type,
             )
@@ -363,6 +376,7 @@ def get_single_price(
                 symbol,
                 exchange_id=source_exchange_id,
                 market_type=source_market_type,
+                instrument_id=instrument_id,
                 stale=True,
             )
         )
@@ -405,6 +419,7 @@ def get_price_map(watchlist: list, timeout_sec: int = 30) -> list:
         symbol = item.get("symbol", "")
         exchange_id = item.get("exchange_id", "")
         market_type = item.get("market_type", "")
+        instrument_id = item.get("instrument_id", "")
         if market and symbol:
             future = executor.submit(
                 get_single_price,
@@ -412,25 +427,30 @@ def get_price_map(watchlist: list, timeout_sec: int = 30) -> list:
                 symbol,
                 exchange_id,
                 market_type,
+                instrument_id,
                 resolved_crypto_exchange_id=resolved_crypto_exchange_id,
             )
-            futures[future] = (market, symbol, exchange_id, market_type)
+            futures[future] = (market, symbol, exchange_id, market_type, instrument_id)
 
     completed = set()
     try:
         for future in as_completed(futures, timeout=timeout_sec):
             completed.add(future)
-            market, symbol, exchange_id, market_type = futures[future]
+            market, symbol, exchange_id, market_type, instrument_id = futures[future]
             try:
                 results.append(future.result())
             except Exception as exc:
                 logger.warning("Price fetch failed: %s:%s - %s", market, symbol, exc)
-                results.append(_cached_or_empty(market, symbol, exchange_id, market_type, "failed"))
+                results.append(_cached_or_empty(
+                    market, symbol, exchange_id, market_type, "failed", instrument_id=instrument_id,
+                ))
     except FuturesTimeoutError:
-        for future, (market, symbol, exchange_id, market_type) in futures.items():
+        for future, (market, symbol, exchange_id, market_type, instrument_id) in futures.items():
             if future not in completed:
                 logger.warning("Price fetch timed out: %s:%s", market, symbol)
-                results.append(_cached_or_empty(market, symbol, exchange_id, market_type, "timeout"))
+                results.append(_cached_or_empty(
+                    market, symbol, exchange_id, market_type, "timeout", instrument_id=instrument_id,
+                ))
 
     return results
 
@@ -441,6 +461,8 @@ def _cached_or_empty(
     exchange_id: str,
     market_type: str,
     error: str,
+    *,
+    instrument_id: str = "",
 ) -> dict:
     source_exchange_id, source_market_type = _quote_source_context(
         market,
@@ -453,6 +475,7 @@ def _cached_or_empty(
             symbol,
             exchange_id=source_exchange_id,
             market_type=source_market_type,
+            instrument_id=instrument_id,
             stale=True,
         )
     )

@@ -38,6 +38,12 @@ def test_fee_reconciliation_reads_saved_phase_and_only_charges_delta():
     assert delta == pytest.approx({"USDT": 0.02})
 
 
+def test_fee_reconciliation_preserves_authoritative_zero_fee_evidence():
+    assert fee_breakdown_snapshot(
+        {"fees_by_ccy": {"USDT": 0}, "fee_status": "actual_zero"}
+    ) == {"USDT": 0.0}
+
+
 def test_fee_backfill_repairs_missing_quote_value_without_overwriting_native_fee(monkeypatch):
     statements = []
 
@@ -76,14 +82,54 @@ def test_fee_backfill_repairs_missing_quote_value_without_overwriting_native_fee
     )
 
     assert count == 1
-    assert "COALESCE(commission_quote, 0) = 0" in statements[0][0]
+    assert "COALESCE(fee_status, 'pending') = 'pending'" in statements[0][0]
     update_sql, update_params = statements[1]
     assert "CASE WHEN COALESCE(commission, 0) = 0" in update_sql
     assert "CASE WHEN COALESCE(commission_quote, 0) = 0" in update_sql
     assert update_params[0] == pytest.approx(0.00003)
     assert update_params[1] == "BNB"
     assert update_params[2] == pytest.approx(0.024)
-    assert update_params[3] == 1
+    assert update_params[3] == "actual"
+    assert update_params[4] == 1
+
+
+def test_fee_backfill_marks_exchange_confirmed_zero_without_retrying_forever(monkeypatch):
+    statements = []
+
+    class Cursor:
+        def execute(self, sql, params):
+            statements.append((sql, params))
+
+        def fetchall(self):
+            return [{"id": 2, "value": 50, "amount": 0.1}]
+
+        def close(self):
+            return None
+
+    class Database:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.pending_orders.fee_reconciliation.get_db_connection",
+        lambda: Database(),
+    )
+
+    assert backfill_zero_commission_trades(
+        order_id=10,
+        fees_by_ccy={"USDT": 0.0},
+        commission_quote=0.0,
+    ) == 1
+    assert statements[1][1][3] == "actual_zero"
 
 
 def test_adapter_preserves_multi_currency_fee_breakdown():

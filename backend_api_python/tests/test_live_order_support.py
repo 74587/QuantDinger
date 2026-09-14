@@ -13,7 +13,7 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
-from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
 from app.services.pending_orders import live_order_phases
@@ -21,10 +21,38 @@ from app.services.pending_orders.live_order_support import (
     FillAccumulator,
     LiveOrderRejected,
     apply_execution_result,
+    attach_instrument_product_contracts,
     build_live_order_context,
     make_client_order_id,
     signal_to_side_pos_reduce,
 )
+
+
+def test_attach_instrument_product_contracts_uses_immutable_native_id():
+    candidates = [{
+        "market": "Crypto",
+        "symbol": "RAAPL/USDT",
+        "exchange_id": "bitget",
+        "market_type": "spot",
+        "key": "Crypto:RAAPL/USDT@bitget:spot",
+    }]
+
+    attach_instrument_product_contracts(
+        candidates,
+        {"instrument_products": [{
+            "symbol": "RAAPL/USDT",
+            "exchange_id": "bitget",
+            "market_type": "spot",
+            "instrument_id": "rAAPLUSDT",
+            "product_type": "tokenized_equity",
+            "api_family": "reality",
+        }]},
+        exchange_id="bitget",
+    )
+
+    assert candidates[0]["instrument_id"] == "rAAPLUSDT"
+    assert candidates[0]["api_family"] == "reality"
+    assert candidates[0]["product_type"] == "tokenized_equity"
 
 
 def test_make_client_order_id_okx_is_compact_alphanumeric():
@@ -87,9 +115,10 @@ def test_all_crypto_order_phase_calls_match_exchange_client_signatures():
             OkxClient,
             BitgetMixClient,
             BitgetSpotClient,
-            BybitClient,
-            GateSpotClient,
-            GateUsdtFuturesClient,
+                BybitClient,
+                GateSpotClient,
+                GateStockClient,
+                GateUsdtFuturesClient,
             HtxClient,
         )
     }
@@ -321,6 +350,63 @@ def test_build_live_order_context_normalizes_and_validates():
     assert ctx.exchange_id == "binance"
     assert ctx.market_type == "swap"
     assert ctx.safe_exchange_config == {"exchange_id": "binance"}
+
+
+def test_build_live_order_context_injects_immutable_reality_api_family():
+    ctx = build_live_order_context(
+        order_id=99,
+        order_row={"strategy_id": 12, "symbol": "RAAPL/USDT", "signal_type": "open_long"},
+        payload={"amount": 50},
+        load_strategy_configs=lambda strategy_id: {
+            "user_id": 7,
+            "market_category": "Crypto",
+            "market_type": "spot",
+            "status": "running",
+            "trading_config": {"instrument_products": [{
+                "symbol": "RAAPL/USDT",
+                "exchange_id": "bitget",
+                "market_type": "spot",
+                "instrument_id": "RAAPLUSDT",
+                "product_type": "tokenized_equity",
+                "api_family": "reality",
+            }]},
+            "exchange_config": {"exchange_id": "bitget"},
+        },
+        resolve_exchange_config=lambda cfg, user_id: dict(cfg, api_key="secret"),
+        safe_exchange_config_for_log=lambda cfg: {
+            "exchange_id": cfg.get("exchange_id"),
+            "api_family": cfg.get("api_family"),
+        },
+    )
+
+    assert ctx.exchange_config["api_family"] == "reality"
+    assert ctx.exchange_config["instrument_id"] == "RAAPLUSDT"
+    assert ctx.safe_exchange_config == {"exchange_id": "bitget", "api_family": "reality"}
+
+
+def test_build_live_order_context_rejects_product_contract_mismatch():
+    with pytest.raises(LiveOrderRejected, match="strategyV2.instrumentProductContractMismatch"):
+        build_live_order_context(
+            order_id=99,
+            order_row={"strategy_id": 12, "symbol": "RNVD/USDT", "signal_type": "open_long"},
+            payload={"amount": 50},
+            load_strategy_configs=lambda strategy_id: {
+                "user_id": 7,
+                "market_category": "Crypto",
+                "market_type": "spot",
+                "status": "running",
+                "trading_config": {"instrument_products": [{
+                    "symbol": "RAAPL/USDT",
+                    "exchange_id": "bitget",
+                    "market_type": "spot",
+                    "product_type": "tokenized_equity",
+                    "api_family": "reality",
+                }]},
+                "exchange_config": {"exchange_id": "bitget"},
+            },
+            resolve_exchange_config=lambda cfg, user_id: cfg,
+            safe_exchange_config_for_log=lambda cfg: cfg,
+        )
 
 
 def test_build_live_order_context_rejects_missing_symbol():

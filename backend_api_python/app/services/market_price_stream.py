@@ -70,11 +70,13 @@ class PublicMarketPriceFeed:
         for item in self.instruments:
             key = str(item.get("key") or "")
             symbol = str(item.get("symbol") or "")
+            instrument_id = str(item.get("instrument_id") or "")
             base = symbol.replace("/", "-").upper()
             aliases = {
                 _normalized_symbol(symbol),
                 _normalized_symbol(base),
                 _normalized_symbol(base + ("-SWAP" if self.market_type != "spot" else "")),
+                _normalized_symbol(instrument_id),
             }
             for alias in aliases:
                 if alias:
@@ -88,7 +90,12 @@ class PublicMarketPriceFeed:
 
     @property
     def supported(self) -> bool:
-        return self.exchange_id in self.SUPPORTED_EXCHANGES and bool(self.instruments)
+        has_special_api = any(
+            str(item.get("api_family") or self.market_type).strip().lower()
+            not in {"spot", "swap"}
+            for item in self.instruments
+        )
+        return self.exchange_id in self.SUPPORTED_EXCHANGES and bool(self.instruments) and not has_special_api
 
     def start(self) -> None:
         if not self.supported or (self._thread and self._thread.is_alive()):
@@ -213,7 +220,10 @@ class PublicMarketPriceFeed:
             backoff = min(30.0, backoff * 2.0)
 
     def _symbols(self) -> list[str]:
-        return [str(item.get("symbol") or "") for item in self.instruments]
+        return [
+            str(item.get("instrument_id") or item.get("symbol") or "")
+            for item in self.instruments
+        ]
 
     def _url(self) -> str:
         swap = self.market_type != "spot"
@@ -238,7 +248,14 @@ class PublicMarketPriceFeed:
         swap = self.market_type != "spot"
         if self.exchange_id == "okx":
             return [{"op": "subscribe", "args": [
-                {"channel": "tickers", "instId": symbol.replace("/", "-").upper() + ("-SWAP" if swap else "")}
+                {
+                    "channel": "tickers",
+                    "instId": (
+                        symbol.replace("/", "-").upper()
+                        if symbol.upper().endswith("-SWAP") or not swap
+                        else symbol.replace("/", "-").upper() + "-SWAP"
+                    ),
+                }
                 for symbol in self._symbols()
             ]}]
         if self.exchange_id == "bybit":

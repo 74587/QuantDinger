@@ -15,6 +15,7 @@ import time
 import threading
 from typing import Optional, Any, List, Dict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -627,6 +628,55 @@ class PostgresConnection:
                 logger.warning(f"Failed to return connection to pool: {e}")
 
 
+class _TransactionConnection:
+    """Keep legacy helper commits inside the owning transaction."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.rollback_only = False
+
+    def cursor(self):
+        return self.connection.cursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        self.rollback_only = True
+
+    def close(self):
+        pass
+
+
+_active_transaction = ContextVar("postgres_active_transaction", default=None)
+
+
+@contextmanager
+def get_pg_transaction():
+    """Atomically commit nested synchronous database helpers, or roll back all."""
+    active = _active_transaction.get()
+    if active is not None:
+        try:
+            yield active
+        except BaseException:
+            active.rollback_only = True
+            raise
+        return
+    with get_pg_connection() as connection:
+        transaction = _TransactionConnection(connection)
+        token = _active_transaction.set(transaction)
+        try:
+            yield transaction
+            if transaction.rollback_only:
+                raise RuntimeError("Database transaction marked for rollback")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            _active_transaction.reset(token)
+
+
 @contextmanager
 def get_pg_connection():
     """
@@ -636,6 +686,14 @@ def get_pg_connection():
     immediately fail the request; we wait up to DB_POOL_ACQUIRE_TIMEOUT
     seconds for a connection to be released.
     """
+    active = _active_transaction.get()
+    if active is not None:
+        try:
+            yield active
+        except BaseException:
+            active.rollback_only = True
+            raise
+        return
     pg_pool = _get_connection_pool()
     conn = None
     broken = False

@@ -838,6 +838,7 @@ def _build_market_snapshot(context: dict) -> dict | None:
     symbol = (context.get("symbol") or "").strip()
     exchange_id = (context.get("exchange_id") or context.get("exchangeId") or "").strip()
     market_type = (context.get("market_type") or context.get("marketType") or "").strip()
+    instrument_id = (context.get("instrument_id") or context.get("instrumentId") or "").strip()
     skip_klines = bool(context.get("skip_klines"))
     requested_timeframes = context.get("snapshot_timeframes")
     if isinstance(requested_timeframes, (list, tuple)):
@@ -863,6 +864,7 @@ def _build_market_snapshot(context: dict) -> dict | None:
         "market": market,
         "exchange_id": exchange_id,
         "market_type": market_type,
+        "instrument_id": instrument_id,
         "generated_at_utc": _now_utc().isoformat(),
         "price": None,
         "timeframes": {},
@@ -882,6 +884,7 @@ def _build_market_snapshot(context: dict) -> dict | None:
             force_refresh=force_price_refresh,
             exchange_id=exchange_id or None,
             market_type=market_type or None,
+            instrument_id=instrument_id or None,
         )
         if price and _to_float(price.get("price")):
             return {
@@ -903,6 +906,7 @@ def _build_market_snapshot(context: dict) -> dict | None:
             snapshot_limit,
             exchange_id=exchange_id or None,
             market_type=market_type or None,
+            instrument_id=instrument_id or None,
         )
         summary = _summarize_klines(klines, timeframe)
         if market_query_plan:

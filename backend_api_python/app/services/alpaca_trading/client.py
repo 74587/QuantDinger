@@ -425,6 +425,10 @@ class AlpacaClient:
         """Cancel an open order by ID."""
         try:
             self._ensure_connected()
+            order = self._trading_client.get_order_by_id(order_id)
+            status = _enum_value(getattr(order, "status", "")).strip().lower()
+            if status not in {"new", "accepted", "pending_new", "partially_filled", "accepted_for_bidding"}:
+                return False
             self._trading_client.cancel_order_by_id(order_id)
             logger.info(f"Alpaca order {_id_log_prefix(order_id)}... cancelled")
             return True
@@ -633,8 +637,8 @@ class AlpacaClient:
                     "asset_class": _enum_value(getattr(o, "asset_class", "")),
                     "side": _enum_value(getattr(o, "side", "")).lower(),
                     "action": _enum_value(getattr(o, "side", "")).upper(),
-                    "quantity": _num(getattr(o, "qty", 0)),
-                    "qty": _num(getattr(o, "qty", 0)),
+                    "quantity": _num(getattr(o, "qty", None), default=None),
+                    "qty": _num(getattr(o, "qty", None), default=None),
                     "notional": _num(getattr(o, "notional", 0), default=0.0),
                     "orderType": _enum_value(getattr(o, "order_type", "")),
                     "order_type": _enum_value(getattr(o, "order_type", "")),
@@ -643,11 +647,16 @@ class AlpacaClient:
                     "status": _enum_value(getattr(o, "status", "")),
                     "filled": _num(getattr(o, "filled_qty", 0)),
                     "filled_qty": _num(getattr(o, "filled_qty", 0)),
-                    "remaining": _num(getattr(o, "qty", 0)) - _num(getattr(o, "filled_qty", 0)),
-                    "avgFillPrice": _num(getattr(o, "filled_avg_price", 0)),
-                    "filled_avg_price": _num(getattr(o, "filled_avg_price", 0)),
+                    "remaining": (
+                        max(0.0, _num(o.qty) - _num(getattr(o, "filled_qty", 0)))
+                        if getattr(o, "qty", None) is not None else None
+                    ),
+                    "avgFillPrice": _num(getattr(o, "filled_avg_price", None), default=None),
+                    "filled_avg_price": _num(getattr(o, "filled_avg_price", None), default=None),
                     "submittedAt": str(getattr(o, "submitted_at", "") or ""),
                     "submitted_at": str(getattr(o, "submitted_at", "") or ""),
+                    "filled_at": str(getattr(o, "filled_at", "") or ""),
+                    "created_at": str(getattr(o, "created_at", "") or ""),
                     "extendedHours": bool(getattr(o, "extended_hours", False)),
                     "extended_hours": bool(getattr(o, "extended_hours", False)),
                 }

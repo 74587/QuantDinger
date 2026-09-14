@@ -1111,7 +1111,9 @@ CREATE TABLE IF NOT EXISTS qd_watchlist (
     settle_currency VARCHAR(20) NOT NULL DEFAULT '',
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW(),
-    CONSTRAINT uq_watchlist_asset UNIQUE(user_id, market, symbol)
+    CONSTRAINT uq_watchlist_market_context UNIQUE(
+        user_id, market, symbol, exchange_id, market_type, instrument_id
+    )
 );
 
 CREATE INDEX IF NOT EXISTS idx_watchlist_user_id ON qd_watchlist(user_id);
@@ -1121,18 +1123,10 @@ ALTER TABLE qd_watchlist ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) NOT NU
 ALTER TABLE qd_watchlist ADD COLUMN IF NOT EXISTS instrument_id VARCHAR(120) NOT NULL DEFAULT '';
 ALTER TABLE qd_watchlist ADD COLUMN IF NOT EXISTS settle_currency VARCHAR(20) NOT NULL DEFAULT '';
 ALTER TABLE qd_watchlist DROP CONSTRAINT IF EXISTS qd_watchlist_user_id_market_symbol_key;
-DELETE FROM qd_watchlist newer
-USING qd_watchlist older
-WHERE newer.user_id = older.user_id
-  AND newer.market = older.market
-  AND newer.symbol = older.symbol
-  AND newer.id < older.id;
-UPDATE qd_watchlist
-SET exchange_id = '', market_type = 'spot', instrument_id = ''
-WHERE exchange_id <> '' OR market_type <> 'spot' OR instrument_id <> '';
-DROP INDEX IF EXISTS uq_watchlist_market_context;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_watchlist_asset
-  ON qd_watchlist(user_id, market, symbol);
+ALTER TABLE qd_watchlist DROP CONSTRAINT IF EXISTS uq_watchlist_asset;
+DROP INDEX IF EXISTS uq_watchlist_asset;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_watchlist_market_context
+  ON qd_watchlist(user_id, market, symbol, exchange_id, market_type, instrument_id);
 
 -- =============================================================================
 -- 10A. Strategy universes and point-in-time membership
@@ -1722,6 +1716,12 @@ CREATE TABLE IF NOT EXISTS qd_market_symbols (
     instrument_id VARCHAR(120) NOT NULL DEFAULT '',
     settle_currency VARCHAR(20) NOT NULL DEFAULT '',
     asset_class VARCHAR(20) NOT NULL DEFAULT 'crypto',
+    product_type VARCHAR(32) NOT NULL DEFAULT 'crypto',
+    api_family VARCHAR(24) NOT NULL DEFAULT 'spot',
+    underlying_market VARCHAR(32) NOT NULL DEFAULT '',
+    underlying_symbol VARCHAR(50) NOT NULL DEFAULT '',
+    product_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    metadata_updated_at TIMESTAMPTZ,
     currency VARCHAR(10) DEFAULT '',
     is_active INTEGER DEFAULT 1,
     is_hot INTEGER DEFAULT 0,
@@ -1753,6 +1753,12 @@ ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) N
 ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS instrument_id VARCHAR(120) NOT NULL DEFAULT '';
 ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS settle_currency VARCHAR(20) NOT NULL DEFAULT '';
 ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS asset_class VARCHAR(20) NOT NULL DEFAULT 'crypto';
+ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS product_type VARCHAR(32) NOT NULL DEFAULT 'crypto';
+ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS api_family VARCHAR(24) NOT NULL DEFAULT 'spot';
+ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS underlying_market VARCHAR(32) NOT NULL DEFAULT '';
+ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS underlying_symbol VARCHAR(50) NOT NULL DEFAULT '';
+ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS product_meta JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE qd_market_symbols ADD COLUMN IF NOT EXISTS metadata_updated_at TIMESTAMPTZ;
 UPDATE qd_market_symbols SET asset_class = 'equity'
 WHERE market IN ('CNStock', 'HKStock', 'USStock', 'MOEX') AND asset_class = 'crypto';
 UPDATE qd_market_symbols SET asset_class = 'forex'
@@ -1773,6 +1779,8 @@ WHERE market = 'USStock' AND asset_class = 'etf' AND symbol IN (
 ALTER TABLE qd_market_symbols DROP CONSTRAINT IF EXISTS qd_market_symbols_market_symbol_key;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_market_symbols_venue_instrument
   ON qd_market_symbols(market, symbol, exchange, market_type, instrument_id);
+CREATE INDEX IF NOT EXISTS idx_market_symbols_product_catalog
+  ON qd_market_symbols(market, exchange, market_type, product_type, is_active);
 
 UPDATE qd_market_symbols
 SET is_active = 0

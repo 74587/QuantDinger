@@ -145,6 +145,9 @@ A valid response contains <code>valid: true</code> and the manifest. Verify the 
 | China A-share | <code>CNStock:600519.SH</code> |
 | US equity | <code>USStock:MSFT</code> |
 | Hong Kong equity | <code>HKStock:00700.HK</code> |
+| Hong Kong equity through Gate stock channel | <code>Crypto:00700/HKD@gate:spot</code> |
+| US equity through Gate stock channel | <code>Crypto:AAPL/USD@gate:spot</code> |
+| Hong Kong equity perpetual on Binance | <code>Crypto:HK0700/USDT@binance:swap</code> when returned by the active catalog |
 | Crypto spot | <code>Crypto:BTC/USDT@spot</code> |
 | Venue-specific Crypto spot | <code>Crypto:BTC/USDT@okx:spot</code> |
 | Crypto perpetual | <code>Crypto:BTC/USDT@swap</code> |
@@ -156,6 +159,53 @@ A valid response contains <code>valid: true</code> and the manifest. Verify the 
 The parser also normalizes selected aliases, such as <code>600519.XSHG</code> to <code>CNStock:600519.SH</code> and <code>BTCUSDT</code> to <code>BTC/USDT</code>.
 
 Production strategies should use the full market prefix. Crypto defaults to spot when no market type is present. Only swap instruments can permit contract leverage. Parsing a market name does not by itself guarantee data coverage or live-trading support; see the live venue matrix in Section 18.
+
+### Exchange-routed equity products: preserve the trading instrument
+
+Gate Tencent uses <code>Crypto:00700/HKD@gate:spot</code>; Gate Apple uses <code>Crypto:AAPL/USD@gate:spot</code>. Here <code>Crypto</code> is the system's exchange routing namespace; it does not mean the underlying asset is cryptocurrency. The Gate stock catalog maps these instruments as follows:
+
+| Field | Tencent | Apple |
+| --- | --- | --- |
+| market / symbol | <code>Crypto</code> / <code>00700/HKD</code> | <code>Crypto</code> / <code>AAPL/USD</code> |
+| exchange_id / market_type | <code>gate</code> / <code>spot</code> | <code>gate</code> / <code>spot</code> |
+| asset_class / product_type / api_family | <code>equity</code> / <code>direct_equity</code> / <code>stock</code> | <code>equity</code> / <code>direct_equity</code> / <code>stock</code> |
+| underlying_market / underlying_symbol | <code>HKStock</code> / <code>00700</code> | <code>USStock</code> / <code>AAPL</code> |
+
+To find these products, select exchange **Gate**, market type **Spot**, and product type **Direct Equity** (shown as **Exchange stock** in the English UI; API value <code>direct_equity</code>), then search <code>00700</code> or <code>AAPL</code>. Select the exact product returned by the catalog.
+
+Other venues expose different contracts. Binance Hong Kong equities are derivatives such as a catalog-confirmed <code>Crypto:HK0700/USDT@binance:swap</code>, recorded as <code>stock_perpetual / swap / swap</code> with a Hong Kong underlying when authoritative metadata identifies it. They are not Gate direct equities and do not represent direct share ownership. OKX and Bybit may expose <code>tokenized_equity / spot / spot</code> and <code>stock_perpetual / swap / swap</code>; Bitget Reality uses <code>tokenized_equity / spot / reality</code> and also supports catalog-confirmed stock perpetuals. HTX equity products remain disabled until an authoritative product marker and execution contract are available.
+
+Never infer these products from a ticker alone. Product discovery must return the venue, market type, product type, API family, native instrument ID, currency, and any underlying identity. Preserve exactly what the catalog returns. If the underlying region is unknown or unsupported, factor and fundamental data remain unavailable rather than being guessed as US equity data.
+
+For research, factor screening, or trading through a traditional securities account, add <code>HKStock:00700.HK</code> under Hong Kong stocks or <code>USStock:AAPL</code> under US stocks. These are different execution identities: an ordinary HKStock or USStock instrument cannot be submitted directly to a Gate account. Do not silently convert a research instrument into an exchange order.
+
+Keep the selected exchange identifier in the universe, history requests, and orders. Preserve <code>00700/HKD</code>, <code>AAPL/USD</code>, or the exact catalog-confirmed perpetual symbol; do not remove leading zeros, substitute a currency, replace the identifier with its underlying stock, or switch venues/API families. Exchange spot equities remain long-only and cannot call <code>allow_leverage</code>. Equity perpetuals follow the Crypto swap contract: declare direction metadata, pass <code>position_side</code> on position/order calls, and enable leverage only through <code>context.allow_leverage(max_leverage=N)</code>.
+
+The active product catalog determines whether an exchange instrument is a direct equity, tokenized equity, stock perpetual, or ordinary crypto product. Ticker spelling alone is insufficient. A history adapter may use a catalog-confirmed underlying equity market while preserving the execution identity. Strategy code must use Strategy API V2 helpers, not directly call exchange, broker, or data-provider APIs. Compilation does not establish live eligibility: deployment also validates the catalog, product/API family, venue, account, trading status, sizing rules, and currency.
+
+~~~python
+"""Gate Hong Kong Equity SMA Example
+Uses the selected Gate stock instrument with bounded long-only exposure.
+"""
+
+def initialize(context):
+    g.symbol = "Crypto:00700/HKD@gate:spot"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1d")
+    context.set_warmup(30)
+    context.set_metadata(direction_mode="long_only")
+
+def handle_data(context, data):
+    bars = get_history(21, "1d", "close", g.symbol)
+    if len(bars) < 20:
+        return
+    bullish = float(bars["close"].iloc[-1]) > float(bars["close"].tail(20).mean())
+    position = get_position(g.symbol)
+    if bullish and position.amount <= 0:
+        order_target_percent(g.symbol, 0.2, reason="sma_entry", stop_loss_pct=0.03)
+    elif not bullish and position.amount > 0:
+        order_target_percent(g.symbol, 0.0, reason="sma_exit")
+~~~
 
 ---
 
@@ -446,6 +496,8 @@ fundamentals = get_fundamentals(
 ~~~
 
 Other public aliases include <code>REVENUE_GROWTH</code>, <code>DEBT_TO_EQUITY</code>, and <code>FREE_CASH_FLOW</code>. Use only real point-in-time fields supported by the platform; do not invent fields or read future reports.
+
+US and Hong Kong equity universes support persisted current snapshots and historical quarterly imports. An exchange-routed stock such as <code>Crypto:00700/HKD@gate:spot</code> reads point-in-time fundamentals from its underlying <code>HKStock:00700</code> identity while retaining the exact Gate product for live orders.
 
 Pass a symbol to <code>factor</code>/<code>indicator</code> in a multi-asset strategy. The symbol may be omitted only when the data portal has exactly one instrument.
 
@@ -871,11 +923,15 @@ Current live-account boundaries:
 
 | Market | Supported live venues | Product boundary |
 | --- | --- | --- |
-| Crypto | Binance, Bitget, Bybit, OKX, Gate, HTX | spot and swap according to venue/account capability |
+| Crypto | Binance, Bitget, Bybit, OKX, Gate, HTX | ordinary spot and swap according to venue/account capability |
+| Exchange direct equities | Gate stock channel | <code>direct_equity / spot / stock</code>; US and Hong Kong products retain the exact catalog currency and are long-only |
+| Exchange tokenized equities | OKX, Bybit, Bitget Reality | OKX/Bybit use <code>tokenized_equity / spot / spot</code>; Bitget uses <code>tokenized_equity / spot / reality</code>; exact catalog product and regional availability required |
+| Exchange equity perpetuals | Binance, OKX, Bitget, Bybit, Gate | <code>stock_perpetual / swap / swap</code>; derivative exposure, Crypto swap direction/leverage rules, and exact native contract required |
+| Unverified exchange equities | HTX | rejected until authoritative product metadata and an execution API family are verified |
 | USStock | Alpaca, IBKR | current broker policy is long-only |
 | Other parsed markets | none | backtest/data availability does not imply live support |
 
-Mixed-market live deployment is unsupported. Other markets cannot be forced through a mismatched credential.
+Mixed-market live deployment is unsupported. Other markets cannot be forced through a mismatched credential. A live allocation must also keep a compatible quote/settlement currency and API family; do not combine HKD Gate direct equities with USDT equity perpetuals merely because both refer to Hong Kong companies.
 
 ### Position ownership, reconciliation, and account risk
 

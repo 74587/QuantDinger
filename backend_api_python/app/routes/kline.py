@@ -113,7 +113,10 @@ def get_kline():
         
         policy = _guard_policy(timeframe, limit, before_time)
         klines = guarded_cached(
-            cache_key("indicator_kline", market, symbol, timeframe, limit, before_time or "", exchange_id or "", market_type or ""),
+            cache_key(
+                "indicator_kline", market, symbol, timeframe, limit, before_time or "",
+                exchange_id or "", market_type or "", instrument_id,
+            ),
             lambda: kline_service.get_kline(
                 market=market,
                 symbol=symbol,
@@ -121,7 +124,8 @@ def get_kline():
                 limit=limit,
                 before_time=before_time,
                 exchange_id=exchange_id,
-                market_type=market_type
+                market_type=market_type,
+                instrument_id=instrument_id,
             ),
             ttl_sec=policy['ttl_sec'],
             stale_ttl_sec=policy['stale_ttl_sec'],

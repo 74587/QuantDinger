@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from app.services.script_source import get_script_source_service
-from app.services.live_trading.capabilities import supported_crypto_exchange_ids
+from app.services.live_trading.capabilities import (
+    supported_crypto_exchange_ids,
+    supports_equity_product,
+)
+from app.services.market.instrument_products import PRODUCT_CRYPTO
+from app.services.market.product_catalog import get_catalog_product
 from app.services.strategy_direction import (
     direction_mode_position_side,
     normalize_direction_mode,
@@ -47,6 +53,23 @@ class StrategyV2DeploymentService:
         if execution_mode == "live" and not exchange_id:
             raise StrategyV2ContractError("strategyV2.credentialRequired")
         self._validate_execution_account(manifest.markets, exchange_id, execution_mode)
+        live_instruments = self._resolve_live_instruments(
+            user_id=user_id,
+            manifest=manifest,
+            execution_mode=execution_mode,
+        )
+        instrument_products = self._validate_manifest_products(
+            manifest.metadata(), exchange_id, execution_mode,
+            instruments=live_instruments,
+        )
+        quote_currency = self._validate_live_quote_currency(
+            markets=manifest.markets,
+            instruments=live_instruments or (
+                (manifest.metadata().get("universe") or {}).get("instruments") or []
+            ),
+            products=instrument_products,
+            execution_mode=execution_mode,
+        )
 
         leverage_enabled = bool(payload.get("leverageEnabled"))
         leverage = float(payload.get("leverage") or 1)
@@ -203,6 +226,10 @@ class StrategyV2DeploymentService:
         resolved_bot_type = resolve_bot_type(source, runtime_config)
         if resolved_bot_type:
             runtime_config["bot_type"] = resolved_bot_type
+        self._validate_bot_product_compatibility(
+            bot_type=str(runtime_config.get("bot_type") or ""),
+            instrument_products=instrument_products,
+        )
         self._normalize_grid_runtime_budget(runtime_config)
         if str(runtime_config.get("bot_type") or "").strip().lower() == "grid":
             runtime_config["position_ledger"] = "fills"
@@ -219,6 +246,8 @@ class StrategyV2DeploymentService:
             "direction_mode": direction_mode,
             "position_side": position_side,
             "account_risk": dict(account_risk),
+            "instrument_products": instrument_products,
+            "quote_currency": quote_currency,
         })
         market_category = manifest.markets[0] if len(manifest.markets) == 1 else "Mixed"
         exchange_config = {"credential_id": credential_id, "exchange_id": exchange_id} if credential_id else {}
@@ -352,6 +381,153 @@ class StrategyV2DeploymentService:
             raise StrategyV2ContractError("strategyV2.stockCredentialRequired")
         if market not in {"Crypto", "USStock"}:
             raise StrategyV2ContractError("strategyV2.liveMarketUnsupported")
+
+    @staticmethod
+    def _validate_manifest_products(
+        manifest: dict[str, Any], exchange_id: str, execution_mode: str,
+        *, instruments: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if execution_mode != "live":
+            return []
+        instruments = instruments if instruments is not None else (
+            (manifest.get("universe") or {}).get("instruments") or []
+        )
+        products: list[dict[str, Any]] = []
+        for item in instruments:
+            if str(item.get("market") or "") != "Crypto":
+                continue
+            declared_exchange = str(item.get("exchange_id") or "").strip().lower()
+            if declared_exchange and declared_exchange != exchange_id:
+                raise StrategyV2ContractError("strategyV2.instrumentVenueMismatch")
+            venue = declared_exchange or exchange_id
+            market_type = str(item.get("market_type") or "spot").strip().lower()
+            symbol = str(item.get("symbol") or "").strip().upper()
+            product = get_catalog_product(
+                market="Crypto",
+                symbol=symbol,
+                exchange_id=venue,
+                market_type=market_type,
+            )
+            if not product:
+                continue
+            product_type = str(product.get("product_type") or PRODUCT_CRYPTO).strip().lower()
+            if product_type != PRODUCT_CRYPTO:
+                if not declared_exchange:
+                    raise StrategyV2ContractError("strategyV2.equityProductVenueRequired")
+                if not supports_equity_product(
+                    venue,
+                    product_type,
+                    market_type,
+                    str(product.get("api_family") or market_type),
+                ):
+                    raise StrategyV2ContractError("strategyV2.equityProductUnsupported")
+            products.append({
+                "market": "Crypto",
+                "symbol": symbol,
+                "exchange_id": venue,
+                "market_type": market_type,
+                "instrument_id": str(product.get("instrument_id") or ""),
+                "product_type": product_type,
+                "api_family": str(product.get("api_family") or market_type),
+                "underlying_market": str(product.get("underlying_market") or ""),
+                "underlying_symbol": str(product.get("underlying_symbol") or ""),
+                "product_meta": dict(product.get("product_meta") or {}),
+            })
+        deduped: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in products:
+            key = (
+                str(item.get("symbol") or "").upper(),
+                str(item.get("exchange_id") or "").lower(),
+                str(item.get("market_type") or "spot").lower(),
+            )
+            deduped[key] = item
+        return list(deduped.values())
+
+    @staticmethod
+    def _resolve_live_instruments(
+        *, user_id: int, manifest: Any, execution_mode: str,
+    ) -> list[dict[str, Any]] | None:
+        if execution_mode != "live" or getattr(manifest.universe, "kind", "static") == "static":
+            return None
+        from app.services.strategy_v2.service import StrategyV2BacktestService
+
+        now = datetime.now(timezone.utc)
+        candidates, _ = StrategyV2BacktestService().resolve_candidates(
+            user_id=int(user_id),
+            manifest=manifest,
+            start_date=now,
+            end_date=now,
+        )
+        return candidates
+
+    @staticmethod
+    def _validate_live_quote_currency(
+        *,
+        markets: tuple[str, ...],
+        instruments: list[dict[str, Any]] | None,
+        products: list[dict[str, Any]],
+        execution_mode: str,
+    ) -> str:
+        if execution_mode != "live":
+            return ""
+        currencies: set[str] = set()
+        product_index = {
+            (
+                str(item.get("symbol") or "").strip().upper(),
+                str(item.get("exchange_id") or "").strip().lower(),
+                str(item.get("market_type") or "spot").strip().lower(),
+            ): item
+            for item in products
+            if isinstance(item, dict)
+        }
+        source = instruments or []
+        for item in source:
+            market = str(item.get("market") or "").strip()
+            if market == "USStock":
+                currencies.add("USD")
+                continue
+            if market == "HKStock":
+                currencies.add("HKD")
+                continue
+            if market != "Crypto":
+                continue
+            symbol = str(item.get("symbol") or "").strip().upper()
+            product = product_index.get((
+                symbol,
+                str(item.get("exchange_id") or "").strip().lower(),
+                str(item.get("market_type") or "spot").strip().lower(),
+            )) or {}
+            meta = product.get("product_meta") if isinstance(product.get("product_meta"), dict) else {}
+            currency = str(
+                meta.get("settlement_currency")
+                or meta.get("quote_currency")
+                or product.get("settle_currency")
+                or (symbol.rsplit("/", 1)[1] if "/" in symbol else "")
+            ).strip().upper()
+            if currency:
+                currencies.add(currency)
+        if not source and len(markets) == 1:
+            market = str(markets[0])
+            if market == "USStock":
+                currencies.add("USD")
+            elif market == "HKStock":
+                currencies.add("HKD")
+        if len(currencies) > 1:
+            raise StrategyV2ContractError("strategyV2.mixedQuoteCurrencyLiveUnsupported")
+        return next(iter(currencies), "USDT")
+
+    @staticmethod
+    def _validate_bot_product_compatibility(
+        *, bot_type: str, instrument_products: list[dict[str, Any]],
+    ) -> None:
+        if str(bot_type or "").strip().lower() != "grid":
+            return
+        if any(
+            str(item.get("api_family") or "").strip().lower() == "stock"
+            for item in instrument_products
+            if isinstance(item, dict)
+        ):
+            raise StrategyV2ContractError("strategyV2.equityRobotUnsupported")
 
     @staticmethod
     def _manifest_symbol(manifest: dict[str, Any]) -> str:

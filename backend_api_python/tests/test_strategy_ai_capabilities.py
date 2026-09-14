@@ -1,6 +1,8 @@
+import ast
+
 import pytest
 
-from app.services.strategy_ai_capabilities import resolve_strategy_generation_intent
+from app.services.strategy_ai_capabilities import resolve_strategy_generation_intent, _validate_history_window_clock
 from app.services.strategy_ai_generation import (
     build_strategy_generation_request,
     build_strategy_system_prompt,
@@ -8,6 +10,73 @@ from app.services.strategy_ai_generation import (
 )
 from app.services.strategy_authoring import get_strategy_authoring_contract
 from app.services.strategy_v2 import StrategyV2ContractError
+
+
+@pytest.mark.parametrize("structured_request", [False, True])
+def test_indicator_conversion_ignores_template_and_visual_source_capabilities(structured_request):
+    request = "Add a stop loss"
+    prompt = (
+        "Optional leverage for a Crypto @swap strategy.\n"
+        "Default to long-only unless requested otherwise.\n"
+        "Do not generate grid, DCA, or martingale logic.\n"
+        f"User conversion request:\n{request}\n"
+        "Indicator source code:\n```python\n"
+        "# supertrend marker in both directions\n```"
+    )
+    context = {
+        "source": "indicator_ide_conversion",
+        "instrument": "Crypto:SOL/USDT@spot",
+        "timeframe": "1d",
+    }
+    if structured_request:
+        context["conversionRequest"] = request
+    intent = resolve_strategy_generation_intent(prompt=prompt, context=context)
+    assert intent.capabilities == ("protection",)
+    assert intent.requested_direction_mode == ""
+    assert intent.required_factor_ids == ()
+
+
+def test_indicator_conversion_preserves_explicit_capability_requests():
+    intent = resolve_strategy_generation_intent(
+        prompt="Conversion template",
+        context={
+            "source": "indicator_ide_conversion",
+            "conversionRequest": "Build a grid with long and short and stop loss",
+            "instrument": "Crypto:SOL/USDT@swap",
+        },
+    )
+    assert intent.requested_direction_mode == "both"
+    assert {"crypto_swap", "bidirectional", "protection", "persistent_state", "order_lifecycle"} <= set(intent.capabilities)
+
+
+@pytest.mark.parametrize("history", ['data.history("Crypto:SOL/USDT@spot", count=35)', 'get_history(35, "1d", "close", "Crypto:SOL/USDT@spot")'])
+def test_rolling_history_length_cannot_drive_persistent_cooldown(history):
+    source = f'''
+def handle_data(context, data):
+    bars = {history}
+    closes = bars["close"]
+    bar_index = len(closes) - 1
+    if bar_index - g.last_exit_bar < 2:
+        return
+    g.last_exit_bar = bar_index
+'''
+    with pytest.raises(StrategyV2ContractError, match="aiHistoryWindowClockUnsupported"):
+        _validate_history_window_clock(ast.parse(source))
+
+
+def test_history_warmup_check_and_advancing_clock_remain_valid():
+    _validate_history_window_clock(ast.parse('''
+def handle_data(context, data):
+    bars = data.history("Crypto:SOL/USDT@spot", count=35)
+    if len(bars) < 35:
+        return
+    if g.last_bar != context.current_dt:
+        g.bar_count += 1
+        g.last_bar = context.current_dt
+    if g.bar_count - g.last_exit_bar < 2:
+        return
+    g.last_exit_bar = g.bar_count
+'''))
 
 
 def _swap_source(*, direction_mode: str = "both", body: str = "    pass") -> str:
@@ -293,7 +362,8 @@ def test_requested_direction_must_match_manifest():
         )
 
 
-def test_requested_protection_requires_executable_native_protection():
+@pytest.mark.parametrize("risk_request", ["增加 3% 止损", "增加风控", "增加風控", "Add risk controls", "Add risk management"])
+def test_requested_protection_requires_executable_native_protection(risk_request):
     source = '''"""SPY Protection Test"""
 
 def initialize(context):
@@ -310,14 +380,31 @@ def handle_data(context, data):
         validate_generated_strategy(
             source,
             asset_type="script",
-            prompt="增加 3% 止损",
+            prompt=risk_request,
         )
 
     protected = source.replace(
         'reason="entry")',
         'reason="entry", stop_loss_pct=0.03)',
     )
-    validate_generated_strategy(protected, asset_type="script", prompt="增加 3% 止损")
+    validate_generated_strategy(protected, asset_type="script", prompt=risk_request)
+
+
+def test_conversion_risk_request_activates_native_contract_without_template_capabilities():
+    system, intent = build_strategy_system_prompt(
+        prompt="Do not generate grid or DCA; optional Crypto @swap leverage.",
+        asset_type="script",
+        generation_mode="indicator_conversion",
+        context={
+            "source": "indicator_ide_conversion",
+            "conversionRequest": "增加风控",
+            "instrument": "Crypto:SOL/USDT@spot",
+        },
+    )
+    assert intent.capabilities == ("protection",)
+    assert "## Native position protection" in system
+    assert "`0.03` means 3%" in system
+    assert "inside an executable handler/callback" in system
 
 
 @pytest.mark.parametrize(
@@ -656,7 +743,7 @@ def test_persistence_flag_must_be_declared_at_module_scope():
 def test_external_authoring_contract_exports_same_capability_catalog():
     contract = get_strategy_authoring_contract()
 
-    assert contract["version"] == "strategy-api-v2-capability-packs-2026-09"
+    assert contract["version"] == "strategy-api-v2-exchange-equities-2026-09"
     assert contract["direction_modes"]["bidirectional"] == "both"
     assert set(contract["direction_modes"]["allowed"]) == {
         "long_only",

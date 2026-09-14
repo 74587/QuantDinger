@@ -36,6 +36,13 @@ def _backtest_time_iso(value: Any) -> str:
     return _cached_backtest_time_iso(pd.Timestamp(value))
 
 
+def _utc_naive_timestamp(value: Any) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    return timestamp
+
+
 @lru_cache(maxsize=8192)
 def _cached_backtest_time_iso(timestamp: pd.Timestamp) -> str:
     if timestamp.tzinfo is None:
@@ -1745,9 +1752,9 @@ class StrategyV2BacktestRunner:
     def run(self, *, start_date: Any = None, end_date: Any = None) -> dict[str, Any]:
         timestamps = self.portal.timestamps
         if start_date is not None:
-            timestamps = timestamps[timestamps >= pd.Timestamp(start_date)]
+            timestamps = timestamps[timestamps >= _utc_naive_timestamp(start_date)]
         if end_date is not None:
-            timestamps = timestamps[timestamps <= pd.Timestamp(end_date)]
+            timestamps = timestamps[timestamps <= _utc_naive_timestamp(end_date)]
         if timestamps.empty:
             raise StrategyV2ContractError("strategyV2.backtestRangeEmpty")
 
@@ -1765,9 +1772,6 @@ class StrategyV2BacktestRunner:
             if pending_orders:
                 pending_orders = self.broker.execute(pending_orders, self.portal, timestamp)
                 self._sync_order_statuses()
-            protection_decisions = self.broker.process_protections(self.portal, timestamp)
-            for decision in protection_decisions:
-                self.context.set_last_exit_reason(decision.symbol, decision.reason)
 
             self._invoke("before_trading_start", self.context, self.context.data)
             pending_orders = self._remove_cancelled_orders(pending_orders)
@@ -1792,6 +1796,13 @@ class StrategyV2BacktestRunner:
                     self.broker.execute(opening_orders, self.portal, timestamp),
                 )
                 self._sync_order_statuses()
+
+            # Opening decisions must precede intrabar protection outcomes.
+            # Include newly opened positions in this bar's protection pass.
+            protection_decisions = self.broker.process_protections(self.portal, timestamp)
+            self._sync_order_statuses()
+            for decision in protection_decisions:
+                self.context.set_last_exit_reason(decision.symbol, decision.reason)
 
             self.portal.set_clock(timestamp, include_current=True)
             if self.broker.liquidate_if_insolvent(self.portal, timestamp):

@@ -121,6 +121,20 @@ class TradingExecutor:
         )
 
         trading_config = _json_object(strategy.get("trading_config"))
+        from app.services.exchange_execution import resolve_exchange_config
+        from app.services.market.product_catalog import validate_runtime_products
+
+        exchange_config = resolve_exchange_config(
+            _json_object(strategy.get("exchange_config")),
+            user_id=user_id,
+        )
+        exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
+        validate_runtime_products(
+            trading_config.get("instrument_products")
+            if isinstance(trading_config.get("instrument_products"), list)
+            else [],
+            credential_exchange_id=exchange_id,
+        )
         market_type = str(
             strategy.get("market_type")
             or trading_config.get("market_type")
@@ -150,14 +164,8 @@ class TradingExecutor:
         if not direction_mode:
             raise RuntimeError("strategyV2.directionModeRequired")
 
-        from app.services.exchange_execution import resolve_exchange_config
         from app.services.grid.exchange_requirements import detect_hedge_position_mode
         from app.services.live_trading.factory import create_client
-
-        exchange_config = resolve_exchange_config(
-            _json_object(strategy.get("exchange_config")),
-            user_id=user_id,
-        )
         client = create_client(exchange_config, market_type=market_type)
         is_hedge, label = detect_hedge_position_mode(
             client,
@@ -365,11 +373,26 @@ class TradingExecutor:
                     if member.get("market") == "Crypto":
                         member["exchange_id"] = account_exchange
                         member["key"] = _member_key(member)
+                from app.services.pending_orders.live_order_support import (
+                    attach_instrument_product_contracts,
+                )
+
+                attach_instrument_product_contracts(
+                    candidates,
+                    trading_config,
+                    exchange_id=account_exchange,
+                )
 
             frequency = program.manifest.driving_frequency
 
             def fetch_runtime_frames() -> dict[str, dict[str, pd.DataFrame]]:
                 refresh_members(service, candidates, program.manifest, user_id, strategy_id, datetime.now(timezone.utc), account_exchange)
+                if execution_mode == "live" and account_exchange:
+                    attach_instrument_product_contracts(
+                        candidates,
+                        trading_config,
+                        exchange_id=account_exchange,
+                    )
                 return load_live_frequency_frames(
                     service=service,
                     candidates=candidates,
@@ -391,6 +414,10 @@ class TradingExecutor:
                     universe_id,
                     as_of=timestamp.date(),
                 )
+                if account_exchange:
+                    for item in members:
+                        if item.get("market") == "Crypto":
+                            item["exchange_id"] = account_exchange
                 return [_member_key(item) for item in members]
 
             frequency_frames = fetch_runtime_frames()
@@ -1270,6 +1297,7 @@ class TradingExecutor:
         from app.services.grid.runner import GridRestingRunner
         from app.services.live_trading.account_configuration import configure_derivatives_account
         from app.services.live_trading.factory import create_client
+        from app.services.pending_orders.live_order_support import bind_instrument_product_contract
 
         symbol = str(primary.get("symbol") or "")
         market_type = str(primary.get("market_type") or "swap").strip().lower()
@@ -1280,11 +1308,18 @@ class TradingExecutor:
             trading_config.get("margin_mode") or trading_config.get("marginMode") or "cross"
         )
         client_holder: Dict[str, Any] = {}
+        bound_exchange_config = bind_instrument_product_contract(
+            exchange_config,
+            trading_config,
+            symbol=symbol,
+            exchange_id=exchange_id,
+            market_type=market_type,
+        )
 
         def create_grid_client():
             client = client_holder.get("client")
             if client is None:
-                client = create_client(exchange_config, market_type=market_type)
+                client = create_client(bound_exchange_config, market_type=market_type)
                 if market_type == "swap":
                     configure_derivatives_account(
                         client,
@@ -1313,7 +1348,7 @@ class TradingExecutor:
                 execution_mode="live",
                 notification_config=notification_config,
                 trading_config=trading_config,
-                exchange_config=exchange_config,
+            exchange_config=exchange_config,
                 signal_reason=str(reason or "grid"),
                 signal_ts=int(time.time()),
                 strategy_run_id=strategy_run_id,
@@ -1355,7 +1390,7 @@ class TradingExecutor:
             strategy_id,
             symbol,
             runtime_grid_config,
-            exchange_config,
+            bound_exchange_config,
             user_id=int((self._load_strategy(strategy_id) or {}).get("user_id") or 1),
             initial_capital=initial_capital,
             enqueue_market_fn=enqueue_market,
@@ -1378,7 +1413,7 @@ class TradingExecutor:
             instruments=candidates,
             rest_fallback=lambda: self._execution_account_prices(
                 candidates,
-                exchange_config,
+                bound_exchange_config,
                 client_holder,
             ),
         )
@@ -2126,27 +2161,37 @@ class TradingExecutor:
         client_holder: dict[str, Any],
     ) -> dict[str, float]:
         prices = cls._live_prices(candidates)
-        try:
-            from app.services.live_trading.factory import create_client
-            from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id
+        from app.services.live_trading.factory import create_client
+        from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id
 
-            market_type = str((candidates[0] if candidates else {}).get("market_type") or "swap")
-            client = client_holder.get("client")
-            if client is None:
-                client = create_client(exchange_config, market_type=market_type)
-                client_holder["client"] = client
-            exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
-            for member in candidates:
-                if str(member.get("market") or "") != "Crypto":
-                    continue
-                symbol = str(member.get("symbol") or "")
+        exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
+        for member in candidates:
+            if str(member.get("market") or "") != "Crypto":
+                continue
+            symbol = str(member.get("symbol") or "")
+            market_type = str(member.get("market_type") or "swap").strip().lower()
+            api_family = str(member.get("api_family") or market_type).strip().lower()
+            instrument_id = str(member.get("instrument_id") or "").strip()
+            client_key = f"{market_type}:{api_family}:{instrument_id}"
+            try:
+                client = client_holder.get(client_key)
+                if client is None:
+                    client_config = dict(exchange_config)
+                    client_config["api_family"] = api_family
+                    if instrument_id:
+                        client_config["instrument_id"] = instrument_id
+                    client = create_client(client_config, market_type=market_type)
+                    client_holder[client_key] = client
                 price = 0.0
                 if hasattr(client, "get_mark_price"):
                     price = float(client.get_mark_price(symbol=symbol) or 0.0)
                 elif hasattr(client, "get_ticker"):
                     if exchange_id == "okx":
-                        is_spot = str(member.get("market_type") or "").lower() == "spot"
-                        inst_id = to_okx_spot_inst_id(symbol) if is_spot else to_okx_swap_inst_id(symbol)
+                        inst_id = (
+                            to_okx_spot_inst_id(symbol)
+                            if market_type == "spot"
+                            else to_okx_swap_inst_id(symbol)
+                        )
                         ticker = client.get_ticker(inst_id=inst_id)
                     else:
                         ticker = client.get_ticker(symbol=symbol)
@@ -2163,8 +2208,14 @@ class TradingExecutor:
                         )
                 if price > 0:
                     prices[str(member.get("key") or "")] = price
-        except Exception as exc:
-            logger.warning("Execution-account price fetch failed: %s", exc)
+            except Exception as exc:
+                logger.warning(
+                    "Execution-account price fetch failed for %s/%s/%s: %s",
+                    exchange_id,
+                    market_type,
+                    instrument_id or symbol,
+                    exc,
+                )
         return prices
 
     @staticmethod

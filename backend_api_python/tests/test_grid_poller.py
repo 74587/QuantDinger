@@ -210,8 +210,8 @@ def test_poller_persists_authoritative_zero_fee():
         1.0,
         100.0,
         commission=0.0,
-        commission_ccy="",
-        commission_quote=None,
+        commission_ccy="USDT",
+        commission_quote=0.0,
         fee_status="actual_zero",
         fee_source="rest",
     )

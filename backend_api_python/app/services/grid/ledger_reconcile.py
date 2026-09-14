@@ -99,6 +99,7 @@ def clear_phantom_grid_ledger(
     from app.services.grid.exchange_requirements import fetch_exchange_dual_leg_snapshot
     from app.services.grid.runtime_state import persist_grid_resting_state
     from app.services.live_trading.factory import create_client
+    from app.services.pending_orders.live_order_support import bind_instrument_product_contract
     from app.services.live_trading.records import rebuild_positions_from_trades
     from app.utils.db import get_db_connection
 
@@ -127,6 +128,13 @@ def clear_phantom_grid_ledger(
     user_id = int(sc.get("user_id") or 1)
     ex_cfg = resolve_exchange_config(sc.get("exchange_config") or {}, user_id=user_id)
     mt = str(tc.get("market_type") or "swap").strip().lower()
+    ex_cfg = bind_instrument_product_contract(
+        ex_cfg,
+        tc,
+        symbol=symbol,
+        exchange_id=str(ex_cfg.get("exchange_id") or ""),
+        market_type=mt,
+    )
 
     exchange_snapshot = None
     try:

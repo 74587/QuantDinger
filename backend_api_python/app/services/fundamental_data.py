@@ -79,9 +79,11 @@ class FundamentalDataService:
             symbol = str(item.get("symbol") or "").upper()
             market = str(item.get("market") or "")
             key = str(item.get("key") or "")
-            identities[symbol] = (market, symbol)
+            fundamental_market = str(item.get("underlying_market") or market)
+            fundamental_symbol = str(item.get("underlying_symbol") or symbol).upper()
+            identities[symbol] = (fundamental_market, fundamental_symbol)
             if key:
-                identities[key] = (market, symbol)
+                identities[key] = (fundamental_market, fundamental_symbol)
         output = {}
         for key, frame in frames.items():
             market, symbol = identities.get(key, identities.get(str(key).upper(), ("", str(key))))
@@ -393,12 +395,14 @@ class FundamentalDataService:
     def sync_history(self, *, market: str, symbol: str) -> dict[str, Any]:
         normalized_market = str(market or "").strip()
         normalized_symbol = str(symbol or "").strip().upper()
-        if normalized_market != "USStock" or not normalized_symbol:
+        if normalized_market not in {"USStock", "HKStock"} or not normalized_symbol:
             raise ValueError("factor.fundamentalHistoryMarketUnsupported")
 
         import yfinance as yf
 
-        ticker = yf.Ticker(normalized_symbol)
+        provider_symbol = _yfinance_history_symbol(normalized_market, normalized_symbol)
+        ticker = yf.Ticker(provider_symbol)
+        quote_currency, financial_currency = _ticker_currencies(ticker)
         income = ticker.quarterly_income_stmt
         balance = ticker.quarterly_balance_sheet
         cashflow = ticker.quarterly_cash_flow
@@ -419,6 +423,13 @@ class FundamentalDataService:
             start=(periods[0] + pd.Timedelta(days=1)).date().isoformat(),
             end=(date.today() + timedelta(days=1)).isoformat(),
             auto_adjust=False,
+        )
+        fx_prices = _currency_history(
+            yf,
+            financial_currency,
+            quote_currency,
+            start=(periods[0] + pd.Timedelta(days=1)).date(),
+            end=date.today() + timedelta(days=1),
         )
         stored = 0
         stored_dates = []
@@ -452,7 +463,21 @@ class FundamentalDataService:
             ) or _statement_value(income, period, "Diluted Average Shares", "Basic Average Shares")
             free_cash_flow = _statement_value(cashflow, period, "Free Cash Flow")
             close = _close_as_of(prices, available_at)
+            fx_rate = _close_as_of(fx_prices, available_at)
+            conversion_required = bool(
+                quote_currency and financial_currency and quote_currency != financial_currency
+            )
+            conversion_available = not conversion_required or fx_rate is not None
+            if conversion_required and fx_rate is not None:
+                revenue = _scale_value(revenue, fx_rate)
+                net_income = _scale_value(net_income, fx_rate)
+                net_income_ttm = _scale_value(net_income_ttm, fx_rate)
+                equity = _scale_value(equity, fx_rate)
+                debt = _scale_value(debt, fx_rate)
+                free_cash_flow = _scale_value(free_cash_flow, fx_rate)
             market_cap = close * shares if close is not None and shares is not None else None
+            if conversion_required and not conversion_available:
+                market_cap = None
             annual_income = net_income_ttm if net_income_ttm is not None else net_income * 4.0 if net_income is not None else None
             roe = annual_income / equity if annual_income is not None and equity not in (None, 0.0) else None
             pe_ratio = market_cap / net_income_ttm if market_cap is not None and net_income_ttm not in (None, 0.0) else None
@@ -463,6 +488,7 @@ class FundamentalDataService:
                 "period_end": period.date(),
                 "available_at": available_at,
                 "frequency": "quarterly",
+                "currency": quote_currency or financial_currency,
                 "revenue": revenue,
                 "net_income": net_income,
                 "net_income_ttm": net_income_ttm,
@@ -483,6 +509,14 @@ class FundamentalDataService:
                     "pointInTime": True,
                     "availabilitySource": availability_source,
                     "marketCapMethod": "close_on_or_before_available_at_x_reported_shares",
+                    "quoteCurrency": quote_currency or None,
+                    "financialCurrency": financial_currency or None,
+                    "financialToQuoteFxRate": fx_rate if conversion_required else 1.0,
+                    "currencyConversion": (
+                        "financial_to_quote"
+                        if conversion_required and conversion_available
+                        else "unavailable" if conversion_required else "not_required"
+                    ),
                 },
             }
             if any(_finite_or_none(payload.get(field)) is not None for field in FUNDAMENTAL_FIELDS):
@@ -494,10 +528,74 @@ class FundamentalDataService:
         return {
             "market": normalized_market,
             "symbol": normalized_symbol,
+            "providerSymbol": provider_symbol,
             "observations": stored,
             "firstAvailableAt": min(stored_dates).isoformat(),
             "lastAvailableAt": max(stored_dates).isoformat(),
         }
+
+
+def _yfinance_history_symbol(market: str, symbol: str) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if market != "HKStock":
+        return normalized
+    if normalized.endswith(".HK"):
+        normalized = normalized[:-3]
+    if normalized.startswith("HK") and normalized[2:].isdigit():
+        normalized = normalized[2:]
+    if normalized.isdigit():
+        return f"{str(int(normalized)).zfill(4)}.HK"
+    return normalized
+
+
+def _ticker_currencies(ticker: Any) -> tuple[str, str]:
+    try:
+        info = ticker.get_info()
+    except Exception:
+        try:
+            info = ticker.info
+        except Exception:
+            info = {}
+    info = info if isinstance(info, dict) else {}
+    return (
+        str(info.get("currency") or "").strip().upper(),
+        str(info.get("financialCurrency") or info.get("financial_currency") or "").strip().upper(),
+    )
+
+
+def _currency_history(
+    yf: Any,
+    financial_currency: str,
+    quote_currency: str,
+    *,
+    start: date,
+    end: date,
+) -> pd.DataFrame:
+    if not financial_currency or not quote_currency or financial_currency == quote_currency:
+        return pd.DataFrame()
+    try:
+        frame = yf.download(
+            f"{financial_currency}{quote_currency}=X",
+            start=start.isoformat(),
+            end=end.isoformat(),
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    if isinstance(frame.columns, pd.MultiIndex):
+        close_columns = [item for item in frame.columns if str(item[0]).lower() == "close"]
+        if not close_columns:
+            return pd.DataFrame()
+        return pd.DataFrame({"Close": frame[close_columns[0]]}, index=frame.index)
+    return frame if "Close" in frame.columns else pd.DataFrame()
+
+
+def _scale_value(value: float | None, rate: float) -> float | None:
+    return value * rate if value is not None else None
 
 
 def _mapping_value(value: Any) -> dict[str, Any]:

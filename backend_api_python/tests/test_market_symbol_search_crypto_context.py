@@ -41,6 +41,11 @@ def test_crypto_search_uses_matching_cached_catalog_without_live_lookup(monkeypa
             "instrument_id": "AAPL-USDT-SWAP",
             "settle_currency": "USDT",
             "asset_class": "equity",
+            "product_type": "crypto",
+            "api_family": "swap",
+            "underlying_market": "",
+            "underlying_symbol": "",
+            "product_meta": {},
         }
     ]
 

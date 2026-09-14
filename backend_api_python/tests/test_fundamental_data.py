@@ -49,3 +49,32 @@ def test_fundamentals_enter_panel_only_when_public_and_market_cap_can_be_derived
     assert enriched.loc["2026-01-05", "market_cap"] == 1_000
     assert enriched.loc["2026-01-10", "net_income"] == 60
     assert enriched.loc["2026-01-10", "market_cap"] == 1_100
+
+
+def test_exchange_equity_panel_uses_underlying_fundamental_identity(monkeypatch):
+    service = FundamentalDataService()
+    calls = []
+    frame = pd.DataFrame({"close": [500]}, index=pd.to_datetime(["2026-01-10"]))
+    monkeypatch.setattr(service, "ensure_schema", lambda: None)
+
+    def enrich_frame(*, market, symbol, frame):
+        calls.append((market, symbol))
+        return frame.assign(net_income=1)
+
+    monkeypatch.setattr(service, "enrich_frame", enrich_frame)
+    key = "Crypto:00700/HKD@gate:spot"
+    result = service.enrich_panel(
+        {key: frame},
+        [{
+            "key": key,
+            "market": "Crypto",
+            "symbol": "00700/HKD",
+            "exchange_id": "gate",
+            "market_type": "spot",
+            "underlying_market": "HKStock",
+            "underlying_symbol": "00700",
+        }],
+    )
+
+    assert calls == [("HKStock", "00700")]
+    assert result[key].iloc[-1]["net_income"] == 1

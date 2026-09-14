@@ -18,10 +18,37 @@ from app.services.fast_analysis_tasks import (
 from app.services.fast_analysis import get_fast_analysis_service
 from app.services.analysis_memory import get_analysis_memory
 from app.services.billing_service import get_billing_service
+from app.services.market.instrument_products import PRODUCT_CRYPTO
+from app.services.market.product_catalog import get_catalog_product
 
 logger = get_logger(__name__)
 
 fast_analysis_blp = Blueprint('fast_analysis', __name__)
+
+
+def _resolve_analysis_instrument(
+    *, market: str, symbol: str, exchange_id: str = '', market_type: str = '',
+    instrument_id: str = '',
+) -> tuple[str, str]:
+    if str(market or '').strip() != 'Crypto' or not str(exchange_id or '').strip():
+        return market, symbol
+    try:
+        product = get_catalog_product(
+            market='Crypto',
+            symbol=symbol,
+            exchange_id=exchange_id,
+            market_type=market_type or 'spot',
+            instrument_id=instrument_id,
+        )
+    except Exception:
+        return market, symbol
+    if not product or str(product.get('product_type') or PRODUCT_CRYPTO) == PRODUCT_CRYPTO:
+        return market, symbol
+    underlying_market = str(product.get('underlying_market') or '').strip()
+    underlying_symbol = str(product.get('underlying_symbol') or '').strip()
+    if underlying_market and underlying_symbol:
+        return underlying_market, underlying_symbol
+    return market, symbol
 
 
 def _professional_response_payload(result, credits_charged=0, remaining_credits=None):
@@ -64,6 +91,9 @@ def analyze():
         
         market = (data.get('market') or '').strip()
         symbol = (data.get('symbol') or '').strip()
+        exchange_id = (data.get('exchange_id') or data.get('exchangeId') or '').strip().lower()
+        market_type = (data.get('market_type') or data.get('marketType') or 'spot').strip().lower()
+        instrument_id = (data.get('instrument_id') or data.get('instrumentId') or '').strip()
         language = data.get('language', 'en-US')
         model = data.get('model')
         timeframe = data.get('timeframe', '1D')
@@ -76,6 +106,13 @@ def analyze():
                 'msg': 'market and symbol are required',
                 'data': None
             }), 400
+        market, symbol = _resolve_analysis_instrument(
+            market=market,
+            symbol=symbol,
+            exchange_id=exchange_id,
+            market_type=market_type,
+            instrument_id=instrument_id,
+        )
         if response_contract not in {'legacy', 'professional_report_v1'}:
             return jsonify({
                 'code': 0,

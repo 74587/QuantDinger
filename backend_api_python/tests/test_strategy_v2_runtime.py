@@ -83,6 +83,28 @@ def rebalance(context, data):
     assert result["finalEquity"] > 10000
 
 
+def test_backtest_range_accepts_timezone_aware_utc_boundaries():
+    runner = StrategyV2BacktestRunner(
+        code="""
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    pass
+""",
+        frames={"USStock:AAPL": _frame([100, 101, 102])},
+        initial_capital=10000,
+    )
+
+    result = runner.run(
+        start_date=pd.Timestamp("2026-01-02", tz="UTC"),
+        end_date=pd.Timestamp("2026-01-03", tz="UTC"),
+    )
+
+    assert len(result["equityCurve"]) == 2
+
+
 def test_result_distinguishes_total_return_from_peak_to_trough_drawdown():
     runner = StrategyV2BacktestRunner(
         code="""

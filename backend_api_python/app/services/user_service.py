@@ -48,7 +48,7 @@ def _seed_default_watchlist(db, user_id: int):
                 instrument_id, created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, '', NOW(), NOW())
-            ON CONFLICT (user_id, market, symbol) DO NOTHING
+            ON CONFLICT (user_id, market, symbol, exchange_id, market_type, instrument_id) DO NOTHING
             """,
             (user_id, market, symbol, name, "", "spot"),
         )

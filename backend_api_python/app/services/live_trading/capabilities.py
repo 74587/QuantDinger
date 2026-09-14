@@ -15,6 +15,8 @@ class VenueCapability:
     exchange_id: str
     market_types: FrozenSet[str]
     aliases: FrozenSet[str] = frozenset()
+    equity_product_types: FrozenSet[str] = frozenset()
+    equity_api_families: FrozenSet[tuple[str, str, str]] = frozenset()
 
     @property
     def supports_spot(self) -> bool:
@@ -26,11 +28,43 @@ class VenueCapability:
 
 
 CRYPTO_VENUE_CAPABILITIES: Dict[str, VenueCapability] = {
-    "binance": VenueCapability("binance", frozenset({"spot", "swap"})),
-    "okx": VenueCapability("okx", frozenset({"spot", "swap"})),
-    "bitget": VenueCapability("bitget", frozenset({"spot", "swap"})),
-    "bybit": VenueCapability("bybit", frozenset({"spot", "swap"})),
-    "gate": VenueCapability("gate", frozenset({"spot", "swap"})),
+    "binance": VenueCapability(
+        "binance", frozenset({"spot", "swap"}),
+        equity_product_types=frozenset({"stock_perpetual"}),
+        equity_api_families=frozenset({("stock_perpetual", "swap", "swap")}),
+    ),
+    "okx": VenueCapability(
+        "okx", frozenset({"spot", "swap"}),
+        equity_product_types=frozenset({"tokenized_equity", "stock_perpetual"}),
+        equity_api_families=frozenset({
+            ("tokenized_equity", "spot", "spot"),
+            ("stock_perpetual", "swap", "swap"),
+        }),
+    ),
+    "bitget": VenueCapability(
+        "bitget", frozenset({"spot", "swap"}),
+        equity_product_types=frozenset({"tokenized_equity", "stock_perpetual"}),
+        equity_api_families=frozenset({
+            ("tokenized_equity", "spot", "reality"),
+            ("stock_perpetual", "swap", "swap"),
+        }),
+    ),
+    "bybit": VenueCapability(
+        "bybit", frozenset({"spot", "swap"}),
+        equity_product_types=frozenset({"tokenized_equity", "stock_perpetual"}),
+        equity_api_families=frozenset({
+            ("tokenized_equity", "spot", "spot"),
+            ("stock_perpetual", "swap", "swap"),
+        }),
+    ),
+    "gate": VenueCapability(
+        "gate", frozenset({"spot", "swap"}),
+        equity_product_types=frozenset({"direct_equity", "stock_perpetual"}),
+        equity_api_families=frozenset({
+            ("direct_equity", "spot", "stock"),
+            ("stock_perpetual", "swap", "swap"),
+        }),
+    ),
     "htx": VenueCapability("htx", frozenset({"spot", "swap"})),
 }
 
@@ -60,6 +94,23 @@ def crypto_exchange_ids_for_market_type(market_type: str) -> Set[str]:
         for exchange_id, capability in CRYPTO_VENUE_CAPABILITIES.items()
         if mt in capability.market_types
     }
+
+
+def supports_equity_product(
+    exchange_id: str,
+    product_type: str,
+    market_type: str = "",
+    api_family: str = "",
+) -> bool:
+    capability = CRYPTO_VENUE_CAPABILITIES.get(canonical_exchange_id(exchange_id))
+    product = str(product_type or "").strip().lower()
+    if not capability or product not in capability.equity_product_types:
+        return False
+    if not market_type and not api_family:
+        return True
+    mt = normalize_market_type(market_type)
+    family = str(api_family or mt).strip().lower()
+    return (product, mt, family) in capability.equity_api_families
 
 
 def normalize_market_type(market_type: str) -> str:

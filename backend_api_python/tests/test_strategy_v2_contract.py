@@ -389,6 +389,24 @@ def handle_data(context, data):
     assert manifest.primary_frequency == "1h"
 
 
+def test_gate_hk_exchange_stock_keeps_canonical_live_identity():
+    code = """
+def initialize(context):
+    context.set_universe(["Crypto:00700/HKD@gate:spot"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    pass
+"""
+    instrument = compile_strategy_v2(code).manifest.universe.instruments[0]
+
+    assert instrument.key == "Crypto:00700/HKD@gate:spot"
+    assert instrument.market == "Crypto"
+    assert instrument.symbol == "00700/HKD"
+    assert instrument.exchange_id == "gate"
+    assert instrument.market_type == "spot"
+
+
 def test_manifest_declares_direction_capability_from_metadata():
     code = """
 def initialize(context):

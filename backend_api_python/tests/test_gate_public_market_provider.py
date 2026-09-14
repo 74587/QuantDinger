@@ -85,6 +85,30 @@ def test_kline_service_prefers_native_gate_spot_and_caches(monkeypatch):
     assert fallback_calls == []
 
 
+def test_kline_cache_separates_native_instrument_identity(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kline_module, "get_gate_spot_klines", lambda *_args: [])
+    monkeypatch.setattr(
+        kline_module.DataSourceFactory,
+        "get_kline",
+        lambda **kwargs: calls.append(kwargs) or [{"time": len(calls), "close": 1}],
+    )
+    service = kline_module.KlineService()
+    service.cache = _Cache()
+
+    first = service.get_kline(
+        "Crypto", "AAPL/USDT", "1D", 10,
+        exchange_id="gate", market_type="spot", instrument_id="AAPL_USDT",
+    )
+    second = service.get_kline(
+        "Crypto", "AAPL/USDT", "1D", 10,
+        exchange_id="gate", market_type="spot", instrument_id="AAPLX_USDT",
+    )
+
+    assert first != second
+    assert len(calls) == 2
+
+
 def test_kline_service_uses_native_path_when_default_exchange_is_gate(monkeypatch):
     native_calls = []
     rows = [{"time": 100, "open": 99, "high": 103, "low": 98, "close": 101, "volume": 10}]
@@ -124,3 +148,83 @@ def test_kline_service_falls_back_when_native_gate_is_unavailable(monkeypatch):
     assert service.get_kline(
         "Crypto", "BTC/USDT", "1D", 120, exchange_id="gate", market_type="spot"
     ) == fallback_rows
+
+
+def test_gate_direct_stock_kline_uses_underlying_equity_series(monkeypatch):
+    calls = []
+    rows = [{"time": 100, "open": 199, "high": 202, "low": 198, "close": 201, "volume": 10}]
+    monkeypatch.setattr(
+        kline_module,
+        "get_catalog_product",
+        lambda **kwargs: {
+            "product_type": "direct_equity",
+            "api_family": "stock",
+            "underlying_market": "USStock",
+            "underlying_symbol": "AAPL",
+        },
+    )
+    monkeypatch.setattr(
+        kline_module.DataSourceFactory,
+        "get_kline",
+        lambda **kwargs: calls.append(kwargs) or rows,
+    )
+    monkeypatch.setattr(
+        kline_module.DataSourceFactory,
+        "get_ticker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("crypto ticker must not be used")),
+    )
+    service = kline_module.KlineService()
+    service.cache = _Cache()
+
+    result = service.get_realtime_price(
+        "Crypto",
+        "AAPL/USD",
+        exchange_id="gate",
+        market_type="spot",
+        instrument_id="AAPL",
+    )
+
+    assert result["price"] == 201
+    assert calls[0]["market"] == "USStock"
+    assert calls[0]["symbol"] == "AAPL"
+
+
+def test_gate_hk_direct_stock_kline_uses_hk_equity_series(monkeypatch):
+    calls = []
+    rows = [{"time": 100, "open": 490, "high": 502, "low": 488, "close": 500, "volume": 10}]
+    monkeypatch.setattr(
+        kline_module,
+        "get_catalog_product",
+        lambda **kwargs: {
+            "product_type": "direct_equity",
+            "api_family": "stock",
+            "underlying_market": "HKStock",
+            "underlying_symbol": "00700",
+        },
+    )
+    monkeypatch.setattr(
+        kline_module.DataSourceFactory,
+        "get_kline",
+        lambda **kwargs: calls.append(kwargs) or rows,
+    )
+    service = kline_module.KlineService()
+    service.cache = _Cache()
+
+    result = service.get_kline(
+        "Crypto",
+        "00700/HKD",
+        "1D",
+        10,
+        exchange_id="gate",
+        market_type="spot",
+        instrument_id="00700",
+    )
+
+    assert result == rows
+    assert calls == [{
+        "market": "HKStock",
+        "symbol": "00700",
+        "timeframe": "1D",
+        "limit": 10,
+        "before_time": None,
+    }]

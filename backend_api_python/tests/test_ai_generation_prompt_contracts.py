@@ -28,7 +28,7 @@ def test_strategy_generation_prompt_enforces_crypto_swap_leverage_boundary():
 
 
 def test_strategy_generation_prompt_exposes_v2_factor_and_fundamental_contract():
-    assert "129-function adapter" in SCRIPT_STRATEGY_SYSTEM_PROMPT
+    assert "at least 129 functions, not exactly 129" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "get_fundamentals" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "point-in-time" in SCRIPT_STRATEGY_SYSTEM_PROMPT
     assert "get_index_stocks" in SCRIPT_STRATEGY_SYSTEM_PROMPT

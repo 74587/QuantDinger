@@ -53,7 +53,7 @@ def start_job(user_id, universe_id, mode='history', fields=None, retry_job=None,
         members = [item for item in members if (item['market'], item['symbol']) in identities]
         if not members:
             raise ValueError('fundamentalSync.invalidRetry')
-    if mode not in {'history', 'current'} or (mode == 'history' and any(m['market'] != 'USStock' for m in members)):
+    if mode not in {'history', 'current'} or (mode == 'history' and any(m['market'] not in {'USStock', 'HKStock'} for m in members)):
         raise ValueError('fundamentalSync.unsupportedMode')
     skipped = 0
     policy = 'retry' if retry_job else 'incremental' if incremental else 'full'
@@ -85,7 +85,7 @@ def start_job(user_id, universe_id, mode='history', fields=None, retry_job=None,
 
 def set_schedule(user_id, universe_id, enabled, mode='history', fields=None):
     members = members_for(user_id, universe_id)
-    if mode not in {'history', 'current'} or (mode == 'history' and any(m['market'] != 'USStock' for m in members)):
+    if mode not in {'history', 'current'} or (mode == 'history' and any(m['market'] not in {'USStock', 'HKStock'} for m in members)):
         raise ValueError('fundamentalSync.unsupportedMode')
     if not isinstance(enabled, bool):
         raise ValueError('fundamentalSync.invalidSchedule')

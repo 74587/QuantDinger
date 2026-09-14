@@ -20,8 +20,9 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
+from app.services.live_trading.bitget_reality import BitgetRealityClient
 from app.services.live_trading.bybit import BybitClient
-from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient
 from app.services.live_trading.htx import HtxClient
 
 # Lazy import IBKR to avoid ImportError if ib_insync not installed
@@ -258,6 +259,15 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         # Bitget simulated trading uses the same REST host; keys must be created in Bitget demo trading.
         base_url = _get(exchange_config, "base_url", "baseUrl") or "https://api.bitget.com"
         if mt == "spot":
+            if str(exchange_config.get("api_family") or "").strip().lower() == "reality":
+                return BitgetRealityClient(
+                    api_key=api_key,
+                    secret_key=secret_key,
+                    passphrase=passphrase,
+                    base_url=base_url,
+                    simulated_trading=is_demo,
+                    instrument_id=_get(exchange_config, "instrument_id", "instrumentId"),
+                )
             return BitgetSpotClient(
                 api_key=api_key,
                 secret_key=secret_key,
@@ -304,6 +314,15 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
         if mt == "spot":
             default_gate = "https://api-testnet.gateapi.io" if is_demo else "https://api.gateio.ws"
             base_url = default_gate if is_demo else (_get(exchange_config, "base_url", "baseUrl") or default_gate)
+            if str(exchange_config.get("api_family") or "").strip().lower() == "stock":
+                if is_demo:
+                    raise LiveTradingError("GATE_STOCK_TESTNET_NOT_SUPPORTED")
+                return GateStockClient(
+                    api_key=api_key,
+                    secret_key=secret_key,
+                    base_url=base_url,
+                    product_meta=exchange_config.get("instrument_product_meta") or {},
+                )
             return GateSpotClient(api_key=api_key, secret_key=secret_key, base_url=base_url)
         default_fut = "https://api-testnet.gateapi.io" if is_demo else "https://fx-api.gateio.ws"
         base_url = default_fut if is_demo else (_get(exchange_config, "base_url", "baseUrl") or default_fut)

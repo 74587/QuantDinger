@@ -171,6 +171,27 @@ def test_crypto_price_map_resolves_default_exchange_before_workers(monkeypatch):
     assert all(result["exchange_id"] == "" for result in results)
 
 
+def test_crypto_price_map_preserves_native_instrument_identity(monkeypatch):
+    calls = []
+
+    def fake_realtime_price(market, symbol, **kwargs):
+        calls.append((market, symbol, kwargs))
+        return {"price": 201.0, "source": "kline_1m"}
+
+    monkeypatch.setattr(quotes.kline_service, "get_realtime_price", fake_realtime_price)
+
+    results = quotes.get_price_map([{
+        "market": "Crypto",
+        "symbol": "AAPL/USD",
+        "exchange_id": "gate",
+        "market_type": "spot",
+        "instrument_id": "AAPL",
+    }])
+
+    assert results[0]["price"] == 201.0
+    assert calls[0][2]["instrument_id"] == "AAPL"
+
+
 def test_request_guard_cache_predicate_skips_rejected_values():
     values = [0, 1]
     key = f"cache-predicate-{uuid.uuid4().hex}"

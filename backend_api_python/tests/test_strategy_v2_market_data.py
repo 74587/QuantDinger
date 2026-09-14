@@ -395,3 +395,73 @@ def test_initial_incomplete_one_minute_warmup_retries_once(monkeypatch):
 
     assert len(calls) == 2
     assert len(frame) == 11
+
+
+def test_gate_hk_stock_backtest_uses_underlying_hk_market(monkeypatch):
+    calls = []
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "app.services.market.product_catalog.get_catalog_product",
+        lambda **kwargs: {
+            "underlying_market": "HKStock",
+            "underlying_symbol": "00700",
+        },
+    )
+    monkeypatch.setattr(
+        market_data.DataSourceFactory,
+        "get_kline_with_diagnostics",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("exchange crypto path must not run")),
+    )
+    monkeypatch.setattr(
+        market_data.DataSourceFactory,
+        "get_kline",
+        lambda **kwargs: calls.append(kwargs) or [
+            {"time": 1785542400, "open": 500, "high": 505, "low": 495, "close": 502, "volume": 10},
+            {"time": 1785628800, "open": 502, "high": 508, "low": 500, "close": 506, "volume": 12},
+        ],
+    )
+
+    frame = market_data._load_strategy_frame_uncached(
+        "Crypto",
+        "00700/HKD",
+        "1d",
+        start,
+        end,
+        market_type="spot",
+        exchange_id="gate",
+        instrument_id="00700",
+        api_family="stock",
+    )
+
+    assert list(frame["close"]) == [502, 506]
+    assert calls[0]["market"] == "HKStock"
+    assert calls[0]["symbol"] == "00700"
+    assert calls[0]["exchange_id"] is None
+    assert calls[0]["market_type"] is None
+
+
+def test_gate_hk_stock_shared_cache_uses_trading_calendar_coverage(monkeypatch):
+    calls = []
+    start = datetime(2026, 8, 3, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 7, 23, tzinfo=timezone.utc)
+    index = pd.date_range("2026-08-03 16:00", "2026-08-07 16:00", freq="1D")
+    frame = pd.DataFrame({"open": 500, "high": 505, "low": 495, "close": 502, "volume": 10}, index=index)
+    monkeypatch.setattr(
+        market_data,
+        "_load_strategy_frame_uncached",
+        lambda *_args, **_kwargs: calls.append(True) or frame,
+    )
+
+    first = market_data.load_strategy_frame(
+        "Crypto", "00700/HKD", "1d", start, end,
+        market_type="spot", exchange_id="gate", instrument_id="00700", api_family="stock",
+    )
+    second = market_data.load_strategy_frame(
+        "Crypto", "00700/HKD", "1d", start, end,
+        market_type="spot", exchange_id="gate", instrument_id="00700", api_family="stock",
+    )
+
+    assert len(first) == 5
+    assert second.equals(first)
+    assert calls == [True]

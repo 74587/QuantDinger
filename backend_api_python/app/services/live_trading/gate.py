@@ -17,7 +17,7 @@ import hashlib
 import hmac
 import logging
 import time
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlencode
 
@@ -343,6 +343,305 @@ class GateSpotClient(_GateBase):
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if timed_out:
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+            time.sleep(float(poll_interval_sec or 0.5))
+
+
+class GateStockClient(_GateBase):
+    """Gate traditional-stock client for the dedicated ``/stock`` API family."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        secret_key: str,
+        base_url: str = "https://api.gateio.ws",
+        timeout_sec: float = 15.0,
+        channel_id: str = "",
+        product_meta: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(
+            api_key=api_key,
+            secret_key=secret_key,
+            base_url=base_url,
+            timeout_sec=timeout_sec,
+            channel_id=channel_id,
+        )
+        self._seed_product_meta = dict(product_meta or {})
+        self._symbol_detail_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._symbol_detail_cache_ttl_sec = 30.0
+
+    @staticmethod
+    def _symbol(symbol: str) -> str:
+        value = str(symbol or "").strip().upper()
+        if ":" in value:
+            value = value.split(":", 1)[0]
+        if "/" in value:
+            value = value.split("/", 1)[0]
+        if not value:
+            raise LiveTradingError("Gate stock symbol is required")
+        return value
+
+    @staticmethod
+    def _rows(raw: Any) -> list[Dict[str, Any]]:
+        data = raw.get("data") if isinstance(raw, dict) else None
+        rows = data.get("list") if isinstance(data, dict) else None
+        return [dict(item) for item in rows or [] if isinstance(item, dict)]
+
+    def ping(self) -> bool:
+        try:
+            raw = self._public_request(
+                "GET", "/api/v4/stock/symbols/detail", params={"symbols": "AAPL", "page_size": 1}
+            )
+            return isinstance(raw, dict)
+        except Exception:
+            return False
+
+    def get_symbol_details(self, *, symbol: str) -> Dict[str, Any]:
+        ticker = self._symbol(symbol)
+        cached = self._symbol_detail_cache.get(ticker)
+        now = time.time()
+        if cached and now - cached[0] <= self._symbol_detail_cache_ttl_sec:
+            return dict(cached[1])
+        params: Dict[str, Any] = {"symbols": ticker, "page_size": 1}
+        stock_exchange = str(self._seed_product_meta.get("stock_exchange") or "").strip().lower()
+        if stock_exchange in {"us", "hk", "kr"}:
+            params["exchange"] = stock_exchange
+        raw = self._public_request(
+            "GET",
+            "/api/v4/stock/symbols/detail",
+            params=params,
+        )
+        rows = self._rows(raw)
+        detail = rows[0] if rows else {}
+        if detail:
+            self._symbol_detail_cache[ticker] = (now, dict(detail))
+        return detail
+
+    @staticmethod
+    def _to_decimal(value: Any) -> Decimal:
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal("0")
+
+    def _order_rules(self, *, symbol: str) -> Dict[str, Any]:
+        detail: Dict[str, Any] = {}
+        try:
+            detail = self.get_symbol_details(symbol=symbol)
+        except Exception as exc:
+            logger.warning("Gate stock symbol rule refresh failed for %s: %s", symbol, exc)
+        return {**self._seed_product_meta, **detail}
+
+    def _assert_side_allowed(self, *, symbol: str, side: str) -> Dict[str, Any]:
+        rules = self._order_rules(symbol=symbol)
+        try:
+            trade_mode = int(rules.get("trade_mode") or 0)
+        except Exception:
+            trade_mode = 0
+        allowed = {"buy": {1, 3, 4}, "sell": {2, 3, 4}}
+        if trade_mode and trade_mode not in allowed[str(side)]:
+            raise LiveTradingError(f"Gate stock {side} is disabled for {self._symbol(symbol)}")
+        return rules
+
+    def _normalize_quantity(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        for_market: bool,
+    ) -> Tuple[Decimal, Optional[int]]:
+        del for_market
+        value = self._to_decimal(quantity)
+        if value <= 0:
+            return Decimal("0"), None
+        rules = self._order_rules(symbol=symbol)
+        step = self._to_decimal(rules.get("step_order_volume") or 0)
+        minimum = self._to_decimal(rules.get("min_order_volume") or 0)
+        maximum = self._to_decimal(rules.get("max_order_volume") or 0)
+        if step > 0:
+            value = floor_decimal_to_step(value, step)
+        precision: Optional[int] = None
+        try:
+            precision = int(rules.get("volume_precision"))
+        except Exception:
+            if step > 0:
+                precision = max(0, -step.normalize().as_tuple().exponent)
+        if precision is not None and precision >= 0:
+            quantum = Decimal("1").scaleb(-precision)
+            value = value.quantize(quantum, rounding=ROUND_DOWN)
+        if (minimum > 0 and value < minimum) or (maximum > 0 and value > maximum):
+            return Decimal("0"), precision
+        return value, precision
+
+    def get_ticker(self, *, symbol: str) -> Dict[str, Any]:
+        ticker = self._symbol(symbol)
+        raw = self._public_request("GET", f"/api/v4/stock/market/{ticker}/orderbook")
+        data = raw.get("data") if isinstance(raw, dict) else None
+        bids = data.get("bids") if isinstance(data, dict) else []
+        asks = data.get("asks") if isinstance(data, dict) else []
+        bid = float((bids[0] if bids else {}).get("p") or 0.0)
+        ask = float((asks[0] if asks else {}).get("p") or 0.0)
+        last = (bid + ask) / 2 if bid > 0 and ask > 0 else max(bid, ask)
+        return {"symbol": ticker, "last": last, "close": last, "price": last, "bid": bid, "ask": ask}
+
+    def get_accounts(self) -> Any:
+        return self._signed_request("GET", "/api/v4/stock/users/assets")
+
+    def get_positions(self, *, symbol: str = "") -> Any:
+        params = {"symbol": self._symbol(symbol)} if str(symbol or "").strip() else None
+        return self._signed_request("GET", "/api/v4/stock/positions", params=params)
+
+    def get_open_orders(self, *, symbol: str = "", limit: int = 100) -> Any:
+        params: Dict[str, Any] = {"page": 1, "page_size": min(500, max(1, int(limit or 100)))}
+        if str(symbol or "").strip():
+            params["symbol"] = self._symbol(symbol)
+        return self._signed_request("GET", "/api/v4/stock/orders", params=params)
+
+    def place_market_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: float,
+        client_order_id: Optional[str] = None,
+    ) -> LiveOrderResult:
+        sd = str(side or "").strip().lower()
+        if sd not in {"buy", "sell"}:
+            raise LiveTradingError(f"Invalid side: {side}")
+        self._assert_side_allowed(symbol=symbol, side=sd)
+        quantity, _ = self._normalize_quantity(symbol=symbol, quantity=size, for_market=True)
+        if quantity <= 0:
+            raise LiveTradingError("Gate stock quantity violates the current symbol rules")
+        body: Dict[str, Any] = {
+            "volume": _gate_decimal_text(quantity),
+            "symbol": self._symbol(symbol),
+            "side": 2 if sd == "buy" else 1,
+            "price_type": "market",
+            "trading_session": "regular",
+            "time_in_force": "day",
+        }
+        if client_order_id:
+            body["client_order_id"] = str(client_order_id)[:64]
+        raw = self._signed_request("POST", "/api/v4/stock/orders", json_body=body)
+        data = raw.get("data") if isinstance(raw, dict) else None
+        order_id = str(data.get("id") or data.get("order_id") or "") if isinstance(data, dict) else ""
+        return LiveOrderResult(
+            exchange_id="gate",
+            exchange_order_id=order_id,
+            filled=0.0,
+            avg_price=0.0,
+            raw=raw if isinstance(raw, dict) else {"raw": raw},
+        )
+
+    def place_limit_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        size: float,
+        price: float,
+        client_order_id: Optional[str] = None,
+    ) -> LiveOrderResult:
+        sd = str(side or "").strip().lower()
+        if sd not in {"buy", "sell"}:
+            raise LiveTradingError(f"Invalid side: {side}")
+        self._assert_side_allowed(symbol=symbol, side=sd)
+        quantity, _ = self._normalize_quantity(symbol=symbol, quantity=size, for_market=False)
+        limit_price = float(price or 0.0)
+        if quantity <= 0 or limit_price <= 0:
+            raise LiveTradingError("Invalid Gate stock limit order")
+        body: Dict[str, Any] = {
+            "volume": _gate_decimal_text(quantity),
+            "symbol": self._symbol(symbol),
+            "side": 2 if sd == "buy" else 1,
+            "price_type": "limit",
+            "trading_session": "all",
+            "time_in_force": "day",
+            "price": _gate_decimal_text(limit_price),
+        }
+        if client_order_id:
+            body["client_order_id"] = str(client_order_id)[:64]
+        raw = self._signed_request("POST", "/api/v4/stock/orders", json_body=body)
+        data = raw.get("data") if isinstance(raw, dict) else None
+        order_id = str(data.get("id") or data.get("order_id") or "") if isinstance(data, dict) else ""
+        return LiveOrderResult(
+            exchange_id="gate",
+            exchange_order_id=order_id,
+            filled=0.0,
+            avg_price=0.0,
+            raw=raw if isinstance(raw, dict) else {"raw": raw},
+        )
+
+    def cancel_order(self, *, order_id: str, symbol: str = "") -> Any:
+        oid = str(order_id or "").strip()
+        if not oid:
+            raise LiveTradingError("Gate stock cancel_order requires order_id")
+        return self._signed_request("DELETE", f"/api/v4/stock/orders/{oid}")
+
+    def get_order(self, *, order_id: str, symbol: str = "") -> Dict[str, Any]:
+        oid = str(order_id or "").strip()
+        if not oid:
+            raise LiveTradingError("Gate stock get_order requires order_id")
+        requests = (
+            lambda: self.get_open_orders(symbol=symbol, limit=500),
+            lambda: self._signed_request(
+                "GET", "/api/v4/stock/orders/history",
+                params={"order_ids": oid, "page": 1, "page_size": 20},
+            ),
+        )
+        for request in requests:
+            try:
+                raw = request()
+            except Exception:
+                continue
+            for row in self._rows(raw):
+                if str(row.get("order_id") or row.get("id") or "") == oid:
+                    return row
+        return {}
+
+    def get_fee_rate(self, symbol: str, market_type: str = "spot") -> Optional[Dict[str, float]]:
+        try:
+            detail = self.get_symbol_details(symbol=symbol)
+            fee = abs(float(detail.get("commission_rate") or 0.0))
+            if fee > 0:
+                return {"maker": fee, "taker": fee}
+        except Exception as exc:
+            logger.warning("Gate stock fee lookup failed for %s: %s", symbol, exc)
+        return None
+
+    def wait_for_fill(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        max_wait_sec: float = 10.0,
+        poll_interval_sec: float = 0.5,
+    ) -> Dict[str, Any]:
+        deadline = time.time() + max(0.0, float(max_wait_sec or 0.0))
+        last: Dict[str, Any] = {}
+        while True:
+            try:
+                last = self.get_order(order_id=order_id, symbol=symbol)
+            except Exception:
+                pass
+            filled = float(last.get("fill_volume") or 0.0)
+            avg_price = float(last.get("avg_fill_price") or last.get("price") or 0.0)
+            fee = abs(float(last.get("commission") or 0.0))
+            status = str(last.get("status_desc") or last.get("status") or "")
+            terminal = status.lower() in {"filled", "cancelled", "canceled", "rejected", "failed"}
+            if terminal or time.time() >= deadline:
+                return {
+                    "filled": filled,
+                    "avg_price": avg_price,
+                    "fee": fee,
+                    "fee_ccy": str(
+                        last.get("quote_currency")
+                        or self._seed_product_meta.get("quote_currency")
+                        or "USD"
+                    ),
+                    "status": status,
+                    "order": last,
+                }
             time.sleep(float(poll_interval_sec or 0.5))
 
 

@@ -55,6 +55,7 @@ from app.services.pending_orders.fill_records import (
     trade_close_reason_from_payload,
 )
 from app.services.pending_orders.fee_reconciliation import (
+    allow_fee_reconciliation_attempt,
     backfill_zero_commission_trades,
     commission_snapshot as _commission_snapshot,
     fee_breakdown_snapshot as _fee_breakdown_snapshot,
@@ -69,6 +70,7 @@ from app.services.pending_orders.live_order_support import (
     LiveOrderNotifier,
     LiveOrderRejected,
     apply_execution_result,
+    bind_instrument_product_contract,
     build_live_order_context,
     console_print,
     make_client_order_id,
@@ -155,12 +157,13 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
         except Exception:
             self._stale_processing_sec = 90
         self._fee_sync_retry_sec = max(60, int(os.getenv("LIVE_FEE_SYNC_RETRY_SEC", "300")))
+        self._fee_sync_batch_per_account = max(1, int(os.getenv("LIVE_FEE_SYNC_BATCH_PER_ACCOUNT", "5")))
         # Position sync self-check (best-effort): keep local positions aligned with exchange.
         self._position_sync_enabled = os.getenv("POSITION_SYNC_ENABLED", "true").lower() == "true"
         self._position_sync_interval_sec = float(os.getenv("POSITION_SYNC_INTERVAL_SEC", "30"))
         self._last_position_sync_ts = 0.0
         self._exchange_catchups: set[tuple[str, int, str]] = set()
-        self._last_stream_audit: Dict[tuple[str, int, str], float] = {}
+        self._last_stream_audit: Dict[tuple[str, int, str, int], float] = {}
         self._stream_audit_sec = max(10.0, float(os.getenv("EXECUTION_STREAM_REST_AUDIT_SEC", "30")))
         logger.info(f"PendingOrderWorker: sync_enabled={self._position_sync_enabled}, interval={self._position_sync_interval_sec}s")
 
@@ -678,7 +681,10 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
     def _sync_live_sent_orders(self, limit: int = 50) -> None:
         """Reconcile submitted crypto orders, including durable resting limits."""
         rows = self._fetch_live_sent_orders(limit=limit)
+        fee_attempts: Dict[tuple[str, int, str], int] = {}
         for row in rows:
+            if not allow_fee_reconciliation_attempt(row, fee_attempts, self._fee_sync_batch_per_account):
+                continue
             if not self._should_rest_reconcile(row):
                 continue
             try:
@@ -692,15 +698,25 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                 )
 
     def _should_rest_reconcile(self, row: Dict[str, Any]) -> bool:
+        if bool(row.get("fee_reconciliation_needed")):
+            return True
         exchange_id = str(row.get("exchange_id") or "").lower()
         credential_id = int(row.get("credential_id") or 0)
         market_type = str(row.get("market_type") or "").lower()
         key = (exchange_id, credential_id, market_type)
+        audit_key = (*key, int(row.get("id") or 0))
         with self._lock:
-            catchup = key in self._exchange_catchups or (exchange_id, credential_id, "all") in self._exchange_catchups
-            if catchup:
-                self._exchange_catchups.discard(key)
-                self._exchange_catchups.discard((exchange_id, credential_id, "all"))
+            for scope in (key, (exchange_id, credential_id, "all")):
+                if scope not in self._exchange_catchups:
+                    continue
+                # Invalidate every matching order, including later query pages.
+                self._last_stream_audit = {
+                    order_key: checked_at
+                    for order_key, checked_at in self._last_stream_audit.items()
+                    if not (order_key[:2] == scope[:2] and
+                            (scope[2] == "all" or order_key[2] == scope[2]))
+                }
+                self._exchange_catchups.discard(scope)
         try:
             from app.startup import get_execution_stream_supervisor
 
@@ -711,13 +727,22 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
             )
         except Exception:
             healthy = False
-        if not healthy or catchup:
+        if not healthy:
             return True
         now = time.monotonic()
-        last = self._last_stream_audit.get(key, 0.0)
-        if now - last >= self._stream_audit_sec:
-            self._last_stream_audit[key] = now
-            return True
+        with self._lock:
+            last = self._last_stream_audit.get(audit_key)
+            if last is None or now - last >= self._stream_audit_sec:
+                self._last_stream_audit[audit_key] = now
+                # Completed orders eventually leave the query; bound the cache
+                # without delaying audits for newly discovered orders.
+                if len(self._last_stream_audit) > 10000:
+                    self._last_stream_audit = {
+                        order_key: checked_at
+                        for order_key, checked_at in self._last_stream_audit.items()
+                        if now - checked_at < self._stream_audit_sec
+                    }
+                return True
         return False
 
     def _fetch_live_sent_orders(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -741,7 +766,13 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                     db.commit()
                 cur.execute(
                     """
-                    SELECT *
+                    SELECT pending_orders.*,
+                           EXISTS (
+                               SELECT 1
+                               FROM qd_strategy_trades pending_fee
+                               WHERE pending_fee.pending_order_id = pending_orders.id
+                                 AND COALESCE(pending_fee.fee_status, 'pending') = 'pending'
+                           ) AS fee_reconciliation_needed
                     FROM pending_orders
                     WHERE (
                             status = 'sent'
@@ -758,14 +789,15 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                                     SELECT 1
                                     FROM qd_strategy_trades t
                                     WHERE t.pending_order_id = pending_orders.id
-                                      AND COALESCE(t.commission_quote, 0) = 0
+                                      AND COALESCE(t.fee_status, 'pending') = 'pending'
                                 )
                             )
                           )
                       AND LOWER(COALESCE(exchange_id, '')) <> 'alpaca'
                       AND COALESCE(exchange_id, '') <> ''
                       AND COALESCE(exchange_order_id, '') <> ''
-                    ORDER BY sent_at ASC NULLS FIRST, id ASC
+                    ORDER BY fee_reconciliation_needed DESC, updated_at ASC NULLS FIRST,
+                             sent_at ASC NULLS FIRST, id ASC
                     LIMIT %s
                     """,
                     (int(self._fee_sync_retry_sec), int(limit)),
@@ -804,7 +836,7 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                                 SELECT 1
                                 FROM qd_strategy_trades t
                                 WHERE t.pending_order_id = pending_orders.id
-                                  AND COALESCE(t.commission_quote, 0) = 0
+                                  AND COALESCE(t.fee_status, 'pending') = 'pending'
                             )
                         )
                       )
@@ -846,6 +878,10 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
             user_id=int(sc.get("user_id") or row.get("user_id") or 1),
         )
         try:
+            exchange_config = bind_instrument_product_contract(
+                exchange_config, sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {}, symbol=symbol,
+                exchange_id=exchange_id or str(exchange_config.get("exchange_id") or ""),
+                market_type=market_type)
             client = create_client(exchange_config, market_type=market_type)
             dispatch_requested_cancel(client, row, payload, exchange_config)
             sync_raw: Dict[str, Any] = {}

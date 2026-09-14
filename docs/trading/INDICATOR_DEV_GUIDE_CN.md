@@ -721,8 +721,12 @@ output = {
 - 是否允许重复入场、加仓或减仓？
 - 仓位大小、止损、止盈和追踪止损如何定义？
 - 交易标的和市场类型是什么？
+- 如果是交易所股票，执行使用哪个准确的目录产品、交易所、币种、产品类型和 API family？必须保留 <code>Crypto:00700/HKD@gate:spot</code> 或目录确认的 <code>Crypto:HK0700/USDT@binance:swap</code> 等完整标识，不能替换成底层股票。
+- 它是只做多的股票现货，还是必须声明方向 metadata 和 <code>position_side</code> 的 Crypto swap 衍生品？
 
 转换后应删除图表专用的颜色、标签偏移、plots、layers 和 marker 数组，保留信号代数，并用 Strategy API V2 明确声明标的、周期、仓位和风险。
+
+只有当前产品目录提供有效 <code>USStock</code> 或 <code>HKStock</code> 映射时，底层股票数据才能用于图表历史行情和时点基本面。数据映射不会改变执行标的，转换器也不能根据显示名称猜测地区。
 
 生成的策略必须重新验证和回测。发布到市场前，系统要求至少有一条成功回测记录。
 

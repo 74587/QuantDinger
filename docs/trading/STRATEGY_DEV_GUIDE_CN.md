@@ -147,6 +147,9 @@ Content-Type: application/json
 | A 股 | <code>CNStock:600519.SH</code> |
 | 美股 | <code>USStock:MSFT</code> |
 | 港股 | <code>HKStock:00700.HK</code> |
+| Gate 股票通道港股 | <code>Crypto:00700/HKD@gate:spot</code> |
+| Gate 股票通道美股 | <code>Crypto:AAPL/USD@gate:spot</code> |
+| Binance 港股股票永续 | 当前产品目录返回时使用 <code>Crypto:HK0700/USDT@binance:swap</code> |
 | Crypto 现货 | <code>Crypto:BTC/USDT@spot</code> |
 | 指定交易所 Crypto 现货 | <code>Crypto:BTC/USDT@okx:spot</code> |
 | Crypto 永续 | <code>Crypto:BTC/USDT@swap</code> |
@@ -158,6 +161,53 @@ Content-Type: application/json
 系统也会规范化部分别名，例如 <code>600519.XSHG</code> → <code>CNStock:600519.SH</code>、<code>BTCUSDT</code> → <code>BTC/USDT</code>。
 
 为避免歧义，生产策略应写完整市场前缀。Crypto 未写市场类型时默认为 spot。只有 swap 可以启用合约杠杆。能够解析市场名称并不代表一定有数据或支持实盘，实盘支持范围见第 18 节。
+
+### 交易所股票产品：保留完整交易标的
+
+Gate 港股腾讯使用 <code>Crypto:00700/HKD@gate:spot</code>，Gate 美股苹果使用 <code>Crypto:AAPL/USD@gate:spot</code>。这里的 <code>Crypto</code> 是系统内的交易所路由命名空间，并不表示底层资产一定是加密货币。Gate 股票目录按以下属性记录这两类标的：
+
+| 字段 | 腾讯 | 苹果 |
+| --- | --- | --- |
+| market / symbol | <code>Crypto</code> / <code>00700/HKD</code> | <code>Crypto</code> / <code>AAPL/USD</code> |
+| exchange_id / market_type | <code>gate</code> / <code>spot</code> | <code>gate</code> / <code>spot</code> |
+| asset_class / product_type / api_family | <code>equity</code> / <code>direct_equity</code> / <code>stock</code> | <code>equity</code> / <code>direct_equity</code> / <code>stock</code> |
+| underlying_market / underlying_symbol | <code>HKStock</code> / <code>00700</code> | <code>USStock</code> / <code>AAPL</code> |
+
+筛选时选择交易所 **Gate**、市场类型 **Spot**、产品类型 **Direct Equity**（中文界面显示“交易所股票”，英文显示“Exchange stock”，接口值为 <code>direct_equity</code>），然后搜索 <code>00700</code> 或 <code>AAPL</code>，选择目录返回的准确标的。
+
+其他交易所使用不同的产品契约。Binance 港股属于衍生品，例如产品目录确认的 <code>Crypto:HK0700/USDT@binance:swap</code>，记录为 <code>stock_perpetual / swap / swap</code>；只有权威元数据确认港股底层时才映射到 HKStock。它不是 Gate 直接股票，也不代表直接持有港股。OKX 和 Bybit 可以提供 <code>tokenized_equity / spot / spot</code> 与 <code>stock_perpetual / swap / swap</code>；Bitget Reality 使用 <code>tokenized_equity / spot / reality</code>，并支持目录确认的股票永续。HTX 在没有可靠产品标记和执行契约前关闭股票产品识别。
+
+不能只凭 ticker 猜测产品。产品目录必须提供交易所、市场类型、产品类型、API family、原生 instrument ID、币种和可用的底层身份，策略必须完整保留。如果底层地区未知或系统不支持，因子和基本面保持不可用，不能默认为美股数据。
+
+如果只是研究、因子筛选，或通过传统证券账户交易，则在港股分类添加 <code>HKStock:00700.HK</code>，在美股分类添加 <code>USStock:AAPL</code>。它们与 Gate 通道标的具有不同的执行身份：普通 HKStock 或 USStock 标的不能直接交给 Gate 账户下单，也不能把研究标的静默转换为交易所订单。
+
+Universe、历史数据读取和下单都必须保留选中的交易所完整标识。保留 <code>00700/HKD</code>、<code>AAPL/USD</code> 或目录确认的永续标的，不能删除前导零、替换币种、改为底层股票标识或更换交易所/API family。交易所股票现货仍然只做多，不能调用 <code>allow_leverage</code>。股票永续遵守 Crypto swap 契约：声明方向 metadata，持仓和订单调用传递 <code>position_side</code>，只有源码调用 <code>context.allow_leverage(max_leverage=N)</code> 后才允许配置杠杆。
+
+直接股票、代币化股票、股票永续和普通加密产品的类型由有效产品目录决定，不能只按 ticker 名称猜测。历史行情适配器可以读取目录确认的底层股票市场数据，但不会改变策略的执行标的。策略代码仍使用 Strategy API V2，不应自行请求交易所、券商或行情源 API。编译通过不代表可以立即实盘；部署还会核对产品目录、产品类型/API 通道、交易所、账户能力、交易状态、下单规则与币种。
+
+~~~python
+"""Gate Hong Kong Equity SMA Example
+Uses the selected Gate stock instrument with bounded long-only exposure.
+"""
+
+def initialize(context):
+    g.symbol = "Crypto:00700/HKD@gate:spot"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1d")
+    context.set_warmup(30)
+    context.set_metadata(direction_mode="long_only")
+
+def handle_data(context, data):
+    bars = get_history(21, "1d", "close", g.symbol)
+    if len(bars) < 20:
+        return
+    bullish = float(bars["close"].iloc[-1]) > float(bars["close"].tail(20).mean())
+    position = get_position(g.symbol)
+    if bullish and position.amount <= 0:
+        order_target_percent(g.symbol, 0.2, reason="sma_entry", stop_loss_pct=0.03)
+    elif not bullish and position.amount > 0:
+        order_target_percent(g.symbol, 0.0, reason="sma_exit")
+~~~
 
 ---
 
@@ -448,6 +498,8 @@ fundamentals = get_fundamentals(
 ~~~
 
 常用公开别名还包括 <code>REVENUE_GROWTH</code>、<code>DEBT_TO_EQUITY</code> 和 <code>FREE_CASH_FLOW</code>。只使用平台真实支持、按时点可见的字段，不要发明字段或读取未来财报。
+
+美股与港股股票池支持持久化当前快照和历史季度财报导入。交易所路由股票（如 <code>Crypto:00700/HKD@gate:spot</code>）会通过底层 <code>HKStock:00700</code> 身份读取时点基本面，同时保留准确的 Gate 产品身份用于实盘下单。
 
 多标的 <code>factor</code>/<code>indicator</code> 调用必须传 symbol；只有单标的数据门户可以省略 symbol。
 
@@ -873,11 +925,15 @@ def rebalance(context, data):
 
 | 市场 | 支持的实盘通道 | 产品边界 |
 | --- | --- | --- |
-| Crypto | Binance、Bitget、Bybit、OKX、Gate、HTX | 按交易所和账户能力支持 spot 与 swap |
+| Crypto | Binance、Bitget、Bybit、OKX、Gate、HTX | 普通 spot 与 swap 按交易所和账户能力支持 |
+| 交易所直接股票 | Gate 股票通道 | <code>direct_equity / spot / stock</code>；美股和港股必须保留目录返回的准确币种，只做多 |
+| 交易所代币化股票 | OKX、Bybit、Bitget Reality | OKX/Bybit 使用 <code>tokenized_equity / spot / spot</code>；Bitget 使用 <code>tokenized_equity / spot / reality</code>；必须通过目录和地区可用性校验 |
+| 交易所股票永续 | Binance、OKX、Bitget、Bybit、Gate | <code>stock_perpetual / swap / swap</code>；属于衍生品，遵守 Crypto swap 方向和杠杆规则，必须使用准确原生合约 |
+| 未验证交易所股票 | HTX | 在权威产品元数据和执行 API family 验证完成前拒绝 |
 | USStock | Alpaca、IBKR | 当前券商策略按 long-only |
 | 其他可解析市场 | 暂无 | 可回测或有数据不等于支持实盘 |
 
-混合市场 live 不支持，其他市场不能强行用不匹配的凭证部署。
+混合市场 live 不支持，其他市场不能强行用不匹配的凭证部署。一个实盘资金分配还必须保持兼容的计价/结算币种和 API family；例如不能因为底层都是港股公司，就把 HKD Gate 直接股票和 USDT 股票永续放进同一资金池。
 
 ### 仓位归属、对账与账户风控
 

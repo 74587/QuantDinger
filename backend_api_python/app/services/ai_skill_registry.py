@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.services.ai_generation_contracts import STRATEGY_INSTRUMENT_IDENTITY_CONTRACT
+
 
 @dataclass(frozen=True)
 class SkillText:
@@ -175,7 +177,7 @@ _SKILLS: tuple[SkillDefinition, ...] = (
             "Use QuantDinger Strategy API V2 exclusively. The source owns instruments, market, subscriptions, "
             "frequency, schedules, factors, and orders. "
             "Only Crypto perpetual sources may explicitly permit user-adjustable leverage."
-        ),
+        ) + STRATEGY_INSTRUMENT_IDENTITY_CONTRACT,
         keywords=("脚本策略", "python", "scriptstrategy", "自动策略"),
         requires=("market_data", "strategy_requirements"),
         produces=("strategy_source", "backtest_plan"),

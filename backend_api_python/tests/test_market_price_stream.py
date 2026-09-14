@@ -44,3 +44,37 @@ def test_public_price_feed_uses_rest_only_for_missing_or_stale_prices():
     streamed = feed.snapshot(max_age_seconds=1)
     assert streamed.source == "public_websocket"
     assert streamed.prices["Crypto:BTC/USDT@binance:swap"] == 101.0
+
+
+def test_reality_feed_uses_rest_until_reality_websocket_is_verified():
+    feed = PublicMarketPriceFeed(
+        exchange_id="bitget",
+        market_type="spot",
+        instruments=[{
+            "key": "Crypto:RAAPL/USDT@bitget:spot",
+            "symbol": "RAAPL/USDT",
+            "instrument_id": "rAAPLUSDT",
+            "api_family": "reality",
+        }],
+        rest_fallback=lambda: {},
+    )
+
+    assert feed.supported is False
+    assert feed._symbols() == ["rAAPLUSDT"]
+
+
+def test_gate_stock_feed_does_not_subscribe_to_crypto_spot_channel():
+    feed = PublicMarketPriceFeed(
+        exchange_id="gate",
+        market_type="spot",
+        instruments=[{
+            "key": "Crypto:AAPL/USD@gate:spot",
+            "symbol": "AAPL/USD",
+            "instrument_id": "AAPL",
+            "api_family": "stock",
+        }],
+        rest_fallback=lambda: {"Crypto:AAPL/USD@gate:spot": 200.0},
+    )
+
+    assert feed.supported is False
+    assert feed.snapshot().prices["Crypto:AAPL/USD@gate:spot"] == 200.0

@@ -11,7 +11,8 @@ from app.services.execution_streams.repository import ExecutionEventRepository
 from app.services.live_trading.factory import create_client
 from app.services.live_trading.fee_quote import fee_to_quote
 from app.services.pending_orders.fill_records import persist_strategy_fill, trade_close_reason_from_payload
-from app.utils.db import get_db_connection
+from app.services.pending_orders.live_order_support import bind_instrument_product_contract
+from app.utils.db import get_db_connection, get_db_transaction
 from app.utils.logger import get_logger
 from app.utils.strategy_runtime_logs import append_strategy_log
 
@@ -122,12 +123,21 @@ class ExecutionEventProcessor:
         return 0.0, ""
 
     def _process_pending_order(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
+        with get_db_transaction():
+            self._project_pending_order(event, binding)
+
+    def _project_pending_order(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
         pending_id = int(binding.get("pending_order_id") or binding.get("owner_id") or 0)
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute("SELECT * FROM pending_orders WHERE id = %s FOR UPDATE", (pending_id,))
             pending = cur.fetchone()
             if not pending:
+                cur.close()
+                return
+            # Recheck after locking: another projector may have committed while
+            # this event was waiting for the same order.
+            if self._already_projected(int(event.get("id") or 0)):
                 cur.close()
                 return
             pending = dict(pending)
@@ -206,8 +216,15 @@ class ExecutionEventProcessor:
             user_id=int(sc.get("user_id") or pending.get("user_id") or 1),
         )
         market_type = str(event.get("market_type") or pending.get("market_type") or "swap")
-        client = create_client(exchange_config, market_type=market_type)
         symbol = str(event.get("symbol") or pending.get("symbol") or "")
+        exchange_config = bind_instrument_product_contract(
+            exchange_config,
+            sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {},
+            symbol=symbol,
+            exchange_id=str(event.get("exchange_id") or exchange_config.get("exchange_id") or ""),
+            market_type=market_type,
+        )
+        client = create_client(exchange_config, market_type=market_type)
         price = float(event.get("price") or pending.get("avg_price") or 0.0)
         fees, commission_quote = self._fees(event, client=client, symbol=symbol, price=price)
         commission, commission_ccy = self._fee_storage(fees)
@@ -434,11 +451,7 @@ class ExecutionEventProcessor:
         runner = get_runner(strategy_id)
         if not runner:
             return
-        sc = load_strategy_configs(strategy_id)
-        exchange_config = resolve_exchange_config(
-            sc.get("exchange_config") or {},
-            user_id=int(sc.get("user_id") or 1),
-        )
+        exchange_config = runner.exchange_config
         client = create_client(exchange_config, market_type=str(event.get("market_type") or "swap"))
         fees, commission_quote = self._fees(
             event,
@@ -550,6 +563,13 @@ class ExecutionEventProcessor:
                 user_id=int(sc.get("user_id") or trade.get("user_id") or 1),
             )
             market_type = str(event.get("market_type") or trade.get("market_type") or "swap")
+            exchange_config = bind_instrument_product_contract(
+                exchange_config,
+                sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {},
+                symbol=str(event.get("symbol") or trade.get("symbol") or ""),
+                exchange_id=str(event.get("exchange_id") or exchange_config.get("exchange_id") or ""),
+                market_type=market_type,
+            )
             client = create_client(exchange_config, market_type=market_type)
             fees, commission_quote = self._fees(
                 event,

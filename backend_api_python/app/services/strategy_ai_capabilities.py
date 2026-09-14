@@ -170,6 +170,7 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
 - Use `indicator(factor_id, symbol, **params)` when previous/current series values are needed for signals. Use `factor(factor_id, symbol, **params)` only when one current scalar value is sufficient.
 - `indicator(...)` returns a pandas Series for one output or a DataFrame for multiple outputs. Warmup values may be `NaN`; call `.dropna()` on the selected series and check its length before `.iloc` access.
 - Multi-output indicators must select a documented `output` or use the returned DataFrame columns. Never guess output names or parameter aliases.
+- For series APIs, use returned DataFrame columns for MACD (`macd`, `macdsignal`, `macdhist`), STOCH (`slowk`, `slowd`), and KDJ (`k`, `d`, `j`); an `output` argument is not a universal Series selector. For scalar `factor`, use the active definition's output enum.
 - A definition marked `requested` is a hard requirement for this turn. A definition marked only `existing` is context: preserve a working legacy or TA-Lib call when the user did not ask to change that factor.
 """,
         repair="""
@@ -244,12 +245,15 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
         contract="""
 ## Native position protection
 - Attach protection to an entry order with `stop_loss_pct`, `take_profit_pct`, `trailing_stop_pct`, `trailing_activation_pct`, and/or `time_limit_seconds`, or call `set_default_protection(...)` inside an executable handler/callback before later entries.
+- When protection is requested for Crypto swaps, each required entry leg must carry effective protection directly on its order call (inline keywords or a literal `protection` mapping). The AI validator does not accept `set_default_protection` alone as proof that each swap entry leg is protected.
 - Percentage values are decimal ratios: `0.03` means 3%, not 0.03% or 3.
+- Use ratios within their bounds: stop loss and trailing stop 0..1; take profit and trailing activation 0..5; time limits are non-negative seconds. Zero disables a rule; activation alone is not protection. `trailing_rebase_on_scale_in` defaults to true and resets the trail and holding clock on scale-in; false preserves an already active trail.
 - Signal exits and native protections are different mechanisms. Do not claim fixed stop-loss or take-profit behavior unless executable protection arguments are present.
-- Native protection uses completed-bar semantics in backtests and an independent protection price clock in live trading. Do not implement intrabar protection by mutating the current strategy candle.
+- Backtest native protection evaluates each bar's open/high/low and can close at the trigger price or a gap opening price, including on an entry fill bar. It is not a close-only signal exit. The default conservative conflict policy prioritizes stop loss, trailing stop, time limit, then take profit. Live protection uses a separate price clock; do not mutate strategy candles to implement it.
 """,
         repair="""
 - Implement requested stops or take profit with native protection keywords or `set_default_protection`; explanatory comments or parameters alone are insufficient.
+- For Crypto swaps, put effective protection directly on every required entry leg; default protection alone does not pass per-leg AI validation.
 - Keep percentage values as bounded decimal ratios.
 """,
     ),
@@ -339,6 +343,10 @@ _DIRECTION_TERM_MAP = {
     **{term: "long_only" for term in _LONG_ONLY_TERMS},
 }
 _PROTECTION_TERMS = (
+    "风控",
+    "風控",
+    "risk control",
+    "risk management",
     "止损",
     "止盈",
     "移动止损",
@@ -517,6 +525,17 @@ def resolve_strategy_generation_intent(
 ) -> StrategyAIGenerationIntent:
     """Select capability packs from explicit request, source, and IDE context."""
     context = dict(context or {})
+    if context.get("source") == "indicator_ide_conversion":
+        conversion_request = context.pop("conversionRequest", None)
+        if conversion_request is None:
+            # Older clients embed the request between template and indicator source.
+            match = re.search(
+                r"User conversion request:\s*\n(.*?)\nIndicator source code:",
+                str(prompt or ""),
+                flags=re.DOTALL,
+            )
+            conversion_request = match.group(1) if match else prompt
+        prompt = str(conversion_request or "")
     serialized_context = json.dumps(context, ensure_ascii=False, sort_keys=True)
     combined = "\n".join((str(prompt or ""), str(existing_code or ""), serialized_context))
     capabilities: set[str] = set()
@@ -529,7 +548,7 @@ def resolve_strategy_generation_intent(
         *_source_factor_ids(existing_code),
     }))
 
-    if re.search(r"@swap\b|usdtswap\b|usdt[ /_-]*swap\b|\bperpetual\b|永续", combined, re.IGNORECASE):
+    if re.search(r"@(?:[a-z0-9_-]+:)?swap\b|usdtswap\b|usdt[ /_-]*swap\b|\bperpetual\b|永续", combined, re.IGNORECASE):
         capabilities.add("crypto_swap")
     if _contains_any(combined, _SUPERTREND_TERMS):
         capabilities.add("supertrend")
@@ -957,6 +976,41 @@ def _declared_direction_mode(tree: ast.AST, static_strings: dict[str, str]) -> s
     return ""
 
 
+def _validate_history_window_clock(tree: ast.AST) -> None:
+    for function in (node for node in tree.body if isinstance(node, ast.FunctionDef)):
+        assignments = _collect_assignment_expressions(function)
+
+        def origin(node: ast.AST | None, seen: frozenset[str] = frozenset()) -> str:
+            key = _static_string_key(node)
+            if key:
+                return origin(assignments.get(key), seen | {key}) if key not in seen else ""
+            if isinstance(node, ast.Call):
+                if _call_name(node) in {"get_history", "history"}:
+                    return "history"
+                if _call_name(node) == "len" and node.args and origin(node.args[0], seen) == "history":
+                    return "window_length"
+            if isinstance(node, ast.Subscript):
+                return origin(node.value, seen)
+            if isinstance(node, ast.BinOp):
+                if "window_length" in {origin(node.left, seen), origin(node.right, seen)}:
+                    return "window_length"
+            return ""
+
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Compare):
+                continue
+            persisted = any(
+                _static_string_key(child).startswith("g.") and origin(child) == "window_length"
+                for child in ast.walk(node)
+            )
+            current = any(
+                isinstance(child, (ast.Name, ast.Call)) and origin(child) == "window_length"
+                for child in ast.walk(node)
+            )
+            if persisted and current:
+                raise StrategyV2ContractError("strategyV2.aiHistoryWindowClockUnsupported")
+
+
 def validate_strategy_ai_semantics(
     code: str,
     manifest: Any,
@@ -971,6 +1025,7 @@ def validate_strategy_ai_semantics(
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
     static_strings = _collect_static_strings(tree)
     assignment_expressions = _collect_assignment_expressions(tree)
+    _validate_history_window_clock(tree)
     order_calls = [node for node in calls if _call_name(node) in ORDER_CALLS]
     position_calls = [node for node in calls if _call_name(node) == "get_position"]
     direction_mode = normalize_direction_mode(getattr(manifest, "direction_mode", ""))

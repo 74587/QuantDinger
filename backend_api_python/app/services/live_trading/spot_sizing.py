@@ -110,6 +110,23 @@ def get_spot_base_holding(
     base_u = base.upper()
 
     try:
+        from app.services.live_trading.gate import GateStockClient
+
+        if isinstance(client, GateStockClient):
+            raw = client.get_positions(symbol=base_u)
+            for row in client._rows(raw):
+                if str(row.get("symbol") or "").upper() != base_u:
+                    continue
+                total = _pick_free_from_row(row, "volume")
+                available = _pick_free_from_row(row, "available")
+                avg_cost = _pick_cost_from_row(row, "avg_cost_price", "diluted_cost_price")
+                return _spot_holding(total, available, avg_cost)
+    except Exception as e:
+        if strict:
+            raise
+        logger.warning("spot base holding (gate stock): %s", e)
+
+    try:
         from app.services.live_trading.binance_spot import BinanceSpotClient
 
         if isinstance(client, BinanceSpotClient):

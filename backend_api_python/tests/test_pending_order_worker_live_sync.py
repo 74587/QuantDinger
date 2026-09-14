@@ -121,6 +121,34 @@ def test_claim_live_sent_order_transitions_the_claimed_row(monkeypatch):
     assert worker._claim_live_sent_order(41) == {"id": 41, "status": "syncing"}
 
 
+def test_fee_reconciliation_is_not_throttled_by_a_healthy_execution_stream():
+    worker = object.__new__(worker_module.PendingOrderWorker)
+
+    assert worker._should_rest_reconcile({"fee_reconciliation_needed": True}) is True
+
+
+def test_fee_reconciliation_limits_each_exchange_account_batch(monkeypatch):
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._fee_sync_batch_per_account = 2
+    rows = [
+        {
+            "id": order_id,
+            "exchange_id": "binance",
+            "credential_id": 7,
+            "market_type": "spot",
+            "fee_reconciliation_needed": True,
+        }
+        for order_id in range(1, 5)
+    ]
+    monkeypatch.setattr(worker, "_fetch_live_sent_orders", lambda limit: rows)
+    synced = []
+    monkeypatch.setattr(worker, "_sync_one_live_sent_order", lambda row: synced.append(row["id"]))
+
+    worker._sync_live_sent_orders()
+
+    assert synced == [1, 2]
+
+
 def test_live_sent_sync_finalizes_after_restart_without_duplicate_fill(monkeypatch):
     row = _row(filled=1.0, avg_price=101.0)
     worker, snapshots, persisted = _worker(

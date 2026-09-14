@@ -11,6 +11,7 @@ import io
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -18,6 +19,7 @@ import requests
 import urllib3
 
 from app.data_sources.tencent import normalize_hk_code
+from app.services.market.instrument_products import classify_instrument_product
 from app.services.symbol_name import normalize_crypto_symbol
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
@@ -36,6 +38,11 @@ class SymbolMasterRow:
     instrument_id: str = ""
     settle_currency: str = ""
     asset_class: str = ""
+    product_type: str = "crypto"
+    api_family: str = "spot"
+    underlying_market: str = ""
+    underlying_symbol: str = ""
+    product_meta: Optional[Dict[str, object]] = None
 
 
 STATIC_MARKET_ROWS = [
@@ -234,10 +241,16 @@ def fetch_us_stock_symbols() -> List[SymbolMasterRow]:
         test_issue = _clean_symbol(item.get("Test Issue"))
         etf = _clean_symbol(item.get("ETF"))
         if symbol and name and test_issue != "Y":
-            rows.append(SymbolMasterRow(
-                "USStock", symbol, name, "NASDAQ", "USD",
-                asset_class="etf" if etf == "Y" else "equity",
-            ))
+            rows.append(
+                SymbolMasterRow(
+                    "USStock",
+                    symbol,
+                    name,
+                    "NASDAQ",
+                    "USD",
+                    asset_class="etf" if etf == "Y" else "equity",
+                )
+            )
 
     other_rows = _fetch_nasdaq_trader_file("https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt")
     exchange_map = {
@@ -254,10 +267,16 @@ def fetch_us_stock_symbols() -> List[SymbolMasterRow]:
         test_issue = _clean_symbol(item.get("Test Issue"))
         etf = _clean_symbol(item.get("ETF"))
         if symbol and name and test_issue != "Y":
-            rows.append(SymbolMasterRow(
-                "USStock", symbol, name, exchange, "USD",
-                asset_class="etf" if etf == "Y" else "equity",
-            ))
+            rows.append(
+                SymbolMasterRow(
+                    "USStock",
+                    symbol,
+                    name,
+                    exchange,
+                    "USD",
+                    asset_class="etf" if etf == "Y" else "equity",
+                )
+            )
 
     return _unique_rows(rows)
 
@@ -273,73 +292,277 @@ def fetch_crypto_symbols_with_diagnostics():
     )
     from app.services.market.symbol_search import _classify_asset
 
-    rows: List[SymbolMasterRow] = []
-    contexts = []
-    for exchange_id in PUBLIC_KLINE_EXCHANGE_IDS:
-        for market_type in ("spot", "swap"):
-            context_rows: List[SymbolMasterRow] = []
-            try:
-                ccxt_id, options = resolve_ccxt_for_live_trading(exchange_id, market_type)
-                config = {
-                    "enableRateLimit": True,
-                    "timeout": max(int(CCXTConfig.TIMEOUT or 0), 30000),
-                }
-                if options:
-                    config["options"] = options
-                config = apply_public_ccxt_endpoint_config(config, exchange_id)
-                exchange = getattr(ccxt, ccxt_id)(config)
-                _load_ccxt_markets_with_retry(exchange)
-                for symbol, info in exchange.markets.items():
-                    is_target = bool(info.get("spot")) if market_type == "spot" else bool(info.get("swap"))
-                    quote = _clean_symbol(info.get("quote"))
-                    base = _clean_symbol(info.get("base"))
-                    if not info.get("active") or not is_target or quote != "USDT" or not base:
-                        continue
-                    context_rows.append(SymbolMasterRow(
+    def fetch_context(exchange_id: str, market_type: str):
+        context_rows: List[SymbolMasterRow] = []
+        try:
+            ccxt_id, options = resolve_ccxt_for_live_trading(exchange_id, market_type)
+            config = {
+                "enableRateLimit": True,
+                "timeout": max(5000, min(int(CCXTConfig.TIMEOUT or 10000), 15000)),
+            }
+            if options:
+                config["options"] = options
+            config = apply_public_ccxt_endpoint_config(config, exchange_id)
+            exchange = getattr(ccxt, ccxt_id)(config)
+            _load_ccxt_markets_with_retry(exchange)
+            for symbol, info in exchange.markets.items():
+                is_target = bool(info.get("spot")) if market_type == "spot" else bool(info.get("swap"))
+                quote = _clean_symbol(info.get("quote"))
+                base = _clean_symbol(info.get("base"))
+                if not info.get("active") or not is_target or quote != "USDT" or not base:
+                    continue
+                normalized_symbol = normalize_crypto_symbol(symbol)
+                instrument_id = _clean_text(info.get("id") or symbol)
+                profile = classify_instrument_product(
+                    info,
+                    exchange_id=exchange_id,
+                    market_type=market_type,
+                    symbol=normalized_symbol,
+                    instrument_id=instrument_id,
+                )
+                context_rows.append(
+                    SymbolMasterRow(
                         "Crypto",
-                        normalize_crypto_symbol(symbol),
+                        normalized_symbol,
                         _clean_text(info.get("displayName") or info.get("name") or base),
                         exchange_id,
                         "USDT",
                         market_type,
-                        _clean_text(info.get("id") or symbol),
+                        instrument_id,
                         _clean_symbol(info.get("settle") or quote),
-                        _classify_asset(info),
-                    ))
-                rows.extend(context_rows)
-                contexts.append({
-                    "exchange": exchange_id,
-                    "market_type": market_type,
-                    "ok": True,
-                    "rows": len(context_rows),
-                    "source": "ccxt",
-                })
-            except Exception as e:
-                if exchange_id == "okx":
-                    try:
-                        context_rows = _fetch_okx_public_symbol_rows(market_type, _classify_asset)
-                        rows.extend(context_rows)
-                        contexts.append({
-                            "exchange": exchange_id,
-                            "market_type": market_type,
-                            "ok": True,
-                            "rows": len(context_rows),
-                            "source": "official_public_api",
-                            "fallback": True,
-                            "primary_error": str(e)[:500],
-                        })
-                        continue
-                    except Exception as fallback_error:
-                        e = RuntimeError(f"{e}; official fallback failed: {fallback_error}")
-                logger.warning("crypto catalog unavailable exchange=%s type=%s: %s", exchange_id, market_type, e)
-                contexts.append({
-                    "exchange": exchange_id,
-                    "market_type": market_type,
-                    "ok": False,
-                    "rows": 0,
-                    "error": str(e),
-                })
+                        profile.asset_class,
+                        profile.product_type,
+                        profile.api_family,
+                        profile.underlying_market,
+                        profile.underlying_symbol,
+                        profile.product_meta,
+                    )
+                )
+            if exchange_id == "bitget" and market_type == "spot":
+                try:
+                    context_rows.extend(_fetch_bitget_reality_symbol_rows())
+                    context_rows = _unique_rows(context_rows)
+                except Exception as direct_error:
+                    logger.warning("Bitget Reality catalog unavailable: %s", direct_error)
+            if exchange_id == "gate" and market_type == "spot":
+                try:
+                    context_rows.extend(_fetch_gate_stock_symbol_rows())
+                    context_rows = _unique_rows(context_rows)
+                except Exception as direct_error:
+                    logger.warning("Gate stock catalog unavailable: %s", direct_error)
+            return context_rows, {
+                "exchange": exchange_id,
+                "market_type": market_type,
+                "ok": True,
+                "rows": len(context_rows),
+                "source": "ccxt",
+            }
+        except Exception as e:
+            if exchange_id == "bitget" and market_type == "spot":
+                try:
+                    context_rows = _fetch_bitget_reality_symbol_rows()
+                    return context_rows, {
+                        "exchange": exchange_id,
+                        "market_type": market_type,
+                        "ok": True,
+                        "rows": len(context_rows),
+                        "source": "official_public_api",
+                        "fallback": True,
+                        "primary_error": str(e)[:500],
+                    }
+                except Exception as fallback_error:
+                    e = RuntimeError(f"{e}; official fallback failed: {fallback_error}")
+            if exchange_id == "gate" and market_type == "spot":
+                try:
+                    context_rows = _fetch_gate_stock_symbol_rows()
+                    return context_rows, {
+                        "exchange": exchange_id,
+                        "market_type": market_type,
+                        "ok": True,
+                        "rows": len(context_rows),
+                        "source": "official_stock_api",
+                        "fallback": True,
+                        "primary_error": str(e)[:500],
+                    }
+                except Exception as fallback_error:
+                    e = RuntimeError(f"{e}; official stock fallback failed: {fallback_error}")
+            if exchange_id == "okx":
+                try:
+                    context_rows = _fetch_okx_public_symbol_rows(market_type, _classify_asset)
+                    return context_rows, {
+                        "exchange": exchange_id,
+                        "market_type": market_type,
+                        "ok": True,
+                        "rows": len(context_rows),
+                        "source": "official_public_api",
+                        "fallback": True,
+                        "primary_error": str(e)[:500],
+                    }
+                except Exception as fallback_error:
+                    e = RuntimeError(f"{e}; official fallback failed: {fallback_error}")
+            logger.warning("crypto catalog unavailable exchange=%s type=%s: %s", exchange_id, market_type, e)
+            return [], {
+                "exchange": exchange_id,
+                "market_type": market_type,
+                "ok": False,
+                "rows": 0,
+                "error": str(e),
+            }
+
+    rows: List[SymbolMasterRow] = []
+    contexts = []
+    work = [(exchange_id, market_type) for exchange_id in PUBLIC_KLINE_EXCHANGE_IDS for market_type in ("spot", "swap")]
+    worker_count = min(6, len(work))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="symbol-catalog") as executor:
+        futures = {
+            executor.submit(fetch_context, exchange_id, market_type): (exchange_id, market_type)
+            for exchange_id, market_type in work
+        }
+        for future in as_completed(futures):
+            context_rows, diagnostic = future.result()
+            rows.extend(context_rows)
+            contexts.append(diagnostic)
+    order = {exchange_id: index for index, exchange_id in enumerate(PUBLIC_KLINE_EXCHANGE_IDS)}
+    contexts.sort(key=lambda item: (order.get(item["exchange"], len(order)), item["market_type"]))
     return _unique_rows(rows), contexts
+
+
+def _fetch_bitget_reality_symbol_rows() -> List[SymbolMasterRow]:
+    response = requests.get(
+        "https://api.bitget.com/api/v3/market/instruments",
+        params={"category": "SPOT"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    items = data if isinstance(data, list) else data.get("list", []) if isinstance(data, dict) else []
+    rows: List[SymbolMasterRow] = []
+    for raw in items:
+        if not isinstance(raw, dict) or not _bitget_reality_marker(raw):
+            continue
+        base = _clean_symbol(raw.get("baseCoin") or raw.get("baseCurrency"))
+        quote = _clean_symbol(raw.get("quoteCoin") or raw.get("quoteCurrency"))
+        instrument_id = _clean_text(raw.get("symbol"))
+        if not base or quote != "USDT" or not instrument_id:
+            continue
+        status = str(raw.get("status") or "").strip().lower()
+        if status and status not in {"online", "normal", "trading", "live"}:
+            continue
+        symbol = normalize_crypto_symbol(f"{base}/{quote}")
+        profile = classify_instrument_product(
+            {"symbol": symbol, "id": instrument_id, "base": base, "quote": quote, "info": raw},
+            exchange_id="bitget",
+            market_type="spot",
+            symbol=symbol,
+            instrument_id=instrument_id,
+        )
+        if profile.product_type == "crypto":
+            continue
+        rows.append(
+            SymbolMasterRow(
+                "Crypto",
+                symbol,
+                _clean_text(raw.get("displayName") or raw.get("symbolName") or base),
+                "bitget",
+                quote,
+                "spot",
+                instrument_id,
+                quote,
+                profile.asset_class,
+                profile.product_type,
+                profile.api_family,
+                profile.underlying_market,
+                profile.underlying_symbol,
+                profile.product_meta,
+            )
+        )
+    return _unique_rows(rows)
+
+
+def _fetch_gate_stock_symbol_rows() -> List[SymbolMasterRow]:
+    rows: List[SymbolMasterRow] = []
+    supported_exchanges = (("us", "USStock"), ("hk", "HKStock"))
+    for stock_exchange, underlying_market in supported_exchanges:
+        page = 1
+        while True:
+            response = requests.get(
+                "https://api.gateio.ws/api/v4/stock/symbols/detail",
+                params={"exchange": stock_exchange, "page": page, "page_size": 500},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            items = data.get("list", []) if isinstance(data, dict) else []
+            for raw in items:
+                if not isinstance(raw, dict):
+                    continue
+                ticker = _clean_symbol(raw.get("symbol"))
+                quote = _clean_symbol(raw.get("quote_currency"))
+                trade_mode = int(raw.get("trade_mode") or 0)
+                if not ticker or not quote or trade_mode == 0:
+                    continue
+                status = "tradable" if trade_mode in {3, 4} else "buy_only" if trade_mode == 1 else "sell_only"
+                product_meta = {
+                    "instrument_id": ticker,
+                    "status": status,
+                    "session_status": str(raw.get("trade_status") or raw.get("status") or ""),
+                    "trade_mode": trade_mode,
+                    "order_fill_timing": raw.get("order_fill_timing"),
+                    "category": raw.get("category"),
+                    "asset_type": raw.get("asset_type"),
+                    "stock_exchange": stock_exchange,
+                    "quote_currency": quote,
+                    "quote_currency_precision": raw.get("quote_currency_precision"),
+                    "fx_rate": raw.get("fx_rate"),
+                    "min_order_volume": raw.get("min_order_volume"),
+                    "max_order_volume": raw.get("max_order_volume"),
+                    "step_order_volume": raw.get("step_order_volume"),
+                    "price_precision": raw.get("price_precision"),
+                    "volume_precision": raw.get("volume_precision"),
+                    "commission_rate": raw.get("commission_rate"),
+                    "slippage_rate": raw.get("slippage_rate"),
+                    "market_data_api_family": (
+                        "underlying_hk_equity" if underlying_market == "HKStock"
+                        else "underlying_us_equity"
+                    ),
+                }
+                rows.append(
+                    SymbolMasterRow(
+                        "Crypto",
+                        f"{ticker}/{quote}",
+                        _clean_text(raw.get("symbol_desc") or ticker),
+                        "gate",
+                        quote,
+                        "spot",
+                        ticker,
+                        _clean_symbol(raw.get("settlement_currency") or quote),
+                        "equity",
+                        "direct_equity",
+                        "stock",
+                        underlying_market,
+                        ticker,
+                        product_meta,
+                    )
+                )
+            total_pages = int(data.get("total_page") or 1) if isinstance(data, dict) else 1
+            if page >= total_pages or not items:
+                break
+            page += 1
+    return _unique_rows(rows)
+
+
+def _bitget_reality_marker(raw: Dict[str, object]) -> bool:
+    if str(raw.get("isReality") or "").strip().lower() in {"1", "true", "yes", "y"}:
+        return True
+    base = _clean_symbol(raw.get("baseCoin") or raw.get("baseCurrency"))
+    return (
+        str(raw.get("areaSymbol") or "").strip().lower() == "yes"
+        and base.startswith("R")
+        and 1 <= len(base[1:]) <= 5
+        and base[1:].isalpha()
+    )
 
 
 def _load_ccxt_markets_with_retry(exchange, attempts: int = 2) -> None:
@@ -451,17 +674,40 @@ def _okx_public_payload_to_rows(payload: dict, market_type: str, classify_asset)
             quote = "USDT"
         if not base or not instrument_id:
             continue
-        rows.append(SymbolMasterRow(
-            "Crypto",
-            f"{base}/{quote}",
-            base,
-            "okx",
-            quote,
-            market_type,
-            instrument_id,
-            quote,
-            classify_asset({"info": item}),
-        ))
+        unified = {
+            "symbol": f"{base}/{quote}",
+            "id": instrument_id,
+            "base": base,
+            "quote": quote,
+            "spot": market_type == "spot",
+            "swap": market_type == "swap",
+            "info": item,
+        }
+        profile = classify_instrument_product(
+            unified,
+            exchange_id="okx",
+            market_type=market_type,
+            symbol=f"{base}/{quote}",
+            instrument_id=instrument_id,
+        )
+        rows.append(
+            SymbolMasterRow(
+                "Crypto",
+                f"{base}/{quote}",
+                base,
+                "okx",
+                quote,
+                market_type,
+                instrument_id,
+                quote,
+                profile.asset_class,
+                profile.product_type,
+                profile.api_family,
+                profile.underlying_market,
+                profile.underlying_symbol,
+                profile.product_meta,
+            )
+        )
     return _unique_rows(rows)
 
 
@@ -523,11 +769,7 @@ def upsert_symbol_master(rows: Sequence[SymbolMasterRow]) -> int:
     with get_db_connection() as db:
         cur = db.cursor()
         count = 0
-        crypto_contexts = {
-            (row.exchange, row.market_type)
-            for row in rows
-            if row.market == "Crypto" and row.exchange
-        }
+        crypto_contexts = {(row.exchange, row.market_type) for row in rows if row.market == "Crypto" and row.exchange}
         for exchange_id, market_type in crypto_contexts:
             cur.execute(
                 "UPDATE qd_market_symbols SET is_active = 0 WHERE market = 'Crypto' AND exchange = ? AND market_type = ?",
@@ -538,20 +780,39 @@ def upsert_symbol_master(rows: Sequence[SymbolMasterRow]) -> int:
             cur.execute(
                 """
                 INSERT INTO qd_market_symbols
-                    (market, symbol, name, exchange, currency, market_type, instrument_id, settle_currency, asset_class,
-                     is_active, is_hot, sort_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0)
+                    (market, symbol, name, exchange, currency, market_type, instrument_id, settle_currency,
+                     asset_class, product_type, api_family, underlying_market, underlying_symbol, product_meta,
+                     metadata_updated_at, is_active, is_hot, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW(), 1, 0, 0)
                 ON CONFLICT (market, symbol, exchange, market_type, instrument_id) DO UPDATE
                   SET name = EXCLUDED.name,
                       exchange = COALESCE(NULLIF(EXCLUDED.exchange, ''), qd_market_symbols.exchange),
                       currency = COALESCE(NULLIF(EXCLUDED.currency, ''), qd_market_symbols.currency),
                       settle_currency = COALESCE(NULLIF(EXCLUDED.settle_currency, ''), qd_market_symbols.settle_currency),
                       asset_class = EXCLUDED.asset_class,
+                      product_type = EXCLUDED.product_type,
+                      api_family = EXCLUDED.api_family,
+                      underlying_market = EXCLUDED.underlying_market,
+                      underlying_symbol = EXCLUDED.underlying_symbol,
+                      product_meta = EXCLUDED.product_meta,
+                      metadata_updated_at = NOW(),
                       is_active = 1
                 """,
                 (
-                    row.market, row.symbol, row.name, row.exchange, row.currency,
-                    row.market_type, row.instrument_id, row.settle_currency, asset_class,
+                    row.market,
+                    row.symbol,
+                    row.name,
+                    row.exchange,
+                    row.currency,
+                    row.market_type,
+                    row.instrument_id,
+                    row.settle_currency,
+                    asset_class,
+                    row.product_type or "crypto",
+                    row.api_family or row.market_type or "spot",
+                    row.underlying_market or "",
+                    row.underlying_symbol or "",
+                    json.dumps(row.product_meta or {}, ensure_ascii=False),
                 ),
             )
             count += 1

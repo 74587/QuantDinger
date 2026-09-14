@@ -46,6 +46,7 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
     try:
         from app.services.exchange_execution import coalesce_exchange_config_from_payload, load_strategy_configs, resolve_exchange_config
         from app.services.live_trading.factory import create_client
+        from app.services.pending_orders.live_order_support import bind_instrument_product_contract
 
         sc = load_strategy_configs(sid) or {}
         tc = sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {}
@@ -60,6 +61,13 @@ def shutdown_grid_for_strategy(strategy_id: int) -> None:
         user_id = int(sc.get("user_id") or 1)
         ex_cfg = resolve_exchange_config(coalesce_exchange_config_from_payload(sc), user_id=user_id)
         mt = str(tc.get("market_type") or sc.get("market_type") or "swap").strip().lower()
+        ex_cfg = bind_instrument_product_contract(
+            ex_cfg,
+            tc,
+            symbol=symbol,
+            exchange_id=str(ex_cfg.get("exchange_id") or ""),
+            market_type=mt,
+        )
 
         def _create_client():
             return create_client(ex_cfg, market_type=mt)

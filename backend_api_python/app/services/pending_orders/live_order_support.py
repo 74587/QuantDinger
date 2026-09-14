@@ -213,6 +213,87 @@ def signal_to_side_pos_reduce(signal_type: str) -> Tuple[str, str, bool]:
     raise LiveTradingError(f"Unsupported signal_type: {signal_type}")
 
 
+def bind_instrument_product_contract(
+    exchange_config: Dict[str, Any],
+    trading_config: Dict[str, Any],
+    *,
+    symbol: str,
+    exchange_id: str,
+    market_type: str,
+) -> Dict[str, Any]:
+    """Bind a strategy product contract to client configuration."""
+    products = trading_config.get("instrument_products") or []
+    if not isinstance(products, list):
+        products = []
+    equity_products = [
+        item
+        for item in products
+        if isinstance(item, dict)
+        and str(item.get("product_type") or "crypto").strip().lower() != "crypto"
+    ]
+    if not equity_products:
+        return dict(exchange_config)
+    symbol_key = str(symbol or "").strip().upper()
+    exchange_key = str(exchange_id or "").strip().lower()
+    market_key = str(market_type or "spot").strip().lower()
+    matching = next(
+        (
+            item
+            for item in equity_products
+            if str(item.get("symbol") or "").strip().upper() == symbol_key
+            and str(item.get("exchange_id") or "").strip().lower() == exchange_key
+            and str(item.get("market_type") or "spot").strip().lower() == market_key
+        ),
+        None,
+    )
+    if not matching:
+        raise ValueError("strategyV2.instrumentProductContractMismatch")
+    result = dict(exchange_config)
+    result["api_family"] = str(matching.get("api_family") or market_key).strip().lower()
+    result["instrument_product_type"] = str(matching.get("product_type") or "").strip().lower()
+    result["instrument_id"] = str(matching.get("instrument_id") or "").strip()
+    result["instrument_product_meta"] = dict(matching.get("product_meta") or {})
+    return result
+
+
+def attach_instrument_product_contracts(
+    candidates: list[Dict[str, Any]],
+    trading_config: Dict[str, Any],
+    *,
+    exchange_id: str,
+) -> None:
+    """Attach immutable deployment product metadata to live candidates."""
+    products = trading_config.get("instrument_products") or []
+    if not isinstance(products, list) or not products:
+        return
+    exchange_key = str(exchange_id or "").strip().lower()
+    index: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for item in products:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("symbol") or "").strip().upper(),
+            str(item.get("exchange_id") or "").strip().lower(),
+            str(item.get("market_type") or "spot").strip().lower(),
+        )
+        if all(key):
+            index[key] = item
+    for member in candidates:
+        if str(member.get("market") or "").strip() != "Crypto":
+            continue
+        member_exchange = str(member.get("exchange_id") or exchange_key).strip().lower()
+        market_type = str(member.get("market_type") or "spot").strip().lower()
+        product = index.get(
+            (str(member.get("symbol") or "").strip().upper(), member_exchange, market_type)
+        )
+        if not product:
+            continue
+        member["exchange_id"] = member_exchange
+        member["instrument_id"] = str(product.get("instrument_id") or "").strip()
+        member["product_type"] = str(product.get("product_type") or "crypto").strip().lower()
+        member["api_family"] = str(product.get("api_family") or market_type).strip().lower()
+
+
 def build_live_order_context(
     *,
     order_id: int,
@@ -261,7 +342,6 @@ def build_live_order_context(
         )
     strategy_user_id = int(cfg.get("user_id") or 1)
     exchange_config = resolve_exchange_config(cfg.get("exchange_config") or {}, user_id=strategy_user_id)
-    safe_cfg = safe_exchange_config_for_log(exchange_config)
     exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
     market_category = str(cfg.get("market_category") or "Crypto").strip()
 
@@ -297,6 +377,23 @@ def build_live_order_context(
     market_type = str(pre_market_type or "swap").strip().lower()
     if market_type in ("futures", "future", "perp", "perpetual"):
         market_type = "swap"
+
+    try:
+        exchange_config = bind_instrument_product_contract(
+            exchange_config,
+            trading_cfg,
+            symbol=str(symbol),
+            exchange_id=exchange_id,
+            market_type=market_type,
+        )
+    except ValueError as exc:
+        raise LiveOrderRejected(
+            error=str(exc),
+            strategy_id=strategy_id,
+            strategy_log="Order rejected: instrument product contract mismatch",
+        ) from exc
+
+    safe_cfg = safe_exchange_config_for_log(exchange_config)
 
     return LiveOrderExecutionContext(
         order_id=int(order_id),

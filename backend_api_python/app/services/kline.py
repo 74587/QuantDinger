@@ -9,6 +9,8 @@ from app.utils.logger import get_logger
 from app.config import CacheConfig
 from app.config.data_sources import CCXTConfig
 from app.data_providers.gate_public_market import get_gate_spot_klines
+from app.data_providers.bitget_reality_market import get_bitget_reality_klines
+from app.services.market.product_catalog import get_catalog_product
 
 logger = get_logger(__name__)
 
@@ -29,6 +31,7 @@ class KlineService:
         before_time: Optional[int] = None,
         exchange_id: Optional[str] = None,
         market_type: Optional[str] = None,
+        instrument_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取K线数据
@@ -50,13 +53,57 @@ class KlineService:
         effective_ex_key = ex_key or str(CCXTConfig.DEFAULT_EXCHANGE or "").strip().lower()
         mt_key = (market_type or "").strip().lower()
         if not before_time:
-            cache_key = f"kline:{normalized_market}:{ex_key}:{mt_key}:{symbol}:{timeframe}:{limit}"
+            native_key = (instrument_id or "").strip()
+            cache_key = f"kline:{normalized_market}:{ex_key}:{mt_key}:{native_key}:{symbol}:{timeframe}:{limit}"
             cached = self.cache.get(cache_key)
             if cached:
                 return cached
         
         klines = None
+        catalog_product = None
+        if normalized_market == "Crypto" and ex_key and mt_key:
+            try:
+                catalog_product = get_catalog_product(
+                    market="Crypto",
+                    symbol=symbol,
+                    exchange_id=ex_key,
+                    market_type=mt_key,
+                    instrument_id=str(instrument_id or ""),
+                )
+            except Exception:
+                catalog_product = None
+        if catalog_product and str(catalog_product.get("product_type") or "").strip().lower() == "direct_equity":
+            underlying = str(catalog_product.get("underlying_symbol") or "").strip().upper()
+            underlying_market = str(catalog_product.get("underlying_market") or "").strip()
+            if underlying and underlying_market in {"USStock", "HKStock"}:
+                klines = DataSourceFactory.get_kline(
+                    market=underlying_market,
+                    symbol=underlying,
+                    timeframe=timeframe,
+                    limit=limit,
+                    before_time=before_time,
+                )
+        if normalized_market == "Crypto" and effective_ex_key == "bitget" and mt_key in {"", "spot"}:
+            try:
+                product = catalog_product or get_catalog_product(
+                    market="Crypto",
+                    symbol=symbol,
+                    exchange_id="bitget",
+                    market_type="spot",
+                    instrument_id=str(instrument_id or ""),
+                )
+            except Exception:
+                product = None
+            if product and str(product.get("api_family") or "").strip().lower() == "reality":
+                klines = get_bitget_reality_klines(
+                    str(product.get("instrument_id") or instrument_id or symbol),
+                    timeframe,
+                    limit,
+                    before_time=before_time,
+                )
         if (
+            not klines
+            and
             normalized_market == "Crypto"
             and effective_ex_key == "gate"
             and mt_key in {"", "spot"}
@@ -103,6 +150,7 @@ class KlineService:
         force_refresh: bool = False,
         exchange_id: Optional[str] = None,
         market_type: Optional[str] = None,
+        instrument_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         获取实时价格（优先使用 ticker API，降级使用分钟 K 线）
@@ -126,7 +174,8 @@ class KlineService:
         """
         ex_key = (exchange_id or "").strip().lower()
         mt_key = (market_type or "").strip().lower()
-        cache_key = f"realtime_price:{market}:{ex_key}:{mt_key}:{symbol}"
+        native_key = (instrument_id or "").strip()
+        cache_key = f"realtime_price:{market}:{ex_key}:{mt_key}:{native_key}:{symbol}"
         
         if not force_refresh:
             cached = self.cache.get(cache_key)
@@ -144,10 +193,26 @@ class KlineService:
             'source': 'unknown'
         }
         
+        catalog_product = None
+        if DataSourceFactory.normalize_market(market or "") == "Crypto" and ex_key and mt_key:
+            try:
+                catalog_product = get_catalog_product(
+                    market="Crypto",
+                    symbol=symbol,
+                    exchange_id=ex_key,
+                    market_type=mt_key,
+                    instrument_id=native_key,
+                )
+            except Exception:
+                catalog_product = None
+        api_family = str((catalog_product or {}).get("api_family") or "").strip().lower()
+
         try:
-            ticker = DataSourceFactory.get_ticker(
-                market, symbol, exchange_id=exchange_id, market_type=market_type
-            )
+            ticker = None
+            if api_family not in {"reality", "stock"}:
+                ticker = DataSourceFactory.get_ticker(
+                    market, symbol, exchange_id=exchange_id, market_type=market_type
+                )
             if ticker and ticker.get('last', 0) > 0:
                 result = {
                     'price': ticker.get('last', 0),
@@ -167,7 +232,13 @@ class KlineService:
         
         try:
             klines = self.get_kline(
-                market, symbol, '1m', 2, exchange_id=exchange_id, market_type=market_type
+                market,
+                symbol,
+                '1m',
+                2,
+                exchange_id=exchange_id,
+                market_type=market_type,
+                instrument_id=instrument_id,
             )
             if klines and len(klines) > 0:
                 latest = klines[-1]
@@ -201,6 +272,7 @@ class KlineService:
                 2,
                 exchange_id=exchange_id,
                 market_type=market_type,
+                instrument_id=instrument_id,
             )
             if klines and len(klines) > 0:
                 latest = klines[-1]

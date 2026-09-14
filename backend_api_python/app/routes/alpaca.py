@@ -24,7 +24,7 @@ logger = get_logger(__name__)
 
 alpaca_blp = Blueprint('alpaca', __name__)
 
-# Per-user client cache keyed by (user_id, 'alpaca')
+# Clients are isolated by authenticated user and saved credential id.
 _sessions = BrokerSessionRegistry('alpaca')
 
 
@@ -91,24 +91,50 @@ def _config_to_vault_dict(config: AlpacaConfig) -> dict:
     }
 
 
-def _load_saved_alpaca_config(user_id: int) -> dict:
-    """Load the most recent saved Alpaca credential for this user."""
+def _saved_alpaca_rows(user_id: int) -> list:
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
             """
-            SELECT id, encrypted_config
+            SELECT id, name, api_key_hint, encrypted_config
             FROM qd_exchange_credentials
             WHERE user_id = %s AND exchange_id = 'alpaca'
             ORDER BY updated_at DESC NULLS LAST, id DESC
-            LIMIT 1
             """,
             (int(user_id),),
         )
-        row = cur.fetchone() or {}
+        rows = cur.fetchall() or []
         cur.close()
-    if not row:
+    return rows
+
+
+def _requested_credential_id():
+    body = request.get_json(silent=True) or {}
+    value = request.args.get("credential_id", body.get("credential_id"))
+    if value is None:
+        return None
+    try:
+        credential_id = int(value)
+        if credential_id > 0:
+            return credential_id
+    except (ValueError, TypeError):
+        pass
+    raise ValueError("brokerAccounts.accountSelectionRequired")
+
+
+def _load_saved_alpaca_config(user_id: int) -> dict:
+    """Resolve an owned credential; never silently choose between accounts."""
+    rows = _saved_alpaca_rows(user_id)
+    credential_id = _requested_credential_id()
+    if credential_id is not None:
+        rows = [row for row in rows if int(row["id"]) == credential_id]
+        if not rows:
+            raise ValueError("brokerAccounts.accountUnavailable")
+    elif len(rows) > 1:
+        raise ValueError("brokerAccounts.accountSelectionRequired")
+    if not rows:
         return {}
+    row = rows[0]
     try:
         plain = decrypt_credential_blob(row.get("encrypted_config"))
         cfg = json.loads(plain) if plain else {}
@@ -121,7 +147,7 @@ def _load_saved_alpaca_config(user_id: int) -> dict:
         return {}
 
 
-def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int:
+def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig, name: str = "") -> int:
     """Persist the connected Alpaca credential so refresh/restart can restore it."""
     vault_cfg = _config_to_vault_dict(config)
     api_key = str(config.api_key or "").strip()
@@ -157,10 +183,11 @@ def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int
                 UPDATE qd_exchange_credentials
                 SET api_key_hint = %s,
                     encrypted_config = %s,
+                    name = COALESCE(NULLIF(%s, ''), name),
                     updated_at = NOW()
                 WHERE id = %s AND user_id = %s
                 """,
-                (hint, encrypted, target_id, int(user_id)),
+                (hint, encrypted, str(name or "").strip()[:100], target_id, int(user_id)),
             )
             cred_id = target_id
         else:
@@ -171,7 +198,7 @@ def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int
                 VALUES (%s, %s, 'alpaca', %s, %s, NOW(), NOW())
                 RETURNING id
                 """,
-                (int(user_id), f"Alpaca {_alpaca_env_tag(api_key).title()}", hint, encrypted),
+                (int(user_id), str(name or "").strip()[:100] or f"Alpaca {_alpaca_env_tag(api_key).title()}", hint, encrypted),
             )
             cred_id = int((cur.fetchone() or {}).get("id") or 0)
         db.commit()
@@ -179,9 +206,9 @@ def _save_or_update_alpaca_credential(user_id: int, config: AlpacaConfig) -> int
     return cred_id
 
 
-def _client_from_saved_credential():
+def _client_from_saved_credential(cfg=None):
     user_id = int(getattr(g, "user_id", 1) or 1)
-    cfg = _load_saved_alpaca_config(user_id)
+    cfg = cfg if cfg is not None else _load_saved_alpaca_config(user_id)
     if not cfg:
         return None
     config = AlpacaConfig(
@@ -195,22 +222,31 @@ def _client_from_saved_credential():
     client = AlpacaClient(config)
     if not client.connect():
         return None
-    _sessions.set(client)
+    _sessions.set(client, cfg["credential_id"])
     return client
 
 
 # ==================== Connection Management ====================
+
+@alpaca_blp.route('/accounts', methods=['GET'])
+@login_required
+def get_saved_accounts():
+    rows = _saved_alpaca_rows(int(g.user_id))
+    return jsonify({"success": True, "data": [
+        {key: row.get(key) for key in ("id", "name", "api_key_hint")}
+        for row in rows
+    ]})
 
 @alpaca_blp.route('/status', methods=['GET'])
 @login_required
 def get_status():
     """Get Alpaca connection status."""
     try:
-        client = _sessions.get()
+        saved = _load_saved_alpaca_config(int(g.user_id))
+        client = _sessions.get(saved["credential_id"]) if saved else None
         if client is None:
-            client = _client_from_saved_credential()
+            client = _client_from_saved_credential(saved)
         if client is None:
-            saved = _load_saved_alpaca_config(int(getattr(g, "user_id", 1) or 1))
             data = _placeholder_status()
             if saved:
                 data.update(
@@ -222,11 +258,12 @@ def get_status():
                 )
             return jsonify({"success": True, "data": data})
         data = client.get_connection_status()
-        saved = _load_saved_alpaca_config(int(getattr(g, "user_id", 1) or 1))
         if saved:
             data["credential_id"] = saved.get("credential_id") or 0
             data["saved"] = True
         return jsonify({"success": True, "data": data})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         logger.error(f"Get status failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -254,8 +291,8 @@ def connect():
         client = AlpacaClient(config)
         success = client.connect()
         if success:
-            cred_id = _save_or_update_alpaca_credential(int(getattr(g, "user_id", 1) or 1), config)
-            _sessions.set(client)
+            cred_id = _save_or_update_alpaca_credential(int(g.user_id), config, data.get("name", ""))
+            _sessions.set(client, cred_id)
             status = client.get_connection_status()
             status["credential_id"] = cred_id
             status["saved"] = True
@@ -283,7 +320,9 @@ def connect():
 def disconnect():
     """Disconnect from Alpaca."""
     try:
-        _sessions.disconnect_current()
+        cfg = _load_saved_alpaca_config(int(g.user_id))
+        if cfg:
+            _sessions.disconnect_current(cfg["credential_id"])
         return jsonify({"success": True, "message": "Disconnected"})
     except Exception as e:
         logger.error(f"Disconnect failed: {e}")
@@ -293,9 +332,13 @@ def disconnect():
 # ==================== Account Queries ====================
 
 def _require_connected_client():
-    client = _sessions.get()
+    try:
+        cfg = _load_saved_alpaca_config(int(g.user_id))
+    except ValueError as exc:
+        return None, (jsonify({"success": False, "error": str(exc)}), 400)
+    client = _sessions.get(cfg["credential_id"]) if cfg else None
     if client is None or not client.connected:
-        client = _client_from_saved_credential()
+        client = _client_from_saved_credential(cfg)
     if client is None or not client.connected:
         return None, (jsonify({"success": False, "error": "Not connected to Alpaca"}), 400)
     return client, None
@@ -309,7 +352,26 @@ def get_account():
         client, err = _require_connected_client()
         if err is not None:
             return err
-        return jsonify({"success": True, "data": client.get_account_summary()})
+        summary = client.get_account_summary()
+        if summary.get("success") is False:
+            return jsonify({"success": False, "error": "brokerAccounts.accountLoadFailed"}), 502
+        if not _as_bool(request.args.get("include_counts"), True):
+            return jsonify({"success": True, "data": summary})
+        summary["position_count"] = None
+        summary["recent_filled_order_count"] = None
+        summary["recent_order_limit"] = 100
+        try:
+            summary["position_count"] = len(client.get_positions(raise_on_error=True))
+        except Exception:
+            logger.warning("Alpaca account position count unavailable")
+        try:
+            orders = client.get_orders(limit=100, raise_on_error=True)
+            summary["recent_filled_order_count"] = sum(
+                1 for order in orders if str(order.get("status") or "").strip().lower() == "filled"
+            )
+        except Exception:
+            logger.warning("Alpaca account recent order count unavailable")
+        return jsonify({"success": True, "data": summary})
     except Exception as e:
         logger.error(f"Get account info failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -323,7 +385,7 @@ def get_positions():
         client, err = _require_connected_client()
         if err is not None:
             return err
-        return jsonify({"success": True, "data": client.get_positions()})
+        return jsonify({"success": True, "data": client.get_positions(raise_on_error=True)})
     except Exception as e:
         logger.error(f"Get positions failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -339,7 +401,7 @@ def get_orders():
             return err
         status = str(request.args.get("status") or "all").strip().lower()
         limit = int(request.args.get("limit") or 100)
-        return jsonify({"success": True, "data": client.get_orders(status=status, limit=limit)})
+        return jsonify({"success": True, "data": client.get_orders(status=status, limit=limit, raise_on_error=True)})
     except Exception as e:
         logger.error(f"Get orders failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500

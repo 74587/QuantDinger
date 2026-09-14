@@ -1,5 +1,6 @@
 """Symbol search helpers for the market API."""
 
+import json
 import re
 import time
 from typing import Iterable
@@ -9,6 +10,7 @@ from app.data.market_symbols_seed import (
     search_symbols as seed_search_symbols,
 )
 from app.services.symbol_name import persist_seed_name
+from app.services.market.instrument_products import classify_instrument_product
 from app.services.market_context import (
     canonical_crypto_symbol,
     default_crypto_exchange_id,
@@ -56,6 +58,11 @@ def dedupe_symbol_results(items: Iterable[dict], limit: int) -> list:
             "instrument_id": instrument_id,
             "settle_currency": settle_currency,
             "asset_class": asset_class,
+            "product_type": str(item.get("product_type") or "crypto").strip().lower(),
+            "api_family": str(item.get("api_family") or market_type or "spot").strip().lower(),
+            "underlying_market": str(item.get("underlying_market") or "").strip(),
+            "underlying_symbol": str(item.get("underlying_symbol") or "").strip().upper(),
+            "product_meta": _json_object(item.get("product_meta")),
         })
         if len(out) >= limit:
             break
@@ -241,6 +248,13 @@ def _search_crypto_exchange(
                 if not is_target_type:
                     continue
                 canonical_symbol = canonical_crypto_symbol(sym)
+                profile = classify_instrument_product(
+                    info,
+                    exchange_id=exchange_id,
+                    market_type=market_type,
+                    symbol=canonical_symbol,
+                    instrument_id=str(info.get("id") or sym),
+                )
                 markets.append({
                     "symbol": canonical_symbol,
                     "base": info.get("base", ""),
@@ -249,7 +263,7 @@ def _search_crypto_exchange(
                     "market_type": market_type,
                     "instrument_id": str(info.get("id") or sym),
                     "settle_currency": str(info.get("settle") or info.get("quote") or "").upper(),
-                    "asset_class": _classify_asset(info),
+                    **profile.as_dict(),
                 })
             _crypto_markets_cache[cache_key] = {"data": markets, "ts": now}
             _persist_crypto_markets(markets, exchange_id, market_type)
@@ -289,7 +303,8 @@ def _search_cached_crypto_symbols(
             cur.execute(
                 """
                 SELECT market, symbol, name, exchange AS exchange_id, market_type,
-                       instrument_id, settle_currency, asset_class
+                       instrument_id, settle_currency, asset_class, product_type,
+                       api_family, underlying_market, underlying_symbol, product_meta
                 FROM qd_market_symbols
                 WHERE market = 'Crypto' AND is_active = 1
                   AND exchange = ? AND market_type = ?
@@ -326,14 +341,22 @@ def _persist_crypto_markets(markets: list, exchange_id: str, market_type: str) -
                     """
                     INSERT INTO qd_market_symbols (
                         market, symbol, name, exchange, market_type, instrument_id,
-                        settle_currency, currency, asset_class, is_active, is_hot, sort_order
+                        settle_currency, currency, asset_class, product_type, api_family,
+                        underlying_market, underlying_symbol, product_meta, metadata_updated_at,
+                        is_active, is_hot, sort_order
                     )
-                    VALUES ('Crypto', ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 0)
+                    VALUES ('Crypto', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, NOW(), 1, 0, 0)
                     ON CONFLICT (market, symbol, exchange, market_type, instrument_id) DO UPDATE
                       SET name = EXCLUDED.name,
                           settle_currency = EXCLUDED.settle_currency,
                           currency = EXCLUDED.currency,
                           asset_class = EXCLUDED.asset_class,
+                          product_type = EXCLUDED.product_type,
+                          api_family = EXCLUDED.api_family,
+                          underlying_market = EXCLUDED.underlying_market,
+                          underlying_symbol = EXCLUDED.underlying_symbol,
+                          product_meta = EXCLUDED.product_meta,
+                          metadata_updated_at = NOW(),
                           is_active = 1
                     """,
                     (
@@ -345,6 +368,11 @@ def _persist_crypto_markets(markets: list, exchange_id: str, market_type: str) -
                         item.get("settle_currency") or "",
                         item.get("settle_currency") or "",
                         item.get("asset_class") or "crypto",
+                        item.get("product_type") or "crypto",
+                        item.get("api_family") or market_type,
+                        item.get("underlying_market") or "",
+                        item.get("underlying_symbol") or "",
+                        json.dumps(item.get("product_meta") or {}, ensure_ascii=False),
                     ),
                 )
             db.commit()
@@ -354,16 +382,29 @@ def _persist_crypto_markets(markets: list, exchange_id: str, market_type: str) -
 
 
 def _classify_asset(info: dict) -> str:
+    profile = classify_instrument_product(info)
     raw = info.get("info") if isinstance(info.get("info"), dict) else {}
-    inst_category = str(raw.get("instCategory") or "").strip()
-    fields = " ".join(str(raw.get(key) or "") for key in (
-        "symbolType", "underlyingType", "assetClass", "category", "contractType", "businessType"
-    )).lower()
-    if inst_category == "3" or any(token in fields for token in ("stock", "xstock", "equity")):
-        return "equity"
-    if str(raw.get("isRwa") or "").strip().upper() == "YES":
+    if (
+        str(raw.get("isRwa") or "").strip().upper() == "YES"
+        and not any(
+            token in " ".join(str(value or "") for value in raw.values()).lower()
+            for token in ("stock", "xstock", "equity")
+        )
+    ):
         return "rwa"
-    return "crypto"
+    return profile.asset_class
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _df_records(df) -> list:

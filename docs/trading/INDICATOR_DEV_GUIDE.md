@@ -713,8 +713,12 @@ Answer these questions before converting:
 - Are repeated entries, scale-in, or scale-out allowed?
 - How should sizing, stop-loss, take-profit, and trailing protection work?
 - Which instrument and market type will the strategy own?
+- If it is an exchange equity, what exact catalog product, venue, currency, product type, and API family will execution use? Preserve an instrument such as <code>Crypto:00700/HKD@gate:spot</code> or a catalog-confirmed <code>Crypto:HK0700/USDT@binance:swap</code>; do not replace it with its underlying stock.
+- Is the product a long-only spot equity or a Crypto swap derivative that requires explicit direction metadata and <code>position_side</code>?
 
 The converted strategy should remove chart-only colors, label offsets, plots, layers, and marker arrays. Preserve the signal algebra, then declare instruments, frequency, sizing, and risk explicitly with Strategy API V2.
+
+Underlying stock data can support chart history and point-in-time fundamentals only when the active catalog supplies a valid <code>USStock</code> or <code>HKStock</code> mapping. That data mapping never changes the execution instrument, and the converter must not guess a region from a display name.
 
 Always verify and backtest generated strategy code again. Marketplace publication requires at least one successful backtest record.
 

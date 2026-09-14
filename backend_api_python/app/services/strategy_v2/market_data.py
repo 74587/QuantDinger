@@ -113,6 +113,8 @@ def _load_strategy_frame_uncached(
     *,
     market_type: Optional[str] = None,
     exchange_id: Optional[str] = None,
+    instrument_id: Optional[str] = None,
+    api_family: Optional[str] = None,
 ) -> pd.DataFrame:
     start_utc = _normalize_utc_datetime(start_date)
     end_utc = _normalize_utc_datetime(end_date)
@@ -129,6 +131,8 @@ def _load_strategy_frame_uncached(
         str(timeframe),
         str(market_type or ""),
         str(exchange_id or ""),
+        str(instrument_id or ""),
+        str(api_family or ""),
         start_utc.isoformat(),
         end_utc.isoformat(),
     ))
@@ -136,9 +140,40 @@ def _load_strategy_frame_uncached(
     requested_end = pd.Timestamp(end_utc).tz_localize(None)
     closed_bar_cutoff = _last_completed_bar_open(timeframe_seconds)
     coverage_end = min(requested_end, closed_bar_cutoff)
+    effective_market = str(market or "")
+    effective_symbol = str(symbol or "")
+    if (
+        effective_market.strip().lower() == "crypto"
+        and str(exchange_id or "").strip().lower() == "gate"
+        and str(market_type or "spot").strip().lower() == "spot"
+        and str(api_family or "").strip().lower() == "stock"
+    ):
+        from app.services.market.product_catalog import get_catalog_product
+
+        product = get_catalog_product(
+            market="Crypto",
+            symbol=symbol,
+            exchange_id="gate",
+            market_type="spot",
+            instrument_id=str(instrument_id or ""),
+        )
+        underlying = str((product or {}).get("underlying_symbol") or "").strip().upper()
+        underlying_market = str((product or {}).get("underlying_market") or "").strip()
+        if not underlying or underlying_market not in {"USStock", "HKStock"}:
+            raise MarketDataUnavailableError(
+                classify_market_data_failure(
+                    "Gate stock product has no supported underlying market-data identity",
+                    exchange_id="gate",
+                    market_type="spot",
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
+            )
+        effective_market = underlying_market
+        effective_symbol = underlying
     cached = _cache.get(cache_key)
     if cached is not None and not cached.empty:
-        if str(market or "").strip().lower() != "crypto" or _covers_crypto_window(
+        if str(effective_market or "").strip().lower() != "crypto" or _covers_crypto_window(
             cached,
             requested_start,
             coverage_end,
@@ -155,17 +190,36 @@ def _load_strategy_frame_uncached(
             cached.index.max(),
         )
     try:
+        if (
+            str(market or "").strip().lower() == "crypto"
+            and str(exchange_id or "").strip().lower() == "bitget"
+            and str(market_type or "spot").strip().lower() == "spot"
+            and str(api_family or "").strip().lower() == "reality"
+        ):
+            from app.data_providers.bitget_reality_market import get_bitget_reality_klines
+
+            rows = get_bitget_reality_klines(
+                str(instrument_id or symbol),
+                timeframe,
+                limit,
+                before_time=before_time,
+                after_time=after_time,
+            )
+        else:
+            rows = None
         kwargs = {
-            "market": market,
-            "symbol": symbol,
+            "market": effective_market,
+            "symbol": effective_symbol,
             "timeframe": provider_timeframe,
             "limit": limit,
             "before_time": before_time,
             "after_time": after_time,
-            "exchange_id": exchange_id,
-            "market_type": market_type,
+            "exchange_id": exchange_id if effective_market == market else None,
+            "market_type": market_type if effective_market == market else None,
         }
-        if exchange_id:
+        if rows is not None:
+            pass
+        elif effective_market == market and exchange_id:
             rows, failure = DataSourceFactory.get_kline_with_diagnostics(**kwargs)
             if not rows and failure is not None:
                 raise MarketDataUnavailableError(failure)
@@ -213,7 +267,7 @@ def _load_strategy_frame_uncached(
     if requested_end >= closed_bar_cutoff:
         frame = frame[frame.index <= closed_bar_cutoff]
     if (
-        str(market or "").strip().lower() == "crypto"
+        str(effective_market or "").strip().lower() == "crypto"
         and not _covers_crypto_window(frame, requested_start, coverage_end, timeframe_seconds)
     ):
         if not frame.empty:
@@ -246,6 +300,8 @@ def _shared_frame_key(
     timeframe: str,
     market_type: Optional[str],
     exchange_id: Optional[str],
+    instrument_id: Optional[str] = None,
+    api_family: Optional[str] = None,
 ) -> str:
     """Return the process-wide identity for one canonical candle stream."""
     return ":".join((
@@ -253,6 +309,8 @@ def _shared_frame_key(
         str(market or "").strip().lower(),
         str(market_type or "default").strip().lower(),
         str(symbol or "").strip().upper(),
+        str(instrument_id or "").strip(),
+        str(api_family or "").strip().lower(),
         str(timeframe or "1d").strip().lower(),
     ))
 
@@ -317,6 +375,41 @@ def _cached_crypto_frame_is_usable(
     return bool(frame.index.max() >= coverage_end - max_lag)
 
 
+def _uses_continuous_crypto_calendar(
+    market: str,
+    symbol: str,
+    *,
+    exchange_id: Optional[str],
+    market_type: Optional[str],
+    instrument_id: Optional[str],
+    api_family: Optional[str],
+) -> bool:
+    if str(market or "").strip().lower() != "crypto":
+        return False
+    if str(api_family or "").strip().lower() in {"reality", "stock"}:
+        return False
+    if not exchange_id or not instrument_id:
+        return True
+    try:
+        from app.services.market.product_catalog import get_catalog_product
+
+        product = get_catalog_product(
+            market="Crypto",
+            symbol=symbol,
+            exchange_id=str(exchange_id),
+            market_type=str(market_type or "spot"),
+            instrument_id=str(instrument_id),
+        )
+    except Exception:
+        return True
+    if not product:
+        return True
+    return not bool(
+        str(product.get("underlying_market") or "").strip()
+        or str(product.get("product_type") or "crypto").strip().lower() != "crypto"
+    )
+
+
 def clear_shared_strategy_frame_cache() -> None:
     """Clear process-local candle state. Intended for tests and controlled reloads."""
     with _shared_frames_lock:
@@ -333,6 +426,8 @@ def load_strategy_frame(
     *,
     market_type: Optional[str] = None,
     exchange_id: Optional[str] = None,
+    instrument_id: Optional[str] = None,
+    api_family: Optional[str] = None,
 ) -> pd.DataFrame:
     """Load candles through a process-wide, incremental singleflight cache.
 
@@ -354,8 +449,23 @@ def load_strategy_frame(
         closed_cutoff,
         timeframe_seconds,
     )
-    crypto_market = str(market or "").strip().lower() == "crypto"
-    key = _shared_frame_key(market, symbol, timeframe, market_type, exchange_id)
+    continuous_crypto_market = _uses_continuous_crypto_calendar(
+        market,
+        symbol,
+        exchange_id=exchange_id,
+        market_type=market_type,
+        instrument_id=instrument_id,
+        api_family=api_family,
+    )
+    key = _shared_frame_key(
+        market,
+        symbol,
+        timeframe,
+        market_type,
+        exchange_id,
+        instrument_id,
+        api_family,
+    )
 
     with _lock_for_shared_frame(key):
         entry = _shared_frames.get(key)
@@ -401,6 +511,8 @@ def load_strategy_frame(
                         window_end.to_pydatetime().replace(tzinfo=timezone.utc),
                         market_type=market_type,
                         exchange_id=exchange_id,
+                        instrument_id=instrument_id,
+                        api_family=api_family,
                     )
                     last_failure = None
                     break
@@ -436,15 +548,15 @@ def load_strategy_frame(
         actual_end = merged.index.max()
         _shared_frames[key] = _SharedFrameEntry(
             frame=merged,
-            coverage_start=actual_start,
-            coverage_end=actual_end,
+            coverage_start=actual_start if continuous_crypto_market else min(actual_start, requested_start),
+            coverage_end=actual_end if continuous_crypto_market else max(actual_end, coverage_end),
         )
         _evict_shared_frame_if_needed()
         result = merged[
             (merged.index >= requested_start)
             & (merged.index <= coverage_end)
         ].copy()
-        if crypto_market and not _cached_crypto_frame_is_usable(
+        if continuous_crypto_market and not _cached_crypto_frame_is_usable(
             result,
             requested_start,
             coverage_end,

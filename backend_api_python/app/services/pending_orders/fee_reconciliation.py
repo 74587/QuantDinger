@@ -3,10 +3,29 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, MutableMapping, Optional, Tuple
 
 from app.services.live_trading.fee_quote import fee_to_quote
 from app.utils.db import get_db_connection
+
+
+def allow_fee_reconciliation_attempt(
+    row: Dict[str, Any],
+    attempts: MutableMapping[tuple[str, int, str], int],
+    per_account_limit: int,
+) -> bool:
+    if not bool(row.get("fee_reconciliation_needed")):
+        return True
+    key = (
+        str(row.get("exchange_id") or "").lower(),
+        int(row.get("credential_id") or 0),
+        str(row.get("market_type") or "").lower(),
+    )
+    attempted = attempts.get(key, 0)
+    if attempted >= per_account_limit:
+        return False
+    attempts[key] = attempted + 1
+    return True
 
 
 def fee_breakdown_snapshot(raw: Any) -> Dict[str, float]:
@@ -21,10 +40,9 @@ def fee_breakdown_snapshot(raw: Any) -> Dict[str, float]:
             try:
                 fee = float(amount or 0.0)
             except Exception:
-                fee = 0.0
-            if abs(fee) > 1e-18:
-                key = str(currency or "").strip().upper() or "UNKNOWN"
-                fees[key] = fees.get(key, 0.0) + fee
+                continue
+            key = str(currency or "").strip().upper() or "UNKNOWN"
+            fees[key] = fees.get(key, 0.0) + fee
     if fees:
         return fees
     try:
@@ -114,6 +132,7 @@ def backfill_zero_commission_trades(
     if int(order_id or 0) <= 0 or not fees_by_ccy:
         return 0
     native_total, commission_ccy = fee_storage_values(fees_by_ccy)
+    fee_status = "actual" if any(abs(float(value or 0.0)) > 1e-18 for value in fees_by_ccy.values()) else "actual_zero"
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
@@ -121,7 +140,7 @@ def backfill_zero_commission_trades(
             SELECT id, COALESCE(value, 0) AS value, COALESCE(amount, 0) AS amount
             FROM qd_strategy_trades
             WHERE pending_order_id = %s
-              AND (COALESCE(commission, 0) = 0 OR COALESCE(commission_quote, 0) = 0)
+              AND COALESCE(fee_status, 'pending') = 'pending'
             ORDER BY id ASC
             """,
             (int(order_id),),
@@ -143,14 +162,15 @@ def backfill_zero_commission_trades(
                 SET commission = CASE WHEN COALESCE(commission, 0) = 0 THEN %s ELSE commission END,
                     commission_ccy = CASE WHEN COALESCE(commission, 0) = 0 THEN %s ELSE commission_ccy END,
                     commission_quote = CASE WHEN COALESCE(commission_quote, 0) = 0 THEN %s ELSE commission_quote END,
-                    fee_status = 'actual', fee_source = 'rest'
+                    fee_status = %s, fee_source = 'rest'
                 WHERE id = %s
-                  AND (COALESCE(commission, 0) = 0 OR COALESCE(commission_quote, 0) = 0)
+                  AND COALESCE(fee_status, 'pending') = 'pending'
                 """,
                 (
                     native_total * ratio,
                     commission_ccy,
                     (float(commission_quote) * ratio) if commission_quote is not None else None,
+                    fee_status,
                     int(row.get("id") or 0),
                 ),
             )

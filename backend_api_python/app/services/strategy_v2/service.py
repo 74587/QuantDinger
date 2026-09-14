@@ -20,6 +20,8 @@ from app.services.backtest_limits import (
 )
 from app.services.fundamental_data import get_fundamental_data_service
 from app.services.instrument_rules import InstrumentRulesProvider, get_instrument_rules_provider
+from app.services.market.instrument_products import PRODUCT_CRYPTO
+from app.services.market.product_catalog import get_catalog_product
 from app.services.universe import UniverseService, get_universe_service
 from app.utils.logger import get_logger
 
@@ -85,6 +87,7 @@ class StrategyV2BacktestService:
             start_date=start_date,
             end_date=end_date,
         )
+        _attach_catalog_products(candidates)
         minimum_symbols = max(3, int(groups or 5))
         if len(candidates) < minimum_symbols:
             raise StrategyV2ContractError(
@@ -167,7 +170,10 @@ class StrategyV2BacktestService:
         if not candidates:
             raise StrategyV2ContractError("strategyV2.universeHasNoData")
 
+        instrument_products = _attach_catalog_products(candidates)
+
         frequency = manifest.driving_frequency
+        _validate_product_frequencies(instrument_products, manifest.frequencies)
         fetch_starts = {
             item: start_date
             - timedelta(days=_warmup_calendar_days(item, manifest.warmup_bars, candidates))
@@ -336,6 +342,15 @@ class StrategyV2BacktestService:
             "cryptoRebalanceToleranceQuote": 10.0,
             "subLotClosePolicy": "reconcile_up_to_10_quote_with_cash_and_fees",
             "fundingMode": "not_modeled",
+            "exchangeEquityProducts": instrument_products,
+            "corporateActionsMode": (
+                "underlying_us_equity_series"
+                if any(
+                    str(item.get("product_type") or "").strip().lower() == "direct_equity"
+                    for item in instrument_products
+                )
+                else "venue_price_series"
+            ),
             "drivingFrequency": frequency,
             "frequencies": list(manifest.frequencies),
             "higherTimeframePolicy": "completed_before_driving_bar_close",
@@ -423,6 +438,8 @@ class StrategyV2BacktestService:
                 end_date,
                 market_type=member.get("market_type") or "",
                 exchange_id=member.get("exchange_id") or "",
+                instrument_id=member.get("instrument_id") or "",
+                api_family=member.get("api_family") or "",
             )
             return member, frame
 
@@ -472,6 +489,8 @@ class StrategyV2BacktestService:
                 end_date,
                 market_type=member.get("market_type") or "",
                 exchange_id=member.get("exchange_id") or "",
+                instrument_id=member.get("instrument_id") or "",
+                api_family=member.get("api_family") or "",
             )
             return member, frequency, frame
 
@@ -541,12 +560,17 @@ def _enforce_backtest_range(
     checked_markets: set[str] = set()
     for candidate in candidates:
         market = str(candidate.get("market") or "")
-        if market in checked_markets:
+        validation_market = (
+            str(candidate.get("underlying_market") or "USStock")
+            if str(candidate.get("product_type") or "").strip().lower() == "direct_equity"
+            else market
+        )
+        if validation_market in checked_markets:
             continue
-        checked_markets.add(market)
+        checked_markets.add(validation_market)
         error = validate_backtest_range(
-            market=market,
-            symbol=str(candidate.get("symbol") or ""),
+            market=validation_market,
+            symbol=str(candidate.get("underlying_symbol") or candidate.get("symbol") or ""),
             timeframe=timeframe,
             start_date=start_date,
             end_date=end_date,
@@ -568,6 +592,60 @@ def _instrument_member(item: InstrumentSpec) -> dict[str, Any]:
         "market_type": item.market_type,
         "instrument_id": item.instrument_id,
     }
+
+
+def _attach_catalog_products(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach exact venue product metadata used by data routing and reporting."""
+    products: list[dict[str, Any]] = []
+    for member in candidates:
+        if (
+            str(member.get("market") or "").strip() != "Crypto"
+            or not str(member.get("exchange_id") or "").strip()
+        ):
+            continue
+        try:
+            product = get_catalog_product(
+                market="Crypto",
+                symbol=str(member.get("symbol") or ""),
+                exchange_id=str(member.get("exchange_id") or ""),
+                market_type=str(member.get("market_type") or "spot"),
+            )
+        except Exception as exc:
+            logger.debug("Product catalog lookup unavailable during backtest preparation: %s", exc)
+            continue
+        if not product:
+            continue
+        member["instrument_id"] = str(product.get("instrument_id") or member.get("instrument_id") or "")
+        member["product_type"] = str(product.get("product_type") or PRODUCT_CRYPTO)
+        member["api_family"] = str(product.get("api_family") or member.get("market_type") or "spot")
+        member["underlying_market"] = str(product.get("underlying_market") or "")
+        member["underlying_symbol"] = str(product.get("underlying_symbol") or "")
+        if member["product_type"] != PRODUCT_CRYPTO:
+            products.append({
+                "symbol": str(member.get("symbol") or ""),
+                "exchange_id": str(member.get("exchange_id") or ""),
+                "market_type": str(member.get("market_type") or "spot"),
+                "instrument_id": member["instrument_id"],
+                "product_type": member["product_type"],
+                "api_family": member["api_family"],
+                "underlying_market": str(product.get("underlying_market") or ""),
+                "underlying_symbol": str(product.get("underlying_symbol") or ""),
+            })
+    return products
+
+
+def _validate_product_frequencies(
+    products: list[dict[str, Any]],
+    frequencies: tuple[str, ...],
+) -> None:
+    if not any(str(item.get("api_family") or "").lower() == "reality" for item in products):
+        return
+    allowed = {"1m", "5m", "15m", "1h", "4h", "1d"}
+    unsupported = sorted({str(value or "").strip().lower() for value in frequencies} - allowed)
+    if unsupported:
+        raise StrategyV2ContractError(
+            f"strategyV2.bitgetRealityTimeframeUnsupported:{','.join(unsupported)}"
+        )
 
 
 def _validate_warmup_history(frequency_frames, warmup_bars: int, start_date: datetime) -> None:

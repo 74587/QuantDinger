@@ -14,7 +14,7 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
-from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.symbols import to_gate_currency_pair, to_okx_swap_inst_id
@@ -137,6 +137,8 @@ def place_live_limit_order(
             pos_side=pos_side,
             client_order_id=client_order_id,
         )
+    if isinstance(client, GateStockClient):
+        return client.place_limit_order(symbol=str(symbol), side=side, size=amount, price=price, client_order_id=client_order_id)
     if isinstance(client, GateSpotClient):
         return client.place_limit_order(symbol=str(symbol), side=side, size=amount, price=price, client_order_id=client_order_id)
     if isinstance(client, GateUsdtFuturesClient):
@@ -184,7 +186,7 @@ def wait_live_order_fill(
     wait_sec = float(max_wait_sec or 0.0)
     if phase == "market":
         wait_sec = 5.0 if isinstance(client, (BinanceFuturesClient, BinanceSpotClient)) else 12.0
-    elif phase == "limit" and isinstance(client, (BitgetMixClient, BitgetSpotClient, GateSpotClient, GateUsdtFuturesClient)):
+    elif phase == "limit" and isinstance(client, (BitgetMixClient, BitgetSpotClient, GateSpotClient, GateStockClient, GateUsdtFuturesClient)):
         wait_sec = max(wait_sec, 8.0)
 
     if isinstance(client, (BinanceFuturesClient, BinanceSpotClient)):
@@ -204,6 +206,8 @@ def wait_live_order_fill(
         return client.wait_for_fill(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id, max_wait_sec=wait_sec)
     if isinstance(client, BybitClient):
         return client.wait_for_fill(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id, max_wait_sec=wait_sec)
+    if isinstance(client, GateStockClient):
+        return client.wait_for_fill(order_id=order_id, symbol=str(symbol), max_wait_sec=wait_sec)
     if isinstance(client, GateSpotClient):
         return client.wait_for_fill(order_id=order_id, symbol=str(symbol), max_wait_sec=wait_sec)
     if isinstance(client, GateUsdtFuturesClient):
@@ -236,6 +240,8 @@ def cancel_live_limit_order(
         return client.cancel_order(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id)
     if isinstance(client, BybitClient):
         return client.cancel_order(symbol=str(symbol), order_id=order_id, client_order_id=client_order_id)
+    if isinstance(client, GateStockClient):
+        return client.cancel_order(order_id=order_id, symbol=str(symbol))
     if isinstance(client, GateSpotClient):
         return client.cancel_order(order_id=order_id, symbol=str(symbol))
     if isinstance(client, GateUsdtFuturesClient):
@@ -373,6 +379,8 @@ def place_live_market_order(
             pos_side=pos_side,
             client_order_id=client_order_id,
         )
+    if isinstance(client, GateStockClient):
+        return client.place_market_order(symbol=str(symbol), side=side, size=amount, client_order_id=client_order_id)
     if isinstance(client, GateSpotClient):
         mkt_size = spot_quote_amt if (side == "buy" and spot_market_buy_uses_quote and spot_quote_amt > 0) else amount
         if side == "buy" and mkt_size <= 0 and ref_price > 0:

@@ -34,6 +34,8 @@ class BrokerSessionRegistry:
     A single registry instance is typically created per broker (e.g. one for
     IBKR, one for Alpaca). Keys are ``(user_id, broker_name)`` so the same
     registry can be reused across processes/brokers if desired.
+    Callers with multiple saved accounts can pass a credential id to scope
+    each operation independently without changing a user's default client.
 
     Notes:
         * Falls back to ``user_id=0`` when no Flask request context exists or
@@ -64,18 +66,19 @@ class BrokerSessionRegistry:
         except (TypeError, ValueError):
             return 0
 
-    def _key(self) -> Tuple[int, str]:
-        return (self._current_user_id(), self.broker_name)
+    def _key(self, credential_id: int | None = None) -> Tuple[int, str]:
+        scope = self.broker_name if credential_id is None else f"{self.broker_name}:{int(credential_id)}"
+        return (self._current_user_id(), scope)
 
-    def get(self) -> Optional[Any]:
+    def get(self, credential_id: int | None = None) -> Optional[Any]:
         """Return the current user's client or ``None`` if not connected."""
         with self._lock:
-            return self._clients.get(self._key())
+            return self._clients.get(self._key(credential_id))
 
-    def set(self, client: Any) -> None:
+    def set(self, client: Any, credential_id: int | None = None) -> None:
         """Store ``client`` for the current user, disposing any prior one."""
         with self._lock:
-            key = self._key()
+            key = self._key(credential_id)
             old = self._clients.get(key)
             if old is not None and old is not client:
                 try:
@@ -87,18 +90,18 @@ class BrokerSessionRegistry:
                     )
             self._clients[key] = client
 
-    def clear(self) -> Optional[Any]:
+    def clear(self, credential_id: int | None = None) -> Optional[Any]:
         """Remove the current user's client (without calling disconnect)."""
         with self._lock:
-            return self._clients.pop(self._key(), None)
+            return self._clients.pop(self._key(credential_id), None)
 
-    def disconnect_current(self) -> bool:
+    def disconnect_current(self, credential_id: int | None = None) -> bool:
         """Disconnect and remove the current user's client.
 
         Returns ``True`` if a client existed and was disconnected.
         """
         with self._lock:
-            client = self._clients.pop(self._key(), None)
+            client = self._clients.pop(self._key(credential_id), None)
         if client is None:
             return False
         try:

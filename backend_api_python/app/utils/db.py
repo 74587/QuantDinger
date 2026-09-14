@@ -23,6 +23,7 @@ from pathlib import Path
 # Re-export from PostgreSQL module
 from app.utils.db_postgres import (
     get_pg_connection as get_db_connection,
+    get_pg_transaction as get_db_transaction,
     get_pg_connection_sync as get_db_connection_sync,
     is_postgres_available,
     close_pool as close_db,

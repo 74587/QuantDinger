@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.services.ai_generation_contracts import SCRIPT_STRATEGY_SYSTEM_PROMPT
+from app.services.ai_generation_contracts import SCRIPT_STRATEGY_SYSTEM_PROMPT, STRATEGY_INSTRUMENT_IDENTITY_CONTRACT
 from app.services.factors.registry import list_factors
 from app.services.fundamental_data import FUNDAMENTAL_FIELDS
+from app.services.live_trading.capabilities import CRYPTO_VENUE_CAPABILITIES
 from app.services.strategy_ai_capabilities import strategy_ai_capability_catalog
 from app.services.strategy_direction import DIRECTION_MODES
 
@@ -96,8 +97,78 @@ def handle_data(context, data):
 def get_strategy_authoring_contract() -> dict[str, Any]:
     """Return the canonical source-ownership and runtime API contract."""
     return {
-        "version": "strategy-api-v2-capability-packs-2026-09",
+        "version": "strategy-api-v2-exchange-equities-2026-09",
         "doc": "docs/trading/STRATEGY_DEV_GUIDE.md",
+        "instrument_identity": {
+            "contract": STRATEGY_INSTRUMENT_IDENTITY_CONTRACT,
+            "examples": [{
+                "instrument": "Crypto:00700/HKD@gate:spot",
+                "market": "Crypto",
+                "symbol": "00700/HKD",
+                "exchange_id": "gate",
+                "market_type": "spot",
+                "asset_class": "equity",
+                "product_type": "direct_equity",
+                "api_family": "stock",
+                "underlying_market": "HKStock",
+                "underlying_symbol": "00700",
+                "catalog_validation_required": True,
+            }, {
+                "instrument": "Crypto:AAPL/USD@gate:spot",
+                "market": "Crypto",
+                "symbol": "AAPL/USD",
+                "exchange_id": "gate",
+                "market_type": "spot",
+                "asset_class": "equity",
+                "product_type": "direct_equity",
+                "api_family": "stock",
+                "underlying_market": "USStock",
+                "underlying_symbol": "AAPL",
+                "catalog_validation_required": True,
+            }, {
+                "instrument": "Crypto:HK0700/USDT@binance:swap",
+                "market": "Crypto",
+                "symbol": "HK0700/USDT",
+                "exchange_id": "binance",
+                "market_type": "swap",
+                "asset_class": "equity",
+                "product_type": "stock_perpetual",
+                "api_family": "swap",
+                "underlying_market": "HKStock",
+                "underlying_symbol": "00700",
+                "catalog_validation_required": True,
+                "direct_share_ownership": False,
+            }],
+            "discovery_filters": {
+                "required": ["exchange_id", "market_type", "product_type"],
+                "gate_direct_equity": {
+                    "exchange_id": "gate",
+                    "market_type": "spot",
+                    "product_type": "direct_equity",
+                    "search_examples": ["00700", "AAPL"],
+                },
+                "binance_hk_equity_perpetual": {
+                    "exchange_id": "binance",
+                    "market_type": "swap",
+                    "product_type": "stock_perpetual",
+                    "search_examples": ["HK0700", "TENCENT"],
+                },
+            },
+            "venue_capabilities": {
+                exchange_id: [
+                    {
+                        "product_type": product_type,
+                        "market_type": market_type,
+                        "api_family": api_family,
+                    }
+                    for product_type, market_type, api_family in sorted(
+                        capability.equity_api_families
+                    )
+                ]
+                for exchange_id, capability in sorted(CRYPTO_VENUE_CAPABILITIES.items())
+            },
+            "research_or_broker_instruments": ["HKStock:00700.HK", "USStock:AAPL"],
+        },
         "dataRequirements": {
             "fundamentalFields": list(FUNDAMENTAL_FIELDS),
             "netIncomeBasis": "latest_reported_period",
