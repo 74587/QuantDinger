@@ -65,6 +65,10 @@ class USStockDataSource(BaseDataSource):
         '1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h', '4h'
     })
 
+    YAHOO_CHUNK_DAYS = {
+        '1m': 7,
+    }
+
     TIMEFRAME_ALIASES = {
         '1h': '1H',
         '1hour': '1H',
@@ -746,6 +750,33 @@ class USStockDataSource(BaseDataSource):
         end_date: datetime,
         limit: int,
     ) -> List[Dict[str, Any]]:
+        chunk_days = int(self.YAHOO_CHUNK_DAYS.get(interval, 0) or 0)
+        if chunk_days and end_date - start_date > timedelta(days=chunk_days):
+            merged: Dict[int, Dict[str, Any]] = {}
+            chunk_start = start_date
+            while chunk_start < end_date:
+                chunk_end = min(end_date, chunk_start + timedelta(days=chunk_days))
+                rows = self._fetch_yahoo_chart_once(
+                    symbol,
+                    interval,
+                    chunk_start,
+                    chunk_end,
+                )
+                for row in rows:
+                    merged[int(row["time"])] = row
+                chunk_start = chunk_end
+            bars = [merged[key] for key in sorted(merged)]
+            return bars[-limit:] if limit and len(bars) > limit else bars
+        bars = self._fetch_yahoo_chart_once(symbol, interval, start_date, end_date)
+        return bars[-limit:] if limit and len(bars) > limit else bars
+
+    def _fetch_yahoo_chart_once(
+        self,
+        symbol: str,
+        interval: str,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> List[Dict[str, Any]]:
         try:
             request_end = (
                 end_date
@@ -797,7 +828,7 @@ class USStockDataSource(BaseDataSource):
                     ))
                 except Exception:
                     continue
-            return bars[-limit:] if limit and len(bars) > limit else bars
+            return bars
         except Exception as e:
             logger.debug(f"Yahoo chart kline failed for {symbol}: {e}")
             return []

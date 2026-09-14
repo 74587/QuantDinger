@@ -90,6 +90,15 @@ def test_stock_intraday_warmup_allows_closed_sessions():
     assert _warmup_calendar_days("1h", 80, [{"market": "USStock"}]) == 42
     assert _warmup_calendar_days("1h", 80, [{"market": "Crypto"}]) == 5
     assert _warmup_calendar_days("1m", 80, [{"market": "USStock"}]) == 7
+    assert _warmup_calendar_days(
+        "1m",
+        500,
+        [{
+            "market": "Crypto",
+            "product_type": "direct_equity",
+            "underlying_market": "USStock",
+        }],
+    ) == 7
 
 
 def test_warmup_counts_only_prior_bars_and_checks_each_frequency():

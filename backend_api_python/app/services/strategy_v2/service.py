@@ -657,7 +657,10 @@ def _warmup_calendar_days(frequency: str, warmup_bars: int, candidates=()) -> in
     days = backtest_warmup_calendar_days(frequency, warmup_bars)
     normalized = str(frequency).lower()
     if warmup_bars > 0 and normalized.endswith(("m", "h")) and any(
-        item.get("market") in {"USStock", "HKStock", "AStock"} for item in candidates
+        item.get("market") in {"USStock", "HKStock", "AStock"}
+        or str(item.get("underlying_market") or "") in {"USStock", "HKStock", "AStock"}
+        or str(item.get("product_type") or "").strip().lower() == "direct_equity"
+        for item in candidates
     ):
         hours = float(normalized[:-1]) / (60 if normalized.endswith("m") else 1)
         # Four trading hours per session also covers the shortest stock market
