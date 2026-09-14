@@ -21,6 +21,7 @@ def test_equity_perpetual_native_instrument_ids_for_six_exchanges():
 
 
 def test_equity_product_capability_matrix_is_api_family_specific():
+    assert supports_equity_product("binance", "tokenized_equity", "spot", "spot")
     assert supports_equity_product("binance", "stock_perpetual", "swap", "swap")
     assert supports_equity_product("okx", "tokenized_equity", "spot", "spot")
     assert supports_equity_product("okx", "stock_perpetual", "swap", "swap")

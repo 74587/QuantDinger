@@ -116,6 +116,16 @@ def _load_strategy_frame_uncached(
     instrument_id: Optional[str] = None,
     api_family: Optional[str] = None,
 ) -> pd.DataFrame:
+    product = _resolve_catalog_product(
+        market,
+        symbol,
+        exchange_id=exchange_id,
+        market_type=market_type,
+        instrument_id=instrument_id,
+    )
+    resolved_api_family = str(
+        api_family or (product or {}).get("api_family") or ""
+    ).strip().lower()
     start_utc = _normalize_utc_datetime(start_date)
     end_utc = _normalize_utc_datetime(end_date)
     total_seconds = max(1.0, (end_utc - start_utc).total_seconds())
@@ -132,7 +142,7 @@ def _load_strategy_frame_uncached(
         str(market_type or ""),
         str(exchange_id or ""),
         str(instrument_id or ""),
-        str(api_family or ""),
+        resolved_api_family,
         start_utc.isoformat(),
         end_utc.isoformat(),
     ))
@@ -142,21 +152,7 @@ def _load_strategy_frame_uncached(
     coverage_end = min(requested_end, closed_bar_cutoff)
     effective_market = str(market or "")
     effective_symbol = str(symbol or "")
-    if (
-        effective_market.strip().lower() == "crypto"
-        and str(exchange_id or "").strip().lower() == "gate"
-        and str(market_type or "spot").strip().lower() == "spot"
-        and str(api_family or "").strip().lower() == "stock"
-    ):
-        from app.services.market.product_catalog import get_catalog_product
-
-        product = get_catalog_product(
-            market="Crypto",
-            symbol=symbol,
-            exchange_id="gate",
-            market_type="spot",
-            instrument_id=str(instrument_id or ""),
-        )
+    if effective_market.strip().lower() == "crypto" and resolved_api_family == "stock":
         underlying = str((product or {}).get("underlying_symbol") or "").strip().upper()
         underlying_market = str((product or {}).get("underlying_market") or "").strip()
         if not underlying or underlying_market not in {"USStock", "HKStock"}:
@@ -171,9 +167,16 @@ def _load_strategy_frame_uncached(
             )
         effective_market = underlying_market
         effective_symbol = underlying
+    continuous_calendar = bool(
+        effective_market.strip().lower() == "crypto"
+        and _product_uses_continuous_crypto_calendar(
+            product,
+            resolved_api_family=resolved_api_family,
+        )
+    )
     cached = _cache.get(cache_key)
     if cached is not None and not cached.empty:
-        if str(effective_market or "").strip().lower() != "crypto" or _covers_crypto_window(
+        if not continuous_calendar or _covers_crypto_window(
             cached,
             requested_start,
             coverage_end,
@@ -194,7 +197,7 @@ def _load_strategy_frame_uncached(
             str(market or "").strip().lower() == "crypto"
             and str(exchange_id or "").strip().lower() == "bitget"
             and str(market_type or "spot").strip().lower() == "spot"
-            and str(api_family or "").strip().lower() == "reality"
+            and resolved_api_family == "reality"
         ):
             from app.data_providers.bitget_reality_market import get_bitget_reality_klines
 
@@ -267,7 +270,7 @@ def _load_strategy_frame_uncached(
     if requested_end >= closed_bar_cutoff:
         frame = frame[frame.index <= closed_bar_cutoff]
     if (
-        str(effective_market or "").strip().lower() == "crypto"
+        continuous_calendar
         and not _covers_crypto_window(frame, requested_start, coverage_end, timeframe_seconds)
     ):
         if not frame.empty:
@@ -386,28 +389,61 @@ def _uses_continuous_crypto_calendar(
 ) -> bool:
     if str(market or "").strip().lower() != "crypto":
         return False
-    if str(api_family or "").strip().lower() in {"reality", "stock"}:
-        return False
-    if not exchange_id or not instrument_id:
+    product = _resolve_catalog_product(
+        market,
+        symbol,
+        exchange_id=exchange_id,
+        market_type=market_type,
+        instrument_id=instrument_id,
+    )
+    resolved_api_family = str(
+        api_family or (product or {}).get("api_family") or ""
+    ).strip().lower()
+    if not exchange_id:
         return True
+    return _product_uses_continuous_crypto_calendar(
+        product,
+        resolved_api_family=resolved_api_family,
+    )
+
+
+def _product_uses_continuous_crypto_calendar(
+    product: Optional[dict],
+    *,
+    resolved_api_family: str,
+) -> bool:
+    if resolved_api_family in {"reality", "stock"}:
+        return False
+    product_type = str((product or {}).get("product_type") or "crypto").strip().lower()
+    return product_type != "direct_equity"
+
+
+def _resolve_catalog_product(
+    market: str,
+    symbol: str,
+    *,
+    exchange_id: Optional[str],
+    market_type: Optional[str],
+    instrument_id: Optional[str],
+) -> Optional[dict]:
+    if (
+        str(market or "").strip().lower() != "crypto"
+        or not str(exchange_id or "").strip()
+    ):
+        return None
     try:
         from app.services.market.product_catalog import get_catalog_product
 
-        product = get_catalog_product(
+        return get_catalog_product(
             market="Crypto",
             symbol=symbol,
             exchange_id=str(exchange_id),
             market_type=str(market_type or "spot"),
-            instrument_id=str(instrument_id),
+            instrument_id=str(instrument_id or ""),
         )
-    except Exception:
-        return True
-    if not product:
-        return True
-    return not bool(
-        str(product.get("underlying_market") or "").strip()
-        or str(product.get("product_type") or "crypto").strip().lower() != "crypto"
-    )
+    except Exception as exc:
+        logger.debug("Product catalog lookup unavailable during market-data routing: %s", exc)
+        return None
 
 
 def clear_shared_strategy_frame_cache() -> None:

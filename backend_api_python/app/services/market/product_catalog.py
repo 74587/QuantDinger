@@ -27,7 +27,7 @@ def get_catalog_product(
         clauses.append("market_type = ?")
         params.append(str(market_type).strip().lower())
     if instrument_id:
-        clauses.append("instrument_id = ?")
+        clauses.append("UPPER(instrument_id) = UPPER(?)")
         params.append(str(instrument_id).strip())
 
     with get_db_connection() as db:

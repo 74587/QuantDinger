@@ -66,8 +66,12 @@ def test_quick_tool_repair_copilot_and_agent_share_instrument_rules():
         "search_examples": ["00700", "AAPL"],
     }
     assert filters["binance_hk_equity_perpetual"]["product_type"] == "stock_perpetual"
+    assert filters["binance_bstock"] == {
+        "exchange_id": "binance", "market_type": "spot", "product_type": "tokenized_equity",
+        "search_examples": ["NVDAB", "AAPLB"],
+    }
     matrix = contract["instrument_identity"]["venue_capabilities"]
-    assert {item["product_type"] for item in matrix["binance"]} == {"stock_perpetual"}
+    assert {item["product_type"] for item in matrix["binance"]} == {"tokenized_equity", "stock_perpetual"}
     assert {item["api_family"] for item in matrix["bitget"]} == {"reality", "swap"}
     assert matrix["htx"] == []
 

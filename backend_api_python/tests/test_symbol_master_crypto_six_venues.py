@@ -35,6 +35,7 @@ class FakeExchange:
 
 @pytest.fixture(autouse=True)
 def _disable_live_bitget_catalog(monkeypatch, request):
+    monkeypatch.setattr(symbol_master_sync, "_load_known_equity_symbols", lambda: {"AAPL", "NVDA"})
     if request.node.name != "test_bitget_reality_catalog_uses_official_native_contract":
         monkeypatch.setattr(symbol_master_sync, "_fetch_bitget_reality_symbol_rows", lambda: [])
     if request.node.name != "test_gate_stock_catalog_uses_dedicated_official_api":
@@ -228,3 +229,63 @@ def test_okx_catalog_uses_official_public_fallback_when_ccxt_fails(monkeypatch):
     assert len(rows) == 12
     assert len(okx_contexts) == 2
     assert all(context["ok"] and context["fallback"] for context in okx_contexts)
+
+
+def test_stored_equity_products_upgrade_without_remote_catalog(monkeypatch):
+    rows = [
+        {
+            "exchange": "binance",
+            "market_type": "spot",
+            "symbol": "NVDAB/USDT",
+            "instrument_id": "NVDABUSDT",
+            "asset_class": "crypto",
+        },
+        {
+            "exchange": "bybit",
+            "market_type": "swap",
+            "symbol": "AAPL/USDT",
+            "instrument_id": "AAPLUSDT",
+            "asset_class": "equity",
+        },
+    ]
+    updates = []
+
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, query, values=None):
+            if query.lstrip().startswith("UPDATE"):
+                updates.append(values)
+
+        def fetchall(self):
+            return rows
+
+        def close(self):
+            return None
+
+    class Connection:
+        def __init__(self):
+            self.cursor_value = Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def cursor(self):
+            return self.cursor_value
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+    monkeypatch.setattr(symbol_master_sync, "get_db_connection", Connection)
+
+    upgraded = symbol_master_sync.reclassify_stored_equity_products()
+
+    assert upgraded == 2
+    assert updates[0][:5] == ("equity", "tokenized_equity", "spot", "USStock", "NVDA")
+    assert updates[1][:5] == ("equity", "stock_perpetual", "swap", "USStock", "AAPL")

@@ -292,6 +292,8 @@ def fetch_crypto_symbols_with_diagnostics():
     )
     from app.services.market.symbol_search import _classify_asset
 
+    known_equity_symbols = _load_known_equity_symbols()
+
     def fetch_context(exchange_id: str, market_type: str):
         context_rows: List[SymbolMasterRow] = []
         try:
@@ -319,6 +321,7 @@ def fetch_crypto_symbols_with_diagnostics():
                     market_type=market_type,
                     symbol=normalized_symbol,
                     instrument_id=instrument_id,
+                    known_equity_symbols=known_equity_symbols,
                 )
                 context_rows.append(
                     SymbolMasterRow(
@@ -425,6 +428,114 @@ def fetch_crypto_symbols_with_diagnostics():
     order = {exchange_id: index for index, exchange_id in enumerate(PUBLIC_KLINE_EXCHANGE_IDS)}
     contexts.sort(key=lambda item: (order.get(item["exchange"], len(order)), item["market_type"]))
     return _unique_rows(rows), contexts
+
+
+def _load_known_equity_symbols() -> set[str]:
+    symbols: set[str] = {"SPCX"}
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT symbol
+                      FROM qd_market_symbols
+                     WHERE market IN ('USStock', 'HKStock') AND is_active = 1
+                    """
+                )
+                symbols.update(
+                    _clean_symbol(row.get("symbol"))
+                    for row in cur.fetchall()
+                    if _clean_symbol(row.get("symbol"))
+                )
+            finally:
+                cur.close()
+    except Exception as exc:
+        logger.debug("Stored equity catalog unavailable for crypto product classification: %s", exc)
+    if len(symbols) > 100:
+        return symbols
+    try:
+        symbols.update(row.symbol for row in fetch_us_stock_symbols())
+    except Exception as exc:
+        logger.warning("US equity reference catalog unavailable during crypto sync: %s", exc)
+    return symbols
+
+
+def reclassify_stored_equity_products() -> int:
+    """Upgrade stored equity rows after the product contract changes.
+
+    Binance bStocks need the local equity reference catalog because their
+    public spot symbols only expose the venue ``B`` suffix. Older catalog
+    rows from every venue may already carry ``asset_class=equity`` while
+    retaining the legacy generic product fields, so those rows are upgraded
+    without requiring another successful remote catalog request.
+    """
+    known_equity_symbols = _load_known_equity_symbols()
+    with get_db_connection() as db:
+        cur = db.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT exchange, market_type, symbol, instrument_id, asset_class
+                  FROM qd_market_symbols
+                 WHERE market = 'Crypto'
+                   AND is_active = 1
+                   AND product_type = 'crypto'
+                   AND (
+                       asset_class = 'equity'
+                       OR (LOWER(exchange) = 'binance' AND market_type = 'spot')
+                   )
+                """
+            )
+            upgraded = 0
+            for row in cur.fetchall():
+                exchange = _clean_text(row.get("exchange")).lower()
+                market_type = _clean_text(row.get("market_type")).lower()
+                symbol = _clean_symbol(row.get("symbol"))
+                instrument_id = _clean_text(row.get("instrument_id"))
+                base = symbol.split("/", 1)[0]
+                raw = {"symbol": instrument_id}
+                if _clean_text(row.get("asset_class")).lower() == "equity":
+                    raw["assetClass"] = "equity"
+                profile = classify_instrument_product(
+                    {"base": base, "info": raw},
+                    exchange_id=exchange,
+                    market_type=market_type,
+                    symbol=symbol,
+                    instrument_id=instrument_id,
+                    known_equity_symbols=known_equity_symbols,
+                )
+                if profile.product_type == "crypto":
+                    continue
+                cur.execute(
+                    """
+                    UPDATE qd_market_symbols
+                       SET asset_class = ?, product_type = ?, api_family = ?,
+                           underlying_market = ?, underlying_symbol = ?,
+                           metadata_updated_at = NOW()
+                     WHERE market = 'Crypto' AND LOWER(exchange) = ?
+                       AND market_type = ? AND symbol = ? AND instrument_id = ?
+                    """,
+                    (
+                        profile.asset_class,
+                        profile.product_type,
+                        profile.api_family,
+                        profile.underlying_market,
+                        profile.underlying_symbol,
+                        exchange,
+                        market_type,
+                        symbol,
+                        instrument_id,
+                    ),
+                )
+                upgraded += int(cur.rowcount or 0)
+            db.commit()
+            return upgraded
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            cur.close()
 
 
 def _fetch_bitget_reality_symbol_rows() -> List[SymbolMasterRow]:

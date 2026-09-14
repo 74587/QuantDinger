@@ -30,8 +30,11 @@ class VenueCapability:
 CRYPTO_VENUE_CAPABILITIES: Dict[str, VenueCapability] = {
     "binance": VenueCapability(
         "binance", frozenset({"spot", "swap"}),
-        equity_product_types=frozenset({"stock_perpetual"}),
-        equity_api_families=frozenset({("stock_perpetual", "swap", "swap")}),
+        equity_product_types=frozenset({"tokenized_equity", "stock_perpetual"}),
+        equity_api_families=frozenset({
+            ("tokenized_equity", "spot", "spot"),
+            ("stock_perpetual", "swap", "swap"),
+        }),
     ),
     "okx": VenueCapability(
         "okx", frozenset({"spot", "swap"}),

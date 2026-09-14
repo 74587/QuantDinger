@@ -441,6 +441,135 @@ def test_gate_hk_stock_backtest_uses_underlying_hk_market(monkeypatch):
     assert calls[0]["market_type"] is None
 
 
+def test_gate_stock_market_data_infers_catalog_contract(monkeypatch):
+    calls = []
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "app.services.market.product_catalog.get_catalog_product",
+        lambda **kwargs: {
+            "api_family": "stock",
+            "product_type": "direct_equity",
+            "underlying_market": "USStock",
+            "underlying_symbol": "NVDA",
+        },
+    )
+    monkeypatch.setattr(
+        market_data.DataSourceFactory,
+        "get_kline_with_diagnostics",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("exchange crypto path must not run")),
+    )
+    monkeypatch.setattr(
+        market_data.DataSourceFactory,
+        "get_kline",
+        lambda **kwargs: calls.append(kwargs) or [
+            {"time": 1785542400, "open": 180, "high": 185, "low": 179, "close": 184, "volume": 10},
+            {"time": 1785628800, "open": 184, "high": 188, "low": 183, "close": 187, "volume": 12},
+        ],
+    )
+
+    frame = market_data._load_strategy_frame_uncached(
+        "Crypto",
+        "NVDA/USD",
+        "1d",
+        start,
+        end,
+        market_type="spot",
+        exchange_id="gate",
+    )
+
+    assert list(frame["close"]) == [184, 187]
+    assert calls[0]["market"] == "USStock"
+    assert calls[0]["symbol"] == "NVDA"
+
+
+def test_gate_stock_without_instrument_id_uses_trading_calendar(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.market.product_catalog.get_catalog_product",
+        lambda **kwargs: {
+            "api_family": "stock",
+            "product_type": "direct_equity",
+            "underlying_market": "USStock",
+            "underlying_symbol": "NVDA",
+        },
+    )
+
+    assert not market_data._uses_continuous_crypto_calendar(
+        "Crypto",
+        "NVDA/USD",
+        exchange_id="gate",
+        market_type="spot",
+        instrument_id="",
+        api_family="",
+    )
+
+
+@pytest.mark.parametrize("product_type", ["tokenized_equity", "stock_perpetual"])
+def test_always_open_equity_products_keep_continuous_coverage(monkeypatch, product_type):
+    monkeypatch.setattr(
+        "app.services.market.product_catalog.get_catalog_product",
+        lambda **kwargs: {
+            "api_family": "spot" if product_type == "tokenized_equity" else "swap",
+            "product_type": product_type,
+            "underlying_market": "USStock",
+            "underlying_symbol": "AAPL",
+        },
+    )
+
+    assert market_data._uses_continuous_crypto_calendar(
+        "Crypto",
+        "AAPLX/USDT",
+        exchange_id="bybit",
+        market_type="spot" if product_type == "tokenized_equity" else "swap",
+        instrument_id="AAPLXUSDT",
+        api_family="",
+    )
+
+
+def test_bitget_reality_market_data_infers_catalog_contract(monkeypatch):
+    from app.data_providers import bitget_reality_market
+
+    calls = []
+    start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        "app.services.market.product_catalog.get_catalog_product",
+        lambda **kwargs: {
+            "api_family": "reality",
+            "product_type": "tokenized_equity",
+            "underlying_market": "USStock",
+            "underlying_symbol": "AAPL",
+        },
+    )
+    monkeypatch.setattr(
+        bitget_reality_market,
+        "get_bitget_reality_klines",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or [
+            {"time": 1785542400, "open": 200, "high": 205, "low": 199, "close": 204, "volume": 10},
+            {"time": 1785628800, "open": 204, "high": 208, "low": 203, "close": 207, "volume": 12},
+        ],
+    )
+    monkeypatch.setattr(
+        market_data.DataSourceFactory,
+        "get_kline_with_diagnostics",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("generic crypto path must not run")),
+    )
+
+    frame = market_data._load_strategy_frame_uncached(
+        "Crypto",
+        "RAAPL/USDT",
+        "1d",
+        start,
+        end,
+        market_type="spot",
+        exchange_id="bitget",
+        instrument_id="rAAPLUSDT",
+    )
+
+    assert list(frame["close"]) == [204, 207]
+    assert calls[0][0][0] == "rAAPLUSDT"
+
+
 def test_gate_hk_stock_shared_cache_uses_trading_calendar_coverage(monkeypatch):
     calls = []
     start = datetime(2026, 8, 3, tzinfo=timezone.utc)

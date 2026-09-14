@@ -43,6 +43,12 @@ def test_live_history_lookback_is_frequency_aware():
     assert live_history_days("1d", 50) == 150
 
 
+def test_live_history_lookback_covers_stock_sessions_and_weekends():
+    candidates = [{"market": "Crypto", "api_family": "stock", "underlying_market": "USStock"}]
+
+    assert live_history_days("1m", 500, candidates) >= 7
+
+
 def test_intent_signal_timestamp_prefers_scheduled_wall_clock():
     intent = OrderIntent(
         symbol="Crypto:BTC/USDT@okx:swap",

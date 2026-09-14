@@ -62,6 +62,33 @@ def test_binance_hong_kong_equity_swap_maps_numeric_ticker_to_hk_stock():
     assert profile.underlying_symbol == "00700"
 
 
+def test_binance_bstock_spot_uses_reference_equity_catalog():
+    profile = classify_instrument_product(
+        {"base": "NVDAB", "info": {"symbol": "NVDABUSDT"}},
+        exchange_id="binance",
+        market_type="spot",
+        symbol="NVDAB/USDT",
+        instrument_id="NVDABUSDT",
+        known_equity_symbols={"NVDA"},
+    )
+
+    assert profile.product_type == PRODUCT_TOKENIZED_EQUITY
+    assert profile.api_family == "spot"
+    assert profile.underlying_market == "USStock"
+    assert profile.underlying_symbol == "NVDA"
+
+
+def test_binance_unknown_b_suffix_remains_crypto():
+    profile = classify_instrument_product(
+        {"base": "UNKNOWNB", "info": {"symbol": "UNKNOWNBUSDT"}},
+        exchange_id="binance",
+        market_type="spot",
+        known_equity_symbols={"NVDA"},
+    )
+
+    assert profile.product_type == PRODUCT_CRYPTO
+
+
 def test_named_hong_kong_equity_uses_explicit_market_region():
     profile = classify_instrument_product(
         {

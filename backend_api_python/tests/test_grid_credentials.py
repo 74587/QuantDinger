@@ -72,10 +72,13 @@ def test_grid_startup_places_limits_when_client_ok():
         with patch(
             "app.services.grid.engine.GridEngine._grid_entry_ownership_allowed",
             return_value=(True, {}),
-        ), patch("app.services.grid.engine.GridRestingOrderRepository") as repo_cls:
+        ), patch("app.services.grid.engine.GridRestingOrderRepository") as repo_cls, patch(
+            "app.services.grid.engine.GridCellRepository"
+        ) as cell_repo_cls:
             repo = repo_cls.return_value
             repo.has_open_for_cell.return_value = False
             repo.insert.return_value = 1
+            cell_repo_cls.return_value.list_cells.return_value = []
             runner = GridRestingRunner(
                 2,
                 "BTC/USDT",

@@ -265,6 +265,39 @@ def handle_data(context, data):
     assert repository.persisted["manifest"]["apiVersion"] == 2
 
 
+def test_v2_service_applies_changed_runtime_params_to_each_run(tmp_path):
+    code = """
+# @param target_pct float 0.25 Target allocation
+def initialize(context):
+    context.set_universe(["USStock:AAPL"])
+    context.subscribe(frequency="1d")
+
+def handle_data(context, data):
+    if not context.portfolio.positions:
+        target_pct = float(context.params.get("target_pct", 0.25))
+        order_target_percent("AAPL", target_pct)
+"""
+    service = StrategyV2BacktestService(
+        repository=_Repository(),
+        frame_fetcher=_frame,
+        snapshot_store=MarketDataSnapshotStore(tmp_path),
+    )
+    common = {
+        "user_id": 1,
+        "code": code,
+        "start_date": datetime(2026, 1, 1),
+        "end_date": datetime(2026, 1, 5, 23, 59),
+        "initial_capital": 10000,
+        "persist": False,
+    }
+
+    _, smaller = service.run(**common, params={"target_pct": 0.25})
+    _, larger = service.run(**common, params={"target_pct": 0.75})
+
+    assert larger["totalReturn"] > smaller["totalReturn"]
+    assert larger["totalExecutions"] == smaller["totalExecutions"] == 1
+
+
 def test_v2_service_runs_a_multi_symbol_portfolio_and_preserves_symbol_attribution(tmp_path):
     code = """
 def initialize(context):

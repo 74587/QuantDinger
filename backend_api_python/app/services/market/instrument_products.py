@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 
 PRODUCT_CRYPTO = "crypto"
@@ -35,15 +35,15 @@ def classify_instrument_product(
     market_type: str = "spot",
     symbol: str = "",
     instrument_id: str = "",
+    known_equity_symbols: Collection[str] | None = None,
 ) -> InstrumentProductProfile:
     """Build a conservative product profile from exchange instrument metadata.
 
     The classifier only promotes a symbol to an equity product when the venue
-    returns an explicit product flag. Bitget Reality is the sole fallback: its
-    public catalog currently omits ``isReality`` in some CCXT versions, while
-    the venue-defined ``R<TICKER>`` convention and ``areaSymbol=yes`` remain
-    available. Unknown instruments stay ordinary crypto and therefore remain
-    outside equity-product live feature gates.
+    returns an explicit product flag. Bitget Reality also accepts its venue
+    marker, while Binance bStocks require both the venue suffix and a matching
+    reference equity symbol. Unknown instruments stay ordinary crypto and
+    therefore remain outside equity-product live feature gates.
     """
 
     unified = dict(info or {})
@@ -63,7 +63,18 @@ def classify_instrument_product(
             and _looks_like_bitget_reality_base(base)
         )
     )
-    is_equity_product = explicit_equity or bitget_reality
+    known_equities = {
+        str(value or "").strip().upper()
+        for value in (known_equity_symbols or ())
+        if str(value or "").strip()
+    }
+    binance_bstock = (
+        exchange == "binance"
+        and mt == "spot"
+        and base.endswith("B")
+        and base[:-1] in known_equities
+    )
+    is_equity_product = explicit_equity or bitget_reality or binance_bstock
 
     if is_equity_product and mt == "swap":
         product_type = PRODUCT_STOCK_PERPETUAL

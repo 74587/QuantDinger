@@ -138,6 +138,19 @@ def get_strategy_authoring_contract() -> dict[str, Any]:
                 "underlying_symbol": "00700",
                 "catalog_validation_required": True,
                 "direct_share_ownership": False,
+            }, {
+                "instrument": "Crypto:NVDAB/USDT@binance:spot",
+                "market": "Crypto",
+                "symbol": "NVDAB/USDT",
+                "exchange_id": "binance",
+                "market_type": "spot",
+                "asset_class": "equity",
+                "product_type": "tokenized_equity",
+                "api_family": "spot",
+                "underlying_market": "USStock",
+                "underlying_symbol": "NVDA",
+                "catalog_validation_required": True,
+                "direct_share_ownership": False,
             }],
             "discovery_filters": {
                 "required": ["exchange_id", "market_type", "product_type"],
@@ -152,6 +165,12 @@ def get_strategy_authoring_contract() -> dict[str, Any]:
                     "market_type": "swap",
                     "product_type": "stock_perpetual",
                     "search_examples": ["HK0700", "TENCENT"],
+                },
+                "binance_bstock": {
+                    "exchange_id": "binance",
+                    "market_type": "spot",
+                    "product_type": "tokenized_equity",
+                    "search_examples": ["NVDAB", "AAPLB"],
                 },
             },
             "venue_capabilities": {

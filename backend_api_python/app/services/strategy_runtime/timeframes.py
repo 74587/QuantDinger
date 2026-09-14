@@ -19,11 +19,27 @@ from app.services.strategy_v2.models import StrategyManifest
 from app.services.strategy_v2.service import StrategyV2BacktestService
 
 
-def live_history_days(frequency: str, warmup_bars: int) -> int:
+def live_history_days(
+    frequency: str,
+    warmup_bars: int,
+    candidates: list[dict[str, object]] | tuple = (),
+) -> int:
     """Return a frequency-aware live lookback with a startup buffer."""
     bars = max(10, max(1, int(warmup_bars or 0)) * 3)
     seconds = frequency_seconds(frequency) * bars
-    return max(1, int(math.ceil(seconds / 86_400)))
+    days = max(1, int(math.ceil(seconds / 86_400)))
+    normalized = str(frequency or "").strip().lower()
+    stock_session = any(
+        str(item.get("market") or "") in {"USStock", "HKStock", "CNStock", "AStock"}
+        or str(item.get("underlying_market") or "") in {"USStock", "HKStock", "CNStock", "AStock"}
+        or str(item.get("api_family") or "").strip().lower() == "stock"
+        for item in candidates
+    )
+    if stock_session and normalized.endswith(("m", "h")):
+        hours = float(normalized[:-1]) / (60 if normalized.endswith("m") else 1)
+        session_days = math.ceil(max(1, warmup_bars) * 3 * hours / 4 * 7 / 5 * 1.5)
+        days = max(days, 7, session_days)
+    return days
 
 
 def completed_bar_token(frequency: str, now: datetime | None = None) -> int:
@@ -46,7 +62,7 @@ def load_live_frequency_frames(
     """Load a complete live frame bundle for all declared strategy timeframes."""
     start_dates = {
         frequency: end_date
-        - timedelta(days=live_history_days(frequency, manifest.warmup_bars))
+        - timedelta(days=live_history_days(frequency, manifest.warmup_bars, candidates))
         for frequency in manifest.frequencies
     }
     bundles, skipped = service.fetch_frequency_frames(

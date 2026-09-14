@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from app.services.symbol_master_sync import (
     fetch_crypto_symbols_with_diagnostics,
+    reclassify_stored_equity_products,
     upsert_symbol_master,
 )
 from app.utils.db import get_db_connection
@@ -17,7 +18,7 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 _thread_lock = threading.Lock()
 _worker = None
-MARKET_CATALOG_SCHEMA_VERSION = 2
+MARKET_CATALOG_SCHEMA_VERSION = 3
 
 
 def _json_value(value):
@@ -81,6 +82,7 @@ def _run_sync(run_id: int) -> None:
     try:
         rows, contexts = fetch_crypto_symbols_with_diagnostics()
         written = upsert_symbol_master(rows) if rows else 0
+        reclassified = reclassify_stored_equity_products()
         succeeded = sum(1 for item in contexts if item.get("ok"))
         failed = len(contexts) - succeeded
         status = "success" if failed == 0 else ("partial" if succeeded else "failed")
@@ -88,6 +90,7 @@ def _run_sync(run_id: int) -> None:
             "catalog_schema_version": MARKET_CATALOG_SCHEMA_VERSION,
             "rows": len(rows),
             "upserted": written,
+            "reclassified": reclassified,
             "contexts_total": len(contexts),
             "contexts_succeeded": succeeded,
             "contexts_failed": failed,
@@ -198,7 +201,20 @@ def get_market_catalog_overview() -> dict:
                        COUNT(*) FILTER (WHERE is_active = 1) AS active,
                        COUNT(DISTINCT symbol) FILTER (WHERE is_active = 1) AS symbols,
                        COUNT(*) FILTER (WHERE is_active = 1 AND asset_class = 'equity') AS equities,
-                       COUNT(*) FILTER (WHERE is_active = 1 AND asset_class = 'rwa') AS rwa
+                       COUNT(*) FILTER (WHERE is_active = 1 AND asset_class = 'rwa') AS rwa,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND market_type = 'spot'
+                             AND COALESCE(product_type, 'crypto') = 'crypto'
+                       ) AS ordinary_spot,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND product_type = 'tokenized_equity'
+                       ) AS tokenized_equity,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND product_type = 'direct_equity'
+                       ) AS direct_equity,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND product_type = 'stock_perpetual'
+                       ) AS stock_perpetual
                   FROM qd_market_symbols
                  WHERE market = 'Crypto' AND exchange <> ''
                  GROUP BY LOWER(exchange), market_type
@@ -211,7 +227,20 @@ def get_market_catalog_overview() -> dict:
                 SELECT COUNT(*) FILTER (WHERE is_active = 1) AS active,
                        COUNT(DISTINCT symbol) FILTER (WHERE is_active = 1) AS symbols,
                        COUNT(*) FILTER (WHERE is_active = 1 AND asset_class = 'equity') AS equities,
-                       COUNT(*) FILTER (WHERE is_active = 1 AND asset_class = 'rwa') AS rwa
+                       COUNT(*) FILTER (WHERE is_active = 1 AND asset_class = 'rwa') AS rwa,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND market_type = 'spot'
+                             AND COALESCE(product_type, 'crypto') = 'crypto'
+                       ) AS ordinary_spot,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND product_type = 'tokenized_equity'
+                       ) AS tokenized_equity,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND product_type = 'direct_equity'
+                       ) AS direct_equity,
+                       COUNT(*) FILTER (
+                           WHERE is_active = 1 AND product_type = 'stock_perpetual'
+                       ) AS stock_perpetual
                   FROM qd_market_symbols
                  WHERE market = 'Crypto'
                 """

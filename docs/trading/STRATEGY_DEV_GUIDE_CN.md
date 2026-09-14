@@ -175,7 +175,7 @@ Gate 港股腾讯使用 <code>Crypto:00700/HKD@gate:spot</code>，Gate 美股苹
 
 筛选时选择交易所 **Gate**、市场类型 **Spot**、产品类型 **Direct Equity**（中文界面显示“交易所股票”，英文显示“Exchange stock”，接口值为 <code>direct_equity</code>），然后搜索 <code>00700</code> 或 <code>AAPL</code>，选择目录返回的准确标的。
 
-其他交易所使用不同的产品契约。Binance 港股属于衍生品，例如产品目录确认的 <code>Crypto:HK0700/USDT@binance:swap</code>，记录为 <code>stock_perpetual / swap / swap</code>；只有权威元数据确认港股底层时才映射到 HKStock。它不是 Gate 直接股票，也不代表直接持有港股。OKX 和 Bybit 可以提供 <code>tokenized_equity / spot / spot</code> 与 <code>stock_perpetual / swap / swap</code>；Bitget Reality 使用 <code>tokenized_equity / spot / reality</code>，并支持目录确认的股票永续。HTX 在没有可靠产品标记和执行契约前关闭股票产品识别。
+其他交易所使用不同的产品契约。Binance bStocks（例如目录确认的 <code>Crypto:NVDAB/USDT@binance:spot</code>）使用 <code>tokenized_equity / spot / spot</code>；Binance 港股股票永续（例如 <code>Crypto:HK0700/USDT@binance:swap</code>）使用 <code>stock_perpetual / swap / swap</code>，只有权威元数据确认港股底层时才映射到 HKStock。两者都不代表直接持有股票。OKX 和 Bybit 可以提供 <code>tokenized_equity / spot / spot</code> 与 <code>stock_perpetual / swap / swap</code>；Bitget Reality 使用 <code>tokenized_equity / spot / reality</code>，并支持目录确认的股票永续。HTX 在没有可靠产品标记和执行契约前关闭股票产品识别。
 
 不能只凭 ticker 猜测产品。产品目录必须提供交易所、市场类型、产品类型、API family、原生 instrument ID、币种和可用的底层身份，策略必须完整保留。如果底层地区未知或系统不支持，因子和基本面保持不可用，不能默认为美股数据。
 
@@ -929,6 +929,7 @@ def rebalance(context, data):
 | 交易所直接股票 | Gate 股票通道 | <code>direct_equity / spot / stock</code>；美股和港股必须保留目录返回的准确币种，只做多 |
 | 交易所代币化股票 | OKX、Bybit、Bitget Reality | OKX/Bybit 使用 <code>tokenized_equity / spot / spot</code>；Bitget 使用 <code>tokenized_equity / spot / reality</code>；必须通过目录和地区可用性校验 |
 | 交易所股票永续 | Binance、OKX、Bitget、Bybit、Gate | <code>stock_perpetual / swap / swap</code>；属于衍生品，遵守 Crypto swap 方向和杠杆规则，必须使用准确原生合约 |
+| Binance bStocks | Binance | <code>tokenized_equity / spot / spot</code>；必须使用目录中的准确交易对（如 <code>NVDAB/USDT</code>），按普通现货下单且不可使用杠杆 |
 | 未验证交易所股票 | HTX | 在权威产品元数据和执行 API family 验证完成前拒绝 |
 | USStock | Alpaca、IBKR | 当前券商策略按 long-only |
 | 其他可解析市场 | 暂无 | 可回测或有数据不等于支持实盘 |

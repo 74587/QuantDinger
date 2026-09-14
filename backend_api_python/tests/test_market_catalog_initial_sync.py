@@ -93,6 +93,11 @@ def test_catalog_schema_version_is_recorded_for_upgrade_detection(monkeypatch):
     )
     monkeypatch.setattr(
         market_catalog_sync,
+        "reclassify_stored_equity_products",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        market_catalog_sync,
         "_finish_run",
         lambda run_id, status, result: completed.update(
             run_id=run_id, status=status, result=result,
@@ -114,11 +119,15 @@ def test_catalog_schema_version_is_recorded_for_upgrade_detection(monkeypatch):
         ({
             "active_crypto": 10,
             "latest_success_result": {"catalog_schema_version": 2},
-        }, True),
+        }, False),
         ({
             "active_crypto": 0,
             "latest_success_result": {"catalog_schema_version": 2},
         }, False),
+        ({
+            "active_crypto": 10,
+            "latest_success_result": {"catalog_schema_version": 3},
+        }, True),
     ],
 )
 def test_initialized_catalog_requires_current_schema(monkeypatch, row, expected):
