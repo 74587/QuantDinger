@@ -2160,7 +2160,14 @@ class TradingExecutor:
         exchange_config: dict[str, Any],
         client_holder: dict[str, Any],
     ) -> dict[str, float]:
-        prices = cls._live_prices(candidates)
+        standard_candidates = [
+            member
+            for member in candidates
+            if str(
+                member.get("api_family") or member.get("market_type") or "spot"
+            ).strip().lower() in {"spot", "swap"}
+        ]
+        prices = cls._live_prices(standard_candidates) if standard_candidates else {}
         from app.services.live_trading.factory import create_client
         from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id
 
@@ -2180,6 +2187,9 @@ class TradingExecutor:
                     client_config["api_family"] = api_family
                     if instrument_id:
                         client_config["instrument_id"] = instrument_id
+                    product_meta = member.get("product_meta")
+                    if isinstance(product_meta, dict) and product_meta:
+                        client_config["instrument_product_meta"] = dict(product_meta)
                     client = create_client(client_config, market_type=market_type)
                     client_holder[client_key] = client
                 price = 0.0

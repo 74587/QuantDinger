@@ -576,6 +576,44 @@ def test_demo_account_price_overrides_public_market_price(monkeypatch):
     assert prices["Crypto:BTC/USDT@binance:swap"] == 63_943.1
 
 
+def test_special_equity_price_skips_generic_crypto_quote(monkeypatch):
+    from app.services.live_trading import factory
+
+    class Client:
+        def get_ticker(self, *, symbol):
+            assert symbol == "NVDA/USD"
+            return {"last": 210.25}
+
+    monkeypatch.setattr(factory, "create_client", lambda *_args, **_kwargs: Client())
+    monkeypatch.setattr(
+        TradingExecutor,
+        "_live_prices",
+        staticmethod(
+            lambda _candidates: (_ for _ in ()).throw(
+                AssertionError("generic crypto quote must not run for Gate stocks")
+            )
+        ),
+    )
+    candidates = [{
+        "market": "Crypto",
+        "symbol": "NVDA/USD",
+        "key": "Crypto:NVDA/USD@gate:spot",
+        "exchange_id": "gate",
+        "market_type": "spot",
+        "instrument_id": "NVDA",
+        "product_type": "direct_equity",
+        "api_family": "stock",
+    }]
+
+    prices = TradingExecutor._execution_account_prices(
+        candidates,
+        {"exchange_id": "gate", "environment": "live"},
+        {},
+    )
+
+    assert prices["Crypto:NVDA/USD@gate:spot"] == 210.25
+
+
 def test_live_frame_latest_completed_bar_is_not_overwritten_by_execution_price():
     frame = _frame(price=64_294.6)
     before = frame.iloc[-1][["open", "high", "low", "close"]].tolist()

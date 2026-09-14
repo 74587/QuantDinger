@@ -89,6 +89,59 @@ def test_attach_instrument_product_contracts_hydrates_legacy_empty_contract(monk
     assert trading_config["instrument_products"][0]["product_type"] == "direct_equity"
 
 
+def test_attach_instrument_product_contracts_repairs_legacy_generic_contract(monkeypatch):
+    candidates = [{
+        "market": "Crypto",
+        "symbol": "NVDA/USD",
+        "exchange_id": "gate",
+        "market_type": "spot",
+        "key": "Crypto:NVDA/USD@gate:spot",
+    }]
+    trading_config = {"instrument_products": [{
+        "market": "Crypto",
+        "symbol": "NVDA/USD",
+        "exchange_id": "gate",
+        "market_type": "spot",
+        "instrument_id": "NVDA_USD",
+        "product_type": "crypto",
+        "api_family": "spot",
+    }]}
+    monkeypatch.setattr(
+        product_catalog,
+        "get_catalog_product",
+        lambda **kwargs: {
+            "instrument_id": "NVDA",
+            "product_type": "direct_equity",
+            "api_family": "stock",
+            "underlying_market": "USStock",
+            "underlying_symbol": "NVDA",
+            "product_meta": {"quote_currency": "USD"},
+        },
+    )
+
+    attach_instrument_product_contracts(
+        candidates,
+        trading_config,
+        exchange_id="gate",
+    )
+
+    assert candidates[0]["instrument_id"] == "NVDA"
+    assert candidates[0]["api_family"] == "stock"
+    assert candidates[0]["underlying_market"] == "USStock"
+    assert trading_config["instrument_products"] == [{
+        "market": "Crypto",
+        "symbol": "NVDA/USD",
+        "exchange_id": "gate",
+        "market_type": "spot",
+        "instrument_id": "NVDA",
+        "product_type": "direct_equity",
+        "api_family": "stock",
+        "underlying_market": "USStock",
+        "underlying_symbol": "NVDA",
+        "product_meta": {"quote_currency": "USD"},
+    }]
+
+
 def test_attach_instrument_product_contracts_keeps_unresolved_legacy_crypto(monkeypatch):
     candidates = [{
         "market": "Crypto",
