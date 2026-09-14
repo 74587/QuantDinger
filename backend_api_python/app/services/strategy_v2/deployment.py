@@ -62,6 +62,21 @@ class StrategyV2DeploymentService:
             manifest.metadata(), exchange_id, execution_mode,
             instruments=live_instruments,
         )
+        if execution_mode == "live" and any(
+            item.get("exchange_id") == "gate" and item.get("api_family") == "stock"
+            for item in instrument_products
+        ):
+            from app.services.exchange_execution import resolve_exchange_config
+            from app.services.market.product_catalog import validate_product_account_environment
+
+            account_config = resolve_exchange_config(
+                {"credential_id": credential_id, "exchange_id": exchange_id},
+                user_id=user_id,
+            )
+            try:
+                validate_product_account_environment(instrument_products, account_config)
+            except ValueError as exc:
+                raise StrategyV2ContractError(str(exc)) from exc
         quote_currency = self._validate_live_quote_currency(
             markets=manifest.markets,
             instruments=live_instruments or (

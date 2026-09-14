@@ -6,6 +6,33 @@ from app.services.strategy_v2.deployment import StrategyV2DeploymentService
 from app.services.market import product_catalog
 
 
+@pytest.mark.parametrize("config", [
+    {"environment": "testnet"}, {"environment": "demo"}, {"sandbox": True},
+    {"use_testnet": True}, {"enableDemoTrading": "true"},
+])
+def test_gate_stock_environment_validation_preserves_account_configuration(config):
+    account = {"exchange_id": "gate", **config}
+    snapshot = dict(account)
+    with pytest.raises(ValueError, match="gateStockTestnetUnsupported"):
+        product_catalog.validate_product_account_environment(
+            [{"exchange_id": "gate", "api_family": "stock"}], account,
+        )
+    assert account == snapshot
+
+
+@pytest.mark.parametrize("exchange,api_family,environment", [
+    ("gate", "stock", "live"), ("gate", "spot", "testnet"),
+    ("gate", "swap", "testnet"), ("binance", "spot", "demo"),
+    ("okx", "swap", "demo"), ("bitget", "spot", "demo"),
+    ("bybit", "swap", "demo"), ("htx", "spot", "live"),
+])
+def test_gate_stock_guard_does_not_change_other_product_environments(exchange, api_family, environment):
+    product_catalog.validate_product_account_environment(
+        [{"exchange_id": exchange, "api_family": api_family}],
+        {"exchange_id": exchange, "environment": environment},
+    )
+
+
 def _manifest(exchange_id="bybit", market_type="spot"):
     return {
         "universe": {

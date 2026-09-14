@@ -66,6 +66,22 @@ def _json_object(value: Any) -> dict[str, Any]:
     return {}
 
 
+def validate_product_account_environment(
+    products: list[dict[str, Any]] | None,
+    exchange_config: dict[str, Any],
+) -> None:
+    from app.services.live_trading.factory import exchange_trading_environment
+
+    has_gate_stock = any(
+        isinstance(product, dict)
+        and str(product.get("exchange_id") or exchange_config.get("exchange_id") or "").lower() == "gate"
+        and str(product.get("api_family") or "").lower() == "stock"
+        for product in products or []
+    )
+    if has_gate_stock and exchange_trading_environment(exchange_config) != "live":
+        raise ValueError("strategyV2.gateStockTestnetUnsupported")
+
+
 def validate_runtime_products(
     products: list[dict[str, Any]] | None,
     *,

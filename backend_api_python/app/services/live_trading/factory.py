@@ -316,7 +316,7 @@ def create_client(exchange_config: Dict[str, Any], *, market_type: str = "swap")
             base_url = default_gate if is_demo else (_get(exchange_config, "base_url", "baseUrl") or default_gate)
             if str(exchange_config.get("api_family") or "").strip().lower() == "stock":
                 if is_demo:
-                    raise LiveTradingError("GATE_STOCK_TESTNET_NOT_SUPPORTED")
+                    raise LiveTradingError("strategyV2.gateStockTestnetUnsupported")
                 return GateStockClient(
                     api_key=api_key,
                     secret_key=secret_key,

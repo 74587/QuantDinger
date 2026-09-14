@@ -122,13 +122,17 @@ class TradingExecutor:
 
         trading_config = _json_object(strategy.get("trading_config"))
         from app.services.exchange_execution import resolve_exchange_config
-        from app.services.market.product_catalog import validate_runtime_products
+        from app.services.market.product_catalog import (
+            validate_product_account_environment,
+            validate_runtime_products,
+        )
 
         exchange_config = resolve_exchange_config(
             _json_object(strategy.get("exchange_config")),
             user_id=user_id,
         )
         exchange_id = str(exchange_config.get("exchange_id") or "").strip().lower()
+        validate_product_account_environment(trading_config.get("instrument_products"), exchange_config)
         validate_runtime_products(
             trading_config.get("instrument_products")
             if isinstance(trading_config.get("instrument_products"), list)
@@ -382,6 +386,9 @@ class TradingExecutor:
                     trading_config,
                     exchange_id=account_exchange,
                 )
+                from app.services.market.product_catalog import validate_product_account_environment
+
+                validate_product_account_environment(candidates, exchange_config)
 
             frequency = program.manifest.driving_frequency
 
@@ -520,7 +527,6 @@ class TradingExecutor:
                     rest_fallback=runtime_prices,
                 )
                 market_price_feed.start()
-                rest_runtime_prices = runtime_prices
 
                 def runtime_prices() -> dict[str, float]:
                     snapshot = market_price_feed.snapshot(
@@ -533,7 +539,7 @@ class TradingExecutor:
                         "age_ms": snapshot.age_ms,
                         "connected": snapshot.connected,
                     })
-                    return snapshot.prices or rest_runtime_prices()
+                    return snapshot.prices
             state_store = RuntimeStateStore(
                 strategy_id=strategy_id,
                 strategy_run_id=run_id,
