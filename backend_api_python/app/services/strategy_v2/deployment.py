@@ -409,7 +409,7 @@ class StrategyV2DeploymentService:
                 market_type=market_type,
             )
             if not product:
-                continue
+                raise StrategyV2ContractError("strategyV2.instrumentCatalogMissing")
             product_type = str(product.get("product_type") or PRODUCT_CRYPTO).strip().lower()
             if product_type != PRODUCT_CRYPTO:
                 if not declared_exchange:

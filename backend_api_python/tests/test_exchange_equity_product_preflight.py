@@ -66,6 +66,15 @@ def test_live_product_preflight_persists_catalog_contract(monkeypatch):
     }]
 
 
+def test_live_product_preflight_rejects_missing_catalog_product(monkeypatch):
+    monkeypatch.setattr(deployment, "get_catalog_product", lambda **kwargs: None)
+
+    with pytest.raises(StrategyV2ContractError, match="strategyV2.instrumentCatalogMissing"):
+        StrategyV2DeploymentService._validate_manifest_products(
+            _manifest(exchange_id="gate"), "gate", "live",
+        )
+
+
 def test_live_product_preflight_rejects_credential_venue_mismatch(monkeypatch):
     monkeypatch.setattr(deployment, "get_catalog_product", lambda **kwargs: _product())
 

@@ -16,6 +16,7 @@ from app.services.live_trading.bybit import BybitClient
 from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
+from app.services.market import product_catalog
 from app.services.pending_orders import live_order_phases
 from app.services.pending_orders.live_order_support import (
     FillAccumulator,
@@ -53,6 +54,59 @@ def test_attach_instrument_product_contracts_uses_immutable_native_id():
     assert candidates[0]["instrument_id"] == "rAAPLUSDT"
     assert candidates[0]["api_family"] == "reality"
     assert candidates[0]["product_type"] == "tokenized_equity"
+
+
+def test_attach_instrument_product_contracts_hydrates_legacy_empty_contract(monkeypatch):
+    candidates = [{
+        "market": "Crypto",
+        "symbol": "NVDA/USD",
+        "exchange_id": "gate",
+        "market_type": "spot",
+        "key": "Crypto:NVDA/USD@gate:spot",
+    }]
+    trading_config = {"instrument_products": []}
+    monkeypatch.setattr(
+        product_catalog,
+        "get_catalog_product",
+        lambda **kwargs: {
+            "instrument_id": "NVDA",
+            "product_type": "direct_equity",
+            "api_family": "stock",
+            "underlying_market": "USStock",
+            "underlying_symbol": "NVDA",
+            "product_meta": {"quote_currency": "USD"},
+        },
+    )
+
+    attach_instrument_product_contracts(
+        candidates,
+        trading_config,
+        exchange_id="gate",
+    )
+
+    assert candidates[0]["instrument_id"] == "NVDA"
+    assert candidates[0]["api_family"] == "stock"
+    assert trading_config["instrument_products"][0]["product_type"] == "direct_equity"
+
+
+def test_attach_instrument_product_contracts_keeps_unresolved_legacy_crypto(monkeypatch):
+    candidates = [{
+        "market": "Crypto",
+        "symbol": "NVDA/USD",
+        "exchange_id": "gate",
+        "market_type": "spot",
+    }]
+    monkeypatch.setattr(product_catalog, "get_catalog_product", lambda **kwargs: None)
+
+    trading_config = {"instrument_products": []}
+    attach_instrument_product_contracts(
+        candidates,
+        trading_config,
+        exchange_id="gate",
+    )
+
+    assert "api_family" not in candidates[0]
+    assert trading_config["instrument_products"] == []
 
 
 def test_make_client_order_id_okx_is_compact_alphanumeric():
