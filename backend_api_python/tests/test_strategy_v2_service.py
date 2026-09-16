@@ -15,6 +15,7 @@ from app.services.strategy_v2.service import (
     _benchmark_for_manifest,
     _build_benchmark_result,
     _build_review_candle_snapshots,
+    _instrument_rules_as_of,
     _review_frequency_for_window,
     _universe_matches,
     _warmup_calendar_days,
@@ -33,6 +34,26 @@ def test_warmup_days_follow_strategy_frequency():
     assert _warmup_calendar_days("4h", 120) == 30
     assert _warmup_calendar_days("1d", 10) == 19
     assert _warmup_calendar_days("1w", 10) == 80
+
+
+def test_instrument_rules_use_last_common_market_timestamp():
+    frames = {
+        "Crypto:BTC/USDT@swap": pd.DataFrame(
+            {"close": [100.0, 101.0]},
+            index=pd.DatetimeIndex(["2026-09-16 16:08", "2026-09-16 16:09"]),
+        ),
+        "Crypto:ETH/USDT@swap": pd.DataFrame(
+            {"close": [50.0, 51.0]},
+            index=pd.DatetimeIndex(["2026-09-16 16:07", "2026-09-16 16:08"]),
+        ),
+    }
+
+    resolved = _instrument_rules_as_of(
+        frames,
+        datetime(2026, 9, 16, 23, 59, 59),
+    )
+
+    assert resolved == datetime(2026, 9, 16, 16, 8)
 
 
 def test_benchmark_alignment_does_not_extend_stale_prices_past_real_coverage():

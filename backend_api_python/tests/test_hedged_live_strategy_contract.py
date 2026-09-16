@@ -12,7 +12,21 @@ from app.services.pending_order_worker import _strategy_allows_simultaneous_legs
 from app.services.trading_executor import TradingExecutor
 
 
-def _strategy(strategy_id: int, side: str, *, status: str = "running") -> dict:
+def _strategy(
+    strategy_id: int,
+    side: str,
+    *,
+    status: str = "running",
+    direction_mode: str = "",
+) -> dict:
+    trading_config = {
+        "symbol": "BTC/USDT",
+        "market_type": "swap",
+        "position_side": side,
+        "leverage": 5,
+    }
+    if direction_mode:
+        trading_config["direction_mode"] = direction_mode
     return {
         "id": strategy_id,
         "user_id": 7,
@@ -24,12 +38,8 @@ def _strategy(strategy_id: int, side: str, *, status: str = "running") -> dict:
         "initial_capital": 1_000.0,
         "leverage": 5,
         "exchange_config": {"exchange_id": "okx", "credential_id": 17},
-        "trading_config": {
-            "symbol": "BTC/USDT",
-            "market_type": "swap",
-            "position_side": side,
-            "leverage": 5,
-        },
+        "direction_mode": direction_mode,
+        "trading_config": trading_config,
     }
 
 
@@ -143,13 +153,17 @@ def test_swap_preflight_fails_closed_when_position_mode_is_unknown(monkeypatch):
         executor._preflight_live_strategy(20)
 
 
-def test_swap_preflight_accepts_one_way_mode_and_locks_the_whole_instrument(monkeypatch):
+def test_swap_preflight_accepts_one_way_strategy_on_net_account(monkeypatch):
     from app.services.grid import exchange_requirements
     from app.services.live_trading import factory
     from app.services import exchange_execution
 
     executor = TradingExecutor()
-    monkeypatch.setattr(executor, "_load_strategy", lambda _sid: _strategy(20, "long"))
+    monkeypatch.setattr(
+        executor,
+        "_load_strategy",
+        lambda _sid: _strategy(20, "", direction_mode="one_way"),
+    )
     conflict_calls = []
     monkeypatch.setattr(
         strategy_live_guard,
@@ -166,6 +180,30 @@ def test_swap_preflight_accepts_one_way_mode_and_locks_the_whole_instrument(monk
 
     executor._preflight_live_strategy(20)
     assert conflict_calls == [{"allow_opposite_leg": False}]
+
+
+def test_swap_preflight_rejects_one_way_strategy_on_hedge_account(monkeypatch):
+    from app.services.grid import exchange_requirements
+    from app.services.live_trading import factory
+    from app.services import exchange_execution
+
+    executor = TradingExecutor()
+    monkeypatch.setattr(
+        executor,
+        "_load_strategy",
+        lambda _sid: _strategy(20, "", direction_mode="one_way"),
+    )
+    monkeypatch.setattr(strategy_live_guard, "find_live_strategy_conflict", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(exchange_execution, "resolve_exchange_config", lambda *_args, **_kwargs: {"exchange_id": "okx"})
+    monkeypatch.setattr(factory, "create_client", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        exchange_requirements,
+        "detect_hedge_position_mode",
+        lambda *_args, **_kwargs: (True, "okx_long_short_mode"),
+    )
+
+    with pytest.raises(RuntimeError, match="strategyV2.oneWayPositionModeRequired"):
+        executor._preflight_live_strategy(20)
 
 
 def test_swap_preflight_accepts_confirmed_hedge_mode(monkeypatch):

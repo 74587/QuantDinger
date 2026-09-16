@@ -68,7 +68,7 @@ def initialize(context):
     context.set_universe([g.symbol])
     context.set_benchmark("Crypto:BTC/USDT@spot")
     context.subscribe(frequency="4h")
-    context.set_metadata(direction_mode="both")
+    context.set_metadata(direction_mode="one_way")
     context.set_warmup(310)
     context.allow_leverage(max_leverage=20)
 
@@ -86,24 +86,23 @@ def handle_data(context, data):
     close = bars["close"]
     fast = float(close.tail(fast_period).mean())
     slow = float(close.tail(slow_period).mean())
-    long_position = get_position(g.symbol, position_side="long")
-    short_position = get_position(g.symbol, position_side="short")
-    long_open = abs(float(long_position.amount or 0.0)) > 1e-12
-    short_open = abs(float(short_position.amount or 0.0)) > 1e-12
+    amount = float(get_position(g.symbol).amount or 0.0)
+    long_open = amount > 1e-12
+    short_open = amount < -1e-12
     bullish = fast > slow
     if bullish:
         if short_open:
-            order_target_percent(g.symbol, 0.0, position_side="short", reason="dual_ma_close_short")
+            order_target_percent(g.symbol, 0.0, reason="dual_ma_close_short")
         elif not long_open:
-            order_target_percent(g.symbol, target_pct, position_side="long", reason="dual_ma_open_long")
+            order_target_percent(g.symbol, target_pct, reason="dual_ma_open_long")
     else:
         if long_open:
-            order_target_percent(g.symbol, 0.0, position_side="long", reason="dual_ma_close_long")
+            order_target_percent(g.symbol, 0.0, reason="dual_ma_close_long")
         elif allow_short and not short_open:
-            order_target_percent(g.symbol, -target_pct, position_side="short", reason="dual_ma_open_short")
+            order_target_percent(g.symbol, -target_pct, reason="dual_ma_open_short")
         elif not allow_short and short_open:
-            order_target_percent(g.symbol, 0.0, position_side="short", reason="dual_ma_close_short_disabled")
-$double$, '{"params":[{"name":"fast_period","type":"integer","default":20,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label","descriptionKey":"trading-assistant.templateParam.fast_period.desc"},{"name":"slow_period","type":"integer","default":60,"min":5,"max":300,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label","descriptionKey":"trading-assistant.templateParam.slow_period.desc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"},{"name":"allow_short","type":"boolean","default":true,"labelKey":"strategyV2.params.allowShort","descriptionKey":"strategyV2.params.allowShortDesc"}]}'::jsonb, '["strategy-v2","cta","moving-average","crypto","swap"]'::jsonb, 'swap', 'blue', 20, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
+            order_target_percent(g.symbol, 0.0, reason="dual_ma_close_short_disabled")
+$double$, '{"params":[{"name":"fast_period","type":"integer","default":20,"min":2,"max":100,"step":1,"labelKey":"trading-assistant.templateParam.fast_period.label","descriptionKey":"trading-assistant.templateParam.fast_period.desc"},{"name":"slow_period","type":"integer","default":60,"min":5,"max":300,"step":1,"labelKey":"trading-assistant.templateParam.slow_period.label","descriptionKey":"trading-assistant.templateParam.slow_period.desc"},{"name":"target_pct","type":"percent","default":0.95,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.targetPosition","descriptionKey":"strategyV2.params.targetPositionDesc"},{"name":"allow_short","type":"boolean","default":true,"labelKey":"strategyV2.params.allowShort","descriptionKey":"strategyV2.params.allowShortDesc"}]}'::jsonb, '["strategy-v2","cta","moving-average","crypto","swap","one-way"]'::jsonb, 'swap', 'blue', 20, TRUE, '{"source":"system_seed","version":12,"apiVersion":2}'::jsonb, NOW()),
 
 ('strategy_v2_bullish_three_lines', 'script', 'Bullish Candle Through Three Averages', 'An A-share bullish candle breakout through three configurable averages.', $three$"""
 Bullish Candle Through Three Averages

@@ -15,6 +15,8 @@ def enrich_execution_reference(row):
         except (ValueError, TypeError):
             payload = {}
     payload = payload if isinstance(payload, dict) else {}
+    if not result.get("grid_client_reference"):
+        result["grid_client_reference"] = payload.get("client_order_id") or ""
     reference = positive_number(grid_price)
     kind = "limit" if reference is not None else None
     if reference is None:

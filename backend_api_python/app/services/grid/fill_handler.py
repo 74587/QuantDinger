@@ -6,7 +6,6 @@ from typing import Any, Dict
 
 from app.services.grid.resting_orders_repo import GridRestingOrder
 from app.services.live_trading.fill_evidence import require_execution
-from app.services.live_trading.grid_cells import GridCellRepository
 from app.services.live_trading.leg_context import resolve_leg_context
 from app.services.live_trading.records import (
     apply_fill_to_local_position,
@@ -23,38 +22,6 @@ _PURPOSE_TO_SIGNAL = {
     "short_entry": "open_short",
     "short_exit": "close_short",
 }
-
-
-def _matched_grid_entry_price(strategy_id: int, symbol: str, order: GridRestingOrder) -> float:
-    """Best-effort cell cost basis for one grid close fill."""
-    purpose = str(order.purpose or "")
-    if purpose not in ("long_exit", "short_exit"):
-        return 0.0
-    try:
-        repo = GridCellRepository()
-        rows = repo.list_cells(int(strategy_id), str(symbol or ""))
-        for cell in rows or []:
-            if int(getattr(cell, "cell_index", -1)) != int(order.cell_index):
-                continue
-            entry = float(getattr(cell, "leg_entry_price", 0.0) or 0.0)
-            if entry > 0:
-                return entry
-            if purpose == "long_exit":
-                return float(getattr(cell, "lower_price", 0.0) or 0.0)
-            return float(getattr(cell, "upper_price", 0.0) or 0.0)
-    except Exception as e:
-        logger.debug("grid matched entry lookup sid=%s cell=%s: %s", strategy_id, order.cell_index, e)
-    return 0.0
-
-
-def _grid_match_profit(purpose: str, entry_price: float, exit_price: float, qty: float) -> float | None:
-    if entry_price <= 0 or exit_price <= 0 or qty <= 0:
-        return None
-    if purpose == "long_exit":
-        return (exit_price - entry_price) * qty
-    if purpose == "short_exit":
-        return (entry_price - exit_price) * qty
-    return None
 
 
 def apply_grid_fill_to_local_state(
@@ -84,8 +51,6 @@ def apply_grid_fill_to_local_state(
     require_execution(qty, px)
     tc = trading_config if isinstance(trading_config, dict) else {}
     from app.services.pending_orders.fill_records import spot_position_fill_quantity
-    grid_entry_price = _matched_grid_entry_price(int(strategy_id), sym, order)
-    grid_profit = _grid_match_profit(purpose, grid_entry_price, px, qty)
 
     leg = resolve_leg_context(
         strategy_id=int(strategy_id),
@@ -103,9 +68,6 @@ def apply_grid_fill_to_local_state(
         avg_price=px,
         leg=leg,
     )
-    if grid_profit is not None:
-        profit = grid_profit
-        matched_entry = grid_entry_price
     record_trade(
         strategy_id=int(strategy_id),
         symbol=sym,
@@ -118,9 +80,7 @@ def apply_grid_fill_to_local_state(
         profit=profit,
         close_reason=purpose,
         matched_entry_price=matched_entry,
-        grid_matched_profit=(
-            profit if purpose in ("long_exit", "short_exit") and profit is not None else None
-        ),
+        grid_matched_profit=None,
         leg=leg,
         exchange_fill_id=str(exchange_fill_id or ""),
         execution_event_id=int(execution_event_id or 0),

@@ -179,7 +179,7 @@ Never infer these products from a ticker alone. Product discovery must return th
 
 For research, factor screening, or trading through a traditional securities account, add <code>HKStock:00700.HK</code> under Hong Kong stocks or <code>USStock:AAPL</code> under US stocks. These are different execution identities: an ordinary HKStock or USStock instrument cannot be submitted directly to a Gate account. Do not silently convert a research instrument into an exchange order.
 
-Keep the selected exchange identifier in the universe, history requests, and orders. Preserve <code>00700/HKD</code>, <code>AAPL/USD</code>, or the exact catalog-confirmed perpetual symbol; do not remove leading zeros, substitute a currency, replace the identifier with its underlying stock, or switch venues/API families. Exchange spot equities remain long-only and cannot call <code>allow_leverage</code>. Equity perpetuals follow the Crypto swap contract: declare direction metadata, pass <code>position_side</code> on position/order calls, and enable leverage only through <code>context.allow_leverage(max_leverage=N)</code>.
+Keep the selected exchange identifier in the universe, history requests, and orders. Preserve <code>00700/HKD</code>, <code>AAPL/USD</code>, or the exact catalog-confirmed perpetual symbol; do not remove leading zeros, substitute a currency, replace the identifier with its underlying stock, or switch venues/API families. Exchange spot equities remain long-only and cannot call <code>allow_leverage</code>. Equity perpetuals follow the Crypto swap contract: declare direction metadata, omit <code>position_side</code> for <code>one_way</code>, pass it for hedge-leg modes, and enable leverage only through <code>context.allow_leverage(max_leverage=N)</code>.
 
 The active product catalog determines whether an exchange instrument is a direct equity, tokenized equity, stock perpetual, or ordinary crypto product. Ticker spelling alone is insufficient. A history adapter may use a catalog-confirmed underlying equity market while preserving the execution identity. Strategy code must use Strategy API V2 helpers, not directly call exchange, broker, or data-provider APIs. Compilation does not establish live eligibility: deployment also validates the catalog, product/API family, venue, account, trading status, sizing rules, and currency.
 
@@ -534,7 +534,7 @@ Do not confuse these definitions from different layers:
 
 | Name | Layer | Meaning |
 | --- | --- | --- |
-| <code>direction_mode</code> | strategy manifest | allowed capability: <code>long_only</code>, <code>short_only</code>, <code>both</code>, or <code>neutral</code> |
+| <code>direction_mode</code> | strategy manifest | allowed capability: <code>long_only</code>, <code>short_only</code>, <code>one_way</code>, <code>both</code>, or <code>neutral</code> |
 | <code>position_side</code> | position/order | <code>long</code> or <code>short</code> leg in swap hedge mode; spot has long inventory only |
 | order value/target | strategy source | requested quantity, value, or weight change/target; short targets are negative in source |
 | <code>open/add/reduce/close</code> | runtime order intent | canonical action derived from synchronized position and target delta; submitted quantity is absolute |
@@ -672,12 +672,12 @@ Rules:
 New Crypto swap strategies should declare their capability in `initialize`:
 
 ~~~python
-context.set_metadata(direction_mode="both")
+context.set_metadata(direction_mode="one_way")
 ~~~
 
-Supported values are `long_only`, `short_only`, `both`, and `neutral`. This declaration does not place orders or override strategy signals. It lets deployment validation reserve the correct hedge-mode leg or legs and reject new entry signals that exceed the declared capability. `both` and `neutral` require hedge mode for live execution.
+Supported values are `long_only`, `short_only`, `one_way`, `both`, and `neutral`. `one_way` is one signed net position that can reverse between long and short and requires exchange one-way mode. `both` and `neutral` own independent long/short legs and require hedge mode. This declaration does not place orders or override strategy signals.
 
-Every new Crypto swap strategy must declare <code>direction_mode</code> and pass an explicit <code>position_side</code> on each contract-position read and order call. Compiler inference from legacy <code>DIRECTION = 1/-1</code> constants or literal legs exists only for migration; it is not the recommended contract and must not be used by new templates. Write spot strategies as <code>long_only</code>.
+Every new Crypto swap strategy must declare <code>direction_mode</code>. A <code>one_way</code> strategy reads <code>get_position(symbol)</code>, uses the sign of <code>amount</code>, omits <code>position_side</code>, and closes the current net position before opening the opposite side. Hedge-leg modes pass an explicit <code>position_side</code> on every contract-position read and order. Compiler inference from legacy constants exists only for migration. Write spot strategies as <code>long_only</code>.
 
 ### Hedge-mode example
 
@@ -733,7 +733,7 @@ def handle_data(context, data):
         )
 ~~~
 
-The quantity unit follows the venue instrument specification; do not assume one contract always equals one base coin. Before live start, the platform confirms the account position mode. `both` and `neutral` fail closed when hedge mode cannot be confirmed. A running strategy reserves its account/exchange/market/symbol leg; overlapping ownership raises <code>strategyV2.liveLegConflict</code>. In confirmed hedge mode, separate long-only and short-only strategies may own opposite legs, but a strategy declaring <code>both</code> or <code>neutral</code> owns both legs.
+The quantity unit follows the venue instrument specification; do not assume one contract always equals one base coin. Before live start, the platform confirms the account position mode. `one_way` is rejected on a hedge-mode account; `both` and `neutral` fail closed unless hedge mode is confirmed. A running <code>one_way</code> strategy owns the whole account/exchange/market/symbol net position. Overlapping ownership raises <code>strategyV2.liveLegConflict</code>.
 
 Never maintain authoritative quantities only in <code>g.long_qty</code>/<code>g.short_qty</code>. An order can be rejected, deferred, partially filled, or rounded by venue rules. Read synchronized leg positions and order status before updating cycle state.
 
@@ -984,6 +984,7 @@ Allowed import roots are <code>numpy</code>, <code>pandas</code>, <code>math</co
 | <code>strategyV2.initializeParamsUnavailable</code> | params read during discovery | move the read to a handler |
 | <code>strategyV2.directionModeViolation:...</code> | entry exceeds declared direction | fix metadata or signal direction; exits remain allowed |
 | <code>strategyV2.dualDirectionHedgeModeRequired:...</code> | account is not in hedge mode | enable venue hedge/dual-side mode |
+| <code>strategyV2.oneWayPositionModeRequired:...</code> | a one-way strategy is connected to a hedge-mode account | switch the venue account to one-way mode or use an explicit hedge-leg strategy |
 | <code>strategyV2.hedgeModeUnknown:...</code> | account mode could not be confirmed | repair credential/API access and retry |
 | <code>strategyV2.liveLegConflict:...</code> | another live strategy owns the leg | stop/reconfigure the conflicting strategy |
 | <code>position_drift_detected:...</code> | account, strategy, and protected baseline contain an unknown delta | recheck, protect manual inventory, or restore strict mode in Ownership & Repair; do not bypass |
@@ -999,12 +1000,12 @@ Allowed import roots are <code>numpy</code>, <code>pandas</code>, <code>math</co
 
 ### System preset strategy templates
 
-The system preset catalog currently uses <code>system_seed version=11</code>. It contains eight CTA templates (single MA, dual MA, bullish candle through three averages, trend-filtered bullish candle, Turtle, indicator resonance, MACD/KDJ, and SuperTrend) and four portfolio templates (market-cap barbell, momentum Top N, low volatility, and quality growth). Presets are examples and the executable baseline for the current recommended Strategy API V2 contract.
+The system preset catalog contains eight CTA templates and four portfolio templates. The one-way dual-moving-average template uses <code>system_seed version=12</code>; the other templates remain at version 11. Presets are examples and the executable baseline for the current recommended Strategy API V2 contract.
 
 Every system preset must satisfy these rules:
 
-- Declare <code>direction_mode</code> explicitly; Crypto swap templates read and write explicit <code>position_side</code> legs.
-- A bidirectional trend template closes the opposite leg, waits for fill and position synchronization, and only then opens the target leg. It must not replace two hedge legs with one net-position variable.
+- Declare <code>direction_mode</code> explicitly. A <code>one_way</code> template uses one signed net position without <code>position_side</code>; hedge-mode templates read and write explicit legs.
+- A one-way trend template closes the current opposite position and waits for synchronized flat state before opening the target direction.
 - Reconstructible state comes from synchronized <code>amount</code>, <code>avg_cost</code>, and order status. State that cannot be rebuilt reliably must enable <code>PERSIST_RUNTIME_STATE</code>.
 - Every catalog revision must pass parameter-contract, compilation, direction-capability, and synthetic-backtest tests. After copying a preset, revalidate the manifest whenever market, direction, or frequency changes.
 

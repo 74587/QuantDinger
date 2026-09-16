@@ -79,6 +79,28 @@ def test_deployment_persists_manifest_direction_and_legacy_position_side(monkeyp
     assert trading_config["strategy_manifest"]["directionMode"] == "both"
 
 
+def test_deployment_persists_one_way_without_legacy_position_side(monkeypatch):
+    cursor = _Cursor()
+
+    class _OneWaySources:
+        @staticmethod
+        def get_source(_source_id, user_id=None):
+            return {
+                "id": 9,
+                "name": "Net strategy",
+                "code": SOURCE.replace('direction_mode="both"', 'direction_mode="one_way"'),
+            }
+
+    monkeypatch.setattr(deployment, "get_script_source_service", lambda: _OneWaySources())
+    monkeypatch.setattr(deployment, "get_db_connection", lambda: _Db(cursor))
+
+    StrategyV2DeploymentService().save(user_id=7, payload=_payload("one_way"))
+    trading_config = json.loads(cursor.params[-1])
+
+    assert trading_config["direction_mode"] == "one_way"
+    assert trading_config["position_side"] == ""
+
+
 def test_deployment_rejects_direction_override_that_conflicts_with_manifest(monkeypatch):
     monkeypatch.setattr(deployment, "get_script_source_service", lambda: _Sources())
 

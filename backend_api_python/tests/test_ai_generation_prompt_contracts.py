@@ -72,12 +72,12 @@ def test_strategy_generation_prompt_documents_parameter_discovery_boundary():
     assert "initial capital, date range, commission, or slippage" in SCRIPT_STRATEGY_REPAIR_REQUIREMENTS
 
 
-def test_strategy_generation_prompt_maps_bidirectional_requests_to_the_canonical_direction_mode():
+def test_strategy_generation_prompt_distinguishes_net_reversal_from_hedge_legs():
     for prompt in (SCRIPT_STRATEGY_SYSTEM_PROMPT, SCRIPT_STRATEGY_REPAIR_REQUIREMENTS):
-        assert "`long_only`, `short_only`, `both`, or `neutral`" in prompt
-        assert "多空双向" in prompt
-        assert 'direction_mode="both"' in prompt
-        assert "changing only the metadata" in prompt or "changing metadata alone" in prompt
+        assert "`long_only`, `short_only`, `one_way`, `both`, or `neutral`" in prompt
+        assert "`one_way`" in prompt
+        assert "`both`" in prompt
+        assert "changing only metadata" in prompt or "changing metadata alone" in prompt
 
 
 def test_strategy_generation_prompt_preserves_native_multi_timeframes():

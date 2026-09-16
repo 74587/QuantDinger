@@ -14,7 +14,7 @@ import os
 import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -394,10 +394,11 @@ class InstrumentRulesProvider:
                     "strategyV2.instrumentRulesSnapshotMissing:" + ",".join(sorted(missing))
                 )
             return snapshot
-        boundary = as_of or datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        boundary = as_of or now
         if boundary.tzinfo is None:
             boundary = boundary.replace(tzinfo=timezone.utc)
-        is_historical = boundary.astimezone(timezone.utc).date() < datetime.now(timezone.utc).date()
+        is_historical = boundary.astimezone(timezone.utc) < now - timedelta(seconds=5)
         if not is_historical:
             return self.snapshot(instrument_list, persist=persist)
 

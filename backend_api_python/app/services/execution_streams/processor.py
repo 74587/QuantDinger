@@ -483,13 +483,16 @@ class ExecutionEventProcessor:
                 else observed_previous + event_qty
             )
             previous_avg = float(row.get("avg_fill_price") or 0.0)
-            price = float(event.get("price") or row.get("price") or 0.0)
+            price = float(event.get("price") or 0.0)
             observed_delta = max(0.0, total - observed_previous)
             delta = max(0.0, total - processed_previous)
             if event.get("cumulative_average_price"):
                 delta, price = cumulative_delta(
                     processed_previous, posted["average"], cumulative, event["cumulative_average_price"]
                 )
+            if delta > 0:
+                from app.services.live_trading.fill_evidence import require_execution
+                require_execution(delta, price)
             avg = (
                 ((observed_previous * previous_avg) + (observed_delta * price)) / total
                 if total > 0 and observed_delta > 0

@@ -180,6 +180,8 @@ class TradingExecutor:
         owns_both_legs = direction_mode in {"both", "neutral"} or neutral_grid
         if owns_both_legs and is_hedge is not True:
             raise RuntimeError(f"strategyV2.dualDirectionHedgeModeRequired:{label}")
+        if direction_mode == "one_way" and is_hedge is True:
+            raise RuntimeError(f"strategyV2.oneWayPositionModeRequired:{label}")
         if is_hedge is not True:
             if is_hedge is None:
                 raise RuntimeError(f"strategyV2.hedgeModeUnknown:{label}")

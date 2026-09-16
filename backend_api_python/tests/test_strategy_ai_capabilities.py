@@ -45,8 +45,8 @@ def test_indicator_conversion_preserves_explicit_capability_requests():
             "instrument": "Crypto:SOL/USDT@swap",
         },
     )
-    assert intent.requested_direction_mode == "both"
-    assert {"crypto_swap", "bidirectional", "protection", "persistent_state", "order_lifecycle"} <= set(intent.capabilities)
+    assert intent.requested_direction_mode == "one_way"
+    assert {"crypto_swap", "one_way_reversal", "protection", "persistent_state", "order_lifecycle"} <= set(intent.capabilities)
 
 
 @pytest.mark.parametrize("history", ['data.history("Crypto:SOL/USDT@spot", count=35)', 'get_history(35, "1d", "close", "Crypto:SOL/USDT@spot")'])
@@ -109,9 +109,28 @@ VALID_BOTH_BODY = '''    long_position = get_position(g.symbol, position_side="l
         )'''
 
 
-def test_capability_resolver_maps_chinese_bidirectional_request_to_both():
+def test_capability_resolver_maps_general_long_short_request_to_one_way():
     intent = resolve_strategy_generation_intent(
         prompt="交易标的改成 ETH/USDT 永续，并且多空都交易",
+        context={"instrument": "Crypto:ETH/USDT@swap"},
+    )
+
+    assert intent.requested_direction_mode == "one_way"
+    assert set(intent.capabilities) >= {"crypto_swap", "one_way_reversal"}
+
+
+def test_capability_resolver_prefers_complete_one_way_phrase_over_both_token():
+    intent = resolve_strategy_generation_intent(
+        prompt="Trade BTC perpetual in both directions with one net position",
+        context={"instrument": "Crypto:BTC/USDT@swap"},
+    )
+
+    assert intent.requested_direction_mode == "one_way"
+
+
+def test_capability_resolver_reserves_both_for_explicit_hedge_mode():
+    intent = resolve_strategy_generation_intent(
+        prompt="使用对冲模式双向持仓，保持独立多空腿",
         context={"instrument": "Crypto:ETH/USDT@swap"},
     )
 
@@ -124,7 +143,7 @@ def test_capability_resolver_maps_chinese_bidirectional_request_to_both():
     [
         ("把 direction_mode 从 both 改为 long_only", "long_only"),
         ("change direction from short_only to both", "both"),
-        ("不是 long only，是多空都交易", "both"),
+        ("不是 long only，是多空都交易", "one_way"),
     ],
 )
 def test_direction_resolver_uses_the_requested_target_not_an_old_mode(prompt, expected):
@@ -177,9 +196,9 @@ def test_generation_prompt_injects_only_relevant_capability_packs():
 
     assert stock_intent.capabilities == ()
     assert "# Active capability contracts" not in stock_prompt
-    assert set(swap_intent.capabilities) >= {"crypto_swap", "bidirectional", "protection"}
+    assert set(swap_intent.capabilities) >= {"crypto_swap", "one_way_reversal", "protection"}
     assert "## Crypto perpetual contract" in swap_prompt
-    assert "## Bidirectional swap behavior" in swap_prompt
+    assert "## One-way long/short reversal" in swap_prompt
     assert "## Native position protection" in swap_prompt
     assert "## Restart-safe strategy state" not in swap_prompt
 
@@ -191,8 +210,8 @@ def test_structured_request_exposes_machine_readable_capability_intent():
         existing_code=_swap_source(direction_mode="long_only"),
     )
 
-    assert '"requested_direction_mode": "both"' in request
-    assert '"bidirectional"' in request
+    assert '"requested_direction_mode": "one_way"' in request
+    assert '"one_way_reversal"' in request
     assert '"crypto_swap"' in request
 
     factor_request = build_strategy_generation_request(
@@ -284,7 +303,7 @@ def test_strict_authoring_rejects_metadata_only_bidirectional_strategy():
         validate_generated_strategy(
             _swap_source(),
             asset_type="script",
-            prompt="策略支持多空双向",
+            prompt="策略使用对冲模式双向持仓",
         )
 
 
@@ -294,6 +313,39 @@ def test_strict_authoring_rejects_swap_order_without_position_side():
     with pytest.raises(StrategyV2ContractError, match="aiSwapPositionSideRequired"):
         validate_generated_strategy(
             _swap_source(direction_mode="long_only", body=body),
+            asset_type="script",
+        )
+
+
+def test_strict_authoring_accepts_one_way_signed_net_position():
+    body = '''    position = get_position(g.symbol)
+    amount = float(position.amount or 0.0)
+    if amount < 0:
+        order_target_percent(g.symbol, 0.0, reason="close_short")
+    elif amount == 0:
+        order_target_percent(g.symbol, 0.4, reason="open_long")
+    if amount > 0:
+        order_target_percent(g.symbol, 0.0, reason="close_long")
+    elif amount == 0:
+        order_target_percent(g.symbol, -0.4, reason="open_short")'''
+
+    program = validate_generated_strategy(
+        _swap_source(direction_mode="one_way", body=body),
+        asset_type="script",
+        prompt="单向持仓，开多平空、开空平多",
+    )
+
+    assert program.manifest.direction_mode == "one_way"
+
+
+def test_strict_authoring_rejects_position_side_in_one_way_strategy():
+    body = '''    order_target_percent(
+        g.symbol, 0.4, position_side="long", reason="entry"
+    )'''
+
+    with pytest.raises(StrategyV2ContractError, match="aiOneWayPositionSideForbidden"):
+        validate_generated_strategy(
+            _swap_source(direction_mode="one_way", body=body),
             asset_type="script",
         )
 
@@ -343,7 +395,7 @@ def test_strict_authoring_accepts_genuine_bidirectional_swap_behavior():
     program = validate_generated_strategy(
         _swap_source(body=VALID_BOTH_BODY),
         asset_type="script",
-        prompt="策略支持多空双向",
+        prompt="策略使用对冲模式双向持仓",
     )
 
     assert program.manifest.direction_mode == "both"
@@ -358,7 +410,7 @@ def test_requested_direction_must_match_manifest():
         validate_generated_strategy(
             _swap_source(direction_mode="long_only", body=long_body),
             asset_type="script",
-            prompt="改成多空双向",
+            prompt="改成对冲模式双向持仓",
         )
 
 
@@ -447,7 +499,7 @@ def test_zero_only_orders_cannot_claim_bidirectional_opening_behavior():
         validate_generated_strategy(
             _swap_source(body=body),
             asset_type="script",
-            prompt="多空双向",
+            prompt="对冲模式双向持仓",
         )
 
 
@@ -478,7 +530,7 @@ def submit(symbol, side, target):
     program = validate_generated_strategy(
         source,
         asset_type="script",
-        prompt="改成多空双向",
+        prompt="改成对冲模式双向持仓",
     )
 
     assert program.manifest.direction_mode == "both"
@@ -743,17 +795,20 @@ def test_persistence_flag_must_be_declared_at_module_scope():
 def test_external_authoring_contract_exports_same_capability_catalog():
     contract = get_strategy_authoring_contract()
 
-    assert contract["version"] == "strategy-api-v2-exchange-equities-2026-09"
-    assert contract["direction_modes"]["bidirectional"] == "both"
+    assert contract["version"] == "strategy-api-v2-one-way-2026-09"
+    assert contract["direction_modes"]["net_bidirectional"] == "one_way"
+    assert contract["direction_modes"]["hedged_bidirectional"] == "both"
     assert set(contract["direction_modes"]["allowed"]) == {
         "long_only",
         "short_only",
+        "one_way",
         "both",
         "neutral",
     }
     assert set(contract["capability_packs"]) >= {
         "crypto_swap",
         "bidirectional",
+        "one_way_reversal",
         "order_lifecycle",
         "protection",
         "persistent_state",

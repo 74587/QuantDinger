@@ -843,18 +843,21 @@ class IBKRExecutionAdapter:
                 source="commission_report",
             )
         ]
+        from app.services.execution_streams.reported_pnl import number
+        reported_pnl = number(getattr(report, "realizedPNL", None))
+        reported_pnl = float(reported_pnl) if reported_pnl is not None else None
         event.raw = {
             **base_event.raw,
             "commission": float(getattr(report, "commission", 0) or 0.0),
             "currency": str(getattr(report, "currency", "") or ""),
-            "realizedPNL": float(getattr(report, "realizedPNL", 0) or 0.0),
+            "realizedPNL": reported_pnl,
         }
         event.quantity = 0.0
         event.cumulative_quantity = base_event.cumulative_quantity
         event.is_cumulative = True
         # Commission is a second authoritative update for the same execution.
         event.exchange_fill_id = f"{exec_id}:commission"
-        event.realized_pnl = float(getattr(report, "realizedPNL", 0) or 0.0)
+        event.realized_pnl = reported_pnl
         event.credential_id = self.credential_id
         event.user_id = self.user_id
         self.on_event(event)

@@ -1628,28 +1628,12 @@ def test_on_order_filled_short_exit_rehangs_entry_immediately(monkeypatch):
     assert state["value"] == GridCellState.SELL_OPEN
 
 
-def test_grid_fill_profit_uses_cell_entry_price(monkeypatch):
+def test_grid_fill_preserves_account_cost_profit_for_equity(monkeypatch):
     from app.services.grid import fill_handler
     from app.services.grid.resting_orders_repo import GridRestingOrder
-    from app.services.live_trading.grid_cells import GridCell, GridCellState
 
-    cell = GridCell(
-        strategy_id=1,
-        symbol="BNB/USDT",
-        cell_index=11,
-        lower_price=669.3043,
-        upper_price=676.6957,
-        state=GridCellState.LONG_HELD,
-        leg_size=0.05,
-        leg_entry_price=669.3,
-    )
     captured = {}
 
-    class FakeCellRepo:
-        def list_cells(self, strategy_id, symbol=None):
-            return [cell]
-
-    monkeypatch.setattr(fill_handler, "GridCellRepository", lambda: FakeCellRepo())
     monkeypatch.setattr(fill_handler, "resolve_leg_context", lambda **kwargs: None)
     monkeypatch.setattr(
         fill_handler,
@@ -1678,10 +1662,9 @@ def test_grid_fill_profit_uses_cell_entry_price(monkeypatch):
         {"market_type": "swap", "commission": 0},
     )
 
-    expected = (676.7 - 669.3) * 0.05
-    assert captured["profit"] == pytest.approx(expected)
-    assert captured["grid_matched_profit"] == pytest.approx(expected)
-    assert captured["matched_entry_price"] == pytest.approx(669.3)
+    assert captured["profit"] == pytest.approx(-0.99)
+    assert captured["grid_matched_profit"] is None
+    assert captured["matched_entry_price"] == pytest.approx(690.0)
 
 
 def test_grid_fill_ledger_failure_is_not_silently_marked_processed(monkeypatch):
@@ -1741,3 +1724,42 @@ def test_grid_market_fill_ledger_failure_is_not_silently_accepted(monkeypatch):
             676.7,
             {"market_type": "swap"},
         )
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_grid_entry_order_links_survive_partial_fills_and_reset_after_exit(monkeypatch, side):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    from app.services.grid.engine import GridEngine
+    from app.services.grid.resting_orders_repo import GridRestingOrder
+    from app.services.live_trading.grid_cells import GridCellState
+
+    monkeypatch.setattr("app.services.grid.fill_handler.apply_grid_fill_to_local_state", lambda *a, **k: None)
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a, **k: None)
+    cell = SimpleNamespace(index=0, lower_price=100, upper_price=110)
+    state = SimpleNamespace(state=GridCellState.IDLE, leg_size=0, leg_entry_price=0, extra={})
+    engine = object.__new__(GridEngine)
+    engine.strategy_id, engine.symbol = 1, "BTC/USDT"
+    engine.trading_config = {"market_type": "swap"}
+    engine._levels_and_cells = lambda: ([], [cell])
+    engine._cell_record = lambda index: state
+    engine._paused_entries = True
+    engine._ensure_cell_exit_coverage = MagicMock(return_value=True)
+    engine._cells = MagicMock()
+    def update(*args, **kwargs):
+        state.__dict__.update(kwargs)
+        return True
+    engine._cells.update_state.side_effect = update
+    opening = GridRestingOrder(id=10, strategy_id=1, symbol=engine.symbol, cell_index=0, purpose=side + "_entry")
+    closing = GridRestingOrder(id=20, strategy_id=1, symbol=engine.symbol, cell_index=0, purpose=side + "_exit")
+    engine.on_order_filled(opening, .4, 100)
+    engine.on_order_filled(opening, .6, 101)
+    assert state.extra["entry_grid_order_ids"] == [10]
+    assert state.leg_size == pytest.approx(1)
+    engine.on_order_filled(closing, .3, 110)
+    assert state.extra["entry_grid_order_ids"] == [10]
+    engine.on_order_filled(closing, .7, 110)
+    assert state.extra["entry_grid_order_ids"] == []
+    opening.id = 30
+    engine.on_order_filled(opening, 1, 105)
+    assert state.extra["entry_grid_order_ids"] == [30]

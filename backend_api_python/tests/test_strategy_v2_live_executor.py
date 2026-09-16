@@ -199,6 +199,10 @@ def test_direction_constraints_convert_opposite_targets_to_flat():
         -2.0,
         direction_mode="both",
     ) == -2.0
+    assert TradingExecutor._direction_constrained_target(
+        -2.0,
+        direction_mode="one_way",
+    ) == -2.0
 
 
 def test_target_zero_closes_existing_long_position():

@@ -43,6 +43,8 @@ def ledger(monkeypatch):
         "strategy_order_fills",
         "strategy_order_intents",
         "qd_quick_trades",
+        "qd_exchange_credentials",
+        "qd_execution_events",
     )
     with admin.cursor() as cur:
         cur.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
@@ -59,7 +61,7 @@ def ledger(monkeypatch):
                 ),
                 (schema + "." + table + "_ids",),
             )
-        for table in ("qd_execution_owner_projections", "qd_execution_fee_projections"):
+        for table in ("qd_execution_owner_projections", "qd_execution_fee_projections", "qd_exchange_order_pnl"):
             cur.execute(
                 sql.SQL("CREATE TABLE {}.{} (LIKE public.{} INCLUDING DEFAULTS INCLUDING INDEXES)").format(
                     sql.Identifier(schema), sql.Identifier(table), sql.Identifier(table)
@@ -88,7 +90,6 @@ def ledger(monkeypatch):
     monkeypatch.setattr(
         fill_handler, "resolve_leg_context", lambda **k: LegContext(credential_id=1, fill_source="test")
     )
-    monkeypatch.setattr(fill_handler, "_matched_grid_entry_price", lambda *a: 2376.11)
     monkeypatch.setattr(records, "_get_user_id_from_strategy", lambda *a: 1)
     engine = object.__new__(GridEngine)
     engine.strategy_id, engine.symbol = 1, "ETH/USDT"
@@ -354,3 +355,106 @@ def test_trade_api_separates_grid_instruction_and_execution_and_hides_raw_payloa
     assert row["exchange_order_id"] == "open-1"
     assert "request_payload" not in row
     assert "grid_request_price" not in row
+
+
+def test_grid_api_matches_exchange_orders_instead_of_account_average(ledger, monkeypatch):
+    from flask import Flask, g
+    from inspect import unwrap
+    from app.routes import strategy_ledger_routes as routes
+    from app.services.live_trading import funding_reconciliation as funding
+    from app.services.live_trading import alpaca_activity_reconciliation as alpaca
+
+    ledger.query("""INSERT INTO qd_grid_resting_orders
+        (id,strategy_id,symbol,cell_index,purpose,side,pos_side,price,quantity,exchange_order_id)
+        VALUES (3,1,'ETH/USDT',1,'long_entry','buy','long',110,1,'open-3')""")
+    ledger.query("UPDATE qd_grid_resting_orders SET extra = '{\"entry_grid_order_ids\":[1]}'::jsonb WHERE id=2")
+    event, binding = ledger.event(total="10", last="10", average="110", fee=".11")
+    event.update(exchange_order_id="open-3")
+    binding.update(owner_id=3)
+    ledger.processor._process_grid(event, binding)
+    ledger.processor._process_grid(*ledger.event(event_id=12,total="10",last="10",average="100",fee=".1"))
+    ledger.processor._process_grid(*ledger.event(order=2,event_id=13,total="10",last="10",average="101",fee=".101"))
+    assert float(ledger.query("SELECT profit FROM qd_strategy_trades WHERE grid_order_id=2")[0]["profit"]) == -4
+    monkeypatch.setattr(routes,"get_strategy_service",lambda:SimpleNamespace(
+        get_strategy=lambda *a,**k:{"trading_config":{"market_type":"swap","bot_type":"grid"}}))
+    for module, names in [(funding,["sync_strategy_funding","load_strategy_funding_summary"]),
+                          (alpaca,["sync_strategy_alpaca_activities","load_strategy_broker_activity_summary"])]:
+        for name in names:
+            monkeypatch.setattr(module,name,lambda *a,**k:{})
+    monkeypatch.setattr(alpaca,"is_alpaca_strategy",lambda *a,**k:False)
+    app=Flask(__name__)
+    def read():
+        with app.test_request_context("/strategies/trades?id=1"):
+            g.user_id=1
+            return unwrap(routes.get_trades)().get_json()["data"]
+    from app.services.execution_streams import pnl_reconciliation
+    from app.services.execution_streams.reported_pnl import fill_report
+    ledger.query("INSERT INTO qd_exchange_credentials (id,user_id,exchange_id,encrypted_config) VALUES (1,1,'okx','test-only')")
+    reported = fill_report([dict(id="venue-close", quantity=1, pnl=-4)], expected=1, source="rest:fills.fillPnl", currency="USDT")
+    monkeypatch.setattr(pnl_reconciliation, "_client", lambda *a: (ledger.client, {}))
+    monkeypatch.setattr(pnl_reconciliation, "fetch_order_report", lambda *a, **k: reported)
+    data=read()
+    closed=data["trades"][0]
+    assert closed["exchange_pnl"]["amount"] == -4
+    assert closed["exchange_pnl"]["fee_basis"] == "excluding_fees"
+    assert closed["exchange_pnl"]["order_id"] == "close-2"
+    assert len(ledger.query("SELECT * FROM qd_exchange_order_pnl")) == 1
+    assert closed["pnl_status"] == "matched"
+    assert closed["profit"] == pytest.approx(.799)
+    assert closed["profit_gross"] == 1
+    assert closed["matched_orders"][0]["entry_order_ids"] == ["open-1"]
+    assert closed["matched_orders"][0]["exit_order_id"] == "close-2"
+    assert data["cost_summary"]["gross_realized_pnl"] == 1
+    ledger.query("UPDATE qd_strategy_trades SET fee_status='pending' WHERE grid_order_id=1")
+    pending=read()
+    assert pending["trades"][0]["profit"] is None
+    assert pending["trades"][0]["pnl_status"] == "fees_pending"
+    assert pending["cost_summary"]["net_realized_pnl"] is None
+    assert pending["cost_summary"]["opening_commission"] is None
+    ledger.query("UPDATE qd_strategy_trades SET fee_status='actual' WHERE grid_order_id=1")
+    assert read()["trades"][0]["profit"] == pytest.approx(.799)
+
+
+def test_grid_stream_does_not_use_order_limit_when_fill_price_missing(ledger):
+    from app.services.live_trading.base import LiveTradingError
+    event,binding=ledger.event()
+    event.update(price=0, cumulative_average_price=0,raw_json={})
+    with pytest.raises(LiveTradingError, match="fillSnapshotNotReady"):
+        ledger.processor._project_grid(event,binding)
+    assert ledger.query("SELECT * FROM qd_strategy_trades") == []
+
+
+def test_reported_pnl_database_claims_limit_accounts_and_reuse_cache(ledger, monkeypatch):
+    from app.services.execution_streams import pnl_reconciliation as pnl
+    from app.services.execution_streams.reported_pnl import fill_report
+    key = (1, "binance", "swap", "BTC/USDT", "order1")
+    assert pnl._claim(key, 1)
+    assert not pnl._claim(key, 1)
+    for i in range(2, 5):
+        assert pnl._claim((*key[:-1], "order" + str(i)), 1)
+    assert not pnl._claim((*key[:-1], "order5"), 1)
+    assert pnl._claim((2, *key[1:]), 1)
+    report = fill_report([dict(id="f", quantity=1, pnl=-3)], expected=1, source="rest:test", currency="USDT")
+    pnl._save(key, report)
+    rows = [dict(id=1, credential_id=1, exchange_id="binance", market_type="swap", symbol="BTC/USDT",
+                 exchange_order_id="order1", amount=1, type="close_long", profit=100)]
+    monkeypatch.setattr(pnl, "_client", lambda *a: pytest.fail("Cached result must not query venue"))
+    pnl.enrich_reported_order_pnl(rows, user_id=1, trading_config={})
+    assert rows[0]["exchange_pnl"]["amount"] == -3
+    assert rows[0]["profit"] == 100
+    rows[0]["amount"] = 2
+    pnl.enrich_reported_order_pnl(rows, user_id=1, trading_config={})
+    assert rows[0]["exchange_pnl"]["status"] == "pending"
+
+
+def test_reported_pnl_reads_durable_events_without_another_venue_query(ledger, monkeypatch):
+    from app.services.execution_streams import pnl_reconciliation as pnl
+    ledger.query("""INSERT INTO qd_execution_events
+        (event_key,credential_id,exchange_id,market_type,symbol,exchange_order_id,exchange_fill_id,quantity,realized_pnl,raw_json,occurred_at)
+        VALUES ('test-pnl',1,'binance','swap','BTC/USDT','o1','f1',1,-5,'{"o":{"rp":"-5"}}',NOW())""")
+    rows = [dict(id=1, credential_id=1, exchange_id="binance", market_type="swap", symbol="BTC/USDT",
+                 exchange_order_id="o1", amount=1, type="close_long", profit=100)]
+    monkeypatch.setattr(pnl, "_client", lambda *a: pytest.fail("WS evidence is complete"))
+    pnl.enrich_reported_order_pnl(rows, user_id=1, trading_config={})
+    assert rows[0]["exchange_pnl"]["amount"] == -5
+    assert rows[0]["exchange_pnl"]["source"] == "websocket:rp"

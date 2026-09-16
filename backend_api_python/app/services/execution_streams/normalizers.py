@@ -308,7 +308,8 @@ def parse_htx(payload: Dict[str, Any], *, market_type: str) -> List[ExecutionEve
         return []
     data = payload.get("data")
     if market_type != "spot" and isinstance(payload.get("trade"), list):
-        data = [dict(payload, **trade) for trade in payload['trade'] if isinstance(trade, dict)]
+        parent = {k: v for k, v in payload.items() if k != 'real_profit'}
+        data = [dict(parent, **trade) for trade in payload['trade'] if isinstance(trade, dict)]
     items: Iterable[Any] = data if isinstance(data, list) else [data]
     out: List[ExecutionEvent] = []
     for item in items:

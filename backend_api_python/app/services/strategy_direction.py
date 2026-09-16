@@ -6,7 +6,7 @@ import ast
 from typing import Any, Iterable
 
 
-DIRECTION_MODES = {"long_only", "short_only", "both", "neutral"}
+DIRECTION_MODES = {"long_only", "short_only", "one_way", "both", "neutral"}
 
 
 def normalize_direction_mode(value: Any) -> str:
@@ -24,6 +24,10 @@ def normalize_direction_mode(value: Any) -> str:
         "_1.0": "short_only",
         "-1": "short_only",
         "shortonly": "short_only",
+        "oneway": "one_way",
+        "net": "one_way",
+        "net_position": "one_way",
+        "single_position": "one_way",
         "dual": "both",
         "hedged": "both",
         "bidirectional": "both",
@@ -58,7 +62,7 @@ def direction_mode_allows(value: Any, position_side: Any) -> bool:
     side = str(position_side or "").strip().lower()
     if side not in {"long", "short"}:
         return True
-    if mode in {"both", "neutral"}:
+    if mode in {"one_way", "both", "neutral"}:
         return True
     return (mode == "long_only" and side == "long") or (
         mode == "short_only" and side == "short"

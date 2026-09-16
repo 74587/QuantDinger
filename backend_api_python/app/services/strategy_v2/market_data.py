@@ -128,13 +128,16 @@ def _load_strategy_frame_uncached(
     ).strip().lower()
     start_utc = _normalize_utc_datetime(start_date)
     end_utc = _normalize_utc_datetime(end_date)
-    total_seconds = max(1.0, (end_utc - start_utc).total_seconds())
     normalized_timeframe = str(timeframe or "1d").strip().lower()
     timeframe_seconds = TIMEFRAME_SECONDS.get(normalized_timeframe, 86400)
     provider_timeframe = PROVIDER_TIMEFRAMES.get(normalized_timeframe, normalized_timeframe)
+    closed_bar_cutoff = _last_completed_bar_open(timeframe_seconds)
+    cutoff_utc = closed_bar_cutoff.to_pydatetime().replace(tzinfo=timezone.utc)
+    provider_end_utc = min(end_utc, cutoff_utc)
+    total_seconds = max(1.0, (provider_end_utc - start_utc).total_seconds())
     limit = int(math.ceil(total_seconds / timeframe_seconds * 1.15) + 200)
     after_time = int((start_utc - timedelta(seconds=timeframe_seconds)).timestamp())
-    before_time = int((end_utc + timedelta(seconds=timeframe_seconds)).timestamp())
+    before_time = int((provider_end_utc + timedelta(seconds=timeframe_seconds)).timestamp())
     cache_key = ":".join((
         str(market),
         str(symbol),
@@ -148,7 +151,6 @@ def _load_strategy_frame_uncached(
     ))
     requested_start = pd.Timestamp(start_utc).tz_localize(None)
     requested_end = pd.Timestamp(end_utc).tz_localize(None)
-    closed_bar_cutoff = _last_completed_bar_open(timeframe_seconds)
     coverage_end = min(requested_end, closed_bar_cutoff)
     effective_market = str(market or "")
     effective_symbol = str(symbol or "")

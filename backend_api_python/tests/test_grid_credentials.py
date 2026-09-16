@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from app.services.exchange_execution import resolve_exchange_config
+from app.services.exchange_execution import _load_credential_config, resolve_exchange_config
 from app.services.grid.config import GridBotConfig
 from app.services.grid.runner import GridRestingRunner
 from app.services.grid.validator import validate_grid_config
@@ -15,6 +15,46 @@ def test_resolve_exchange_config_merges_credential_id():
     merged = resolve_exchange_config({"credential_id": 9, "market_type": "swap"}, user_id=1)
     # Without DB this stays credential-only; with mock below we verify merge logic separately.
     assert merged.get("credential_id") == 9
+
+
+def test_load_credential_config_restores_exchange_id_from_credential_row(monkeypatch):
+    class Cursor:
+        def execute(self, *_args):
+            return None
+
+        def fetchone(self):
+            return {"exchange_id": "Gate", "encrypted_config": "encrypted"}
+
+        def close(self):
+            return None
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    class Context:
+        def __enter__(self):
+            return Connection()
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.exchange_execution.get_db_connection",
+        lambda: Context(),
+    )
+    monkeypatch.setattr(
+        "app.services.exchange_execution.decrypt_credential_blob",
+        lambda _raw: '{"api_key":"key","environment":"testnet"}',
+    )
+
+    config = _load_credential_config(7, user_id=1)
+
+    assert config == {
+        "api_key": "key",
+        "environment": "testnet",
+        "exchange_id": "gate",
+    }
 
 
 def test_grid_startup_fails_before_initial_market_when_client_missing():

@@ -1553,7 +1553,11 @@ class GridEngine:
                 post_only=post_only,
             )
             ex_oid = str(res.exchange_order_id or "")
+            paired_cell = self._cell_record(cell.index) if reduce_only else None
+            paired_extra = getattr(paired_cell, "extra", {}) or {}
+            paired_ids = paired_extra.get("entry_grid_order_ids", []) if isinstance(paired_extra, dict) else []
             row = GridRestingOrder(
+                extra={"entry_grid_order_ids": paired_ids} if reduce_only else {},
                 strategy_id=self.strategy_id,
                 symbol=self.symbol,
                 cell_index=cell.index,
@@ -1713,6 +1717,17 @@ class GridEngine:
             if not self._cells.update_state(*args, **kwargs):
                 raise RuntimeError("strategyRuntime.fillSnapshotNotReady")
 
+        saved_extra = getattr(persisted_cell, "extra", {}) or {}
+        saved_extra = dict(saved_extra) if isinstance(saved_extra, dict) else {}
+        entry_ids = list(saved_extra.get("entry_grid_order_ids") or [])
+        if purpose in {"long_entry", "short_entry"}:
+            expected = GridCellState.LONG_HELD if purpose == "long_entry" else GridCellState.SHORT_HELD
+            if persisted_state != expected or persisted_qty <= 1e-10:
+                entry_ids = []
+            if order.id and int(order.id) not in entry_ids:
+                entry_ids.append(int(order.id))
+            saved_extra["entry_grid_order_ids"] = entry_ids
+
         if purpose == "long_entry":
             prior_qty = persisted_qty if persisted_state == GridCellState.LONG_HELD else 0.0
             held_qty = prior_qty + fq
@@ -1728,6 +1743,7 @@ class GridEngine:
                 state=GridCellState.LONG_HELD,
                 leg_size=held_qty,
                 leg_entry_price=held_entry,
+                extra=saved_extra,
             )
             exit_ok = run_after_commit(self._ensure_cell_exit_coverage,
                 cell,
@@ -1752,6 +1768,7 @@ class GridEngine:
                 cell.index,
                 state=state,
                 leg_size=remaining,
+                extra={**saved_extra, "entry_grid_order_ids": entry_ids if remaining > 1e-10 else []},
             )
             if remaining <= 1e-10 and not self._paused_entries:
                 if self._cell_allows_entry(cell.index, "long_entry", self._cell_state_by_index()):
@@ -1773,6 +1790,7 @@ class GridEngine:
                 state=GridCellState.SHORT_HELD,
                 leg_size=held_qty,
                 leg_entry_price=held_entry,
+                extra=saved_extra,
             )
             exit_ok = run_after_commit(self._ensure_cell_exit_coverage,
                 cell,
@@ -1797,6 +1815,7 @@ class GridEngine:
                 cell.index,
                 state=state,
                 leg_size=remaining,
+                extra={**saved_extra, "entry_grid_order_ids": entry_ids if remaining > 1e-10 else []},
             )
             if remaining <= 1e-10 and not self._paused_entries:
                 if self._cell_allows_entry(cell.index, "short_entry", self._cell_state_by_index()):

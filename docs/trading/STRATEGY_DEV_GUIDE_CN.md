@@ -181,7 +181,7 @@ Gate 港股腾讯使用 <code>Crypto:00700/HKD@gate:spot</code>，Gate 美股苹
 
 如果只是研究、因子筛选，或通过传统证券账户交易，则在港股分类添加 <code>HKStock:00700.HK</code>，在美股分类添加 <code>USStock:AAPL</code>。它们与 Gate 通道标的具有不同的执行身份：普通 HKStock 或 USStock 标的不能直接交给 Gate 账户下单，也不能把研究标的静默转换为交易所订单。
 
-Universe、历史数据读取和下单都必须保留选中的交易所完整标识。保留 <code>00700/HKD</code>、<code>AAPL/USD</code> 或目录确认的永续标的，不能删除前导零、替换币种、改为底层股票标识或更换交易所/API family。交易所股票现货仍然只做多，不能调用 <code>allow_leverage</code>。股票永续遵守 Crypto swap 契约：声明方向 metadata，持仓和订单调用传递 <code>position_side</code>，只有源码调用 <code>context.allow_leverage(max_leverage=N)</code> 后才允许配置杠杆。
+Universe、历史数据读取和下单都必须保留选中的交易所完整标识。保留 <code>00700/HKD</code>、<code>AAPL/USD</code> 或目录确认的永续标的，不能删除前导零、替换币种、改为底层股票标识或更换交易所/API family。交易所股票现货仍然只做多，不能调用 <code>allow_leverage</code>。股票永续遵守 Crypto swap 契约：声明方向 metadata；<code>one_way</code> 省略 <code>position_side</code>，分腿模式显式传递；只有源码调用 <code>context.allow_leverage(max_leverage=N)</code> 后才允许配置杠杆。
 
 直接股票、代币化股票、股票永续和普通加密产品的类型由有效产品目录决定，不能只按 ticker 名称猜测。历史行情适配器可以读取目录确认的底层股票市场数据，但不会改变策略的执行标的。策略代码仍使用 Strategy API V2，不应自行请求交易所、券商或行情源 API。编译通过不代表可以立即实盘；部署还会核对产品目录、产品类型/API 通道、交易所、账户能力、交易状态、下单规则与币种。
 
@@ -536,7 +536,7 @@ short_position = get_position(g.symbol, position_side="short")
 
 | 名称 | 所属层级 | 含义 |
 | --- | --- | --- |
-| <code>direction_mode</code> | 策略清单 | 策略被允许使用的方向能力：<code>long_only</code>、<code>short_only</code>、<code>both</code> 或 <code>neutral</code> |
+| <code>direction_mode</code> | 策略清单 | 策略被允许使用的方向能力：<code>long_only</code>、<code>short_only</code>、<code>one_way</code>、<code>both</code> 或 <code>neutral</code> |
 | <code>position_side</code> | 仓位/订单 | 合约 hedge mode 中的 <code>long</code> 或 <code>short</code> 分腿；现货只有 long 库存 |
 | 订单 value/target | 策略源码 | 希望增减或达到的数量、价值、权重；做空目标在源码中使用负数 |
 | <code>open/add/reduce/close</code> | 运行时订单意图 | 引擎根据当前同步仓位和目标差额生成的标准动作，提交数量使用绝对值 |
@@ -674,12 +674,12 @@ def initialize(context):
 新的 Crypto swap 策略应在 `initialize` 中声明方向能力：
 
 ~~~python
-context.set_metadata(direction_mode="both")
+context.set_metadata(direction_mode="one_way")
 ~~~
 
-支持 `long_only`（仅做多）、`short_only`（仅做空）、`both`（多空双向）和 `neutral`（中性双腿）。这个声明不会下单，也不会覆盖策略信号；它用于在部署时分配正确的双向持仓腿，并拒绝超出声明能力的新开仓信号。`both` 和 `neutral` 在实盘中要求交易所账户开启双向持仓模式。
+支持 `long_only`（仅做多）、`short_only`（仅做空）、`one_way`（一个净持仓在多空之间切换）、`both`（独立多空腿）和 `neutral`（中性双腿）。`one_way` 要求交易所账户使用单向持仓模式；`both` 和 `neutral` 要求双向持仓模式。这个声明不会下单，也不会覆盖策略信号。
 
-新建 Crypto swap 策略必须显式声明 <code>direction_mode</code>，并在每次合约仓位读取和订单调用中显式传入 <code>position_side</code>。编译器对旧源码中 <code>DIRECTION = 1/-1</code> 或字面量仓位腿的推断只用于迁移，不属于推荐契约，也不应作为新模板的实现方式。现货策略按 <code>long_only</code> 编写。
+新建 Crypto swap 策略必须显式声明 <code>direction_mode</code>。<code>one_way</code> 使用 <code>get_position(symbol)</code> 读取有符号净持仓，订单省略 <code>position_side</code>，反转时先平当前方向，等同步为空仓后再开反向。分腿模式则在每次合约仓位读取和订单调用中显式传入 <code>position_side</code>。编译器对旧源码的推断只用于迁移。现货策略按 <code>long_only</code> 编写。
 
 ### 双向持仓示例
 
@@ -735,7 +735,7 @@ def handle_data(context, data):
         )
 ~~~
 
-数量单位取决于交易所合约规格，不能假定一张合约一定等于一个基础币。实盘启动前，平台会确认账户持仓模式；无法确认 hedge mode 时，`both` 和 `neutral` 会按安全原则拒绝启动。运行中的策略会占用账户/交易所/市场/标的/持仓腿；重复占用会返回 <code>strategyV2.liveLegConflict</code>。确认处于 hedge mode 时，两个独立的 long-only 与 short-only 策略可以分别占用相反方向，但声明 <code>both</code> 或 <code>neutral</code> 的策略会同时占用两条腿。
+数量单位取决于交易所合约规格，不能假定一张合约一定等于一个基础币。实盘启动前，平台会确认账户持仓模式：<code>one_way</code> 连接到双向持仓账户会被拒绝，<code>both</code> 和 <code>neutral</code> 只有确认处于 hedge mode 才能启动。运行中的 <code>one_way</code> 策略占用账户/交易所/市场/标的的整个净持仓；重复占用返回 <code>strategyV2.liveLegConflict</code>。
 
 不要只用 <code>g.long_qty</code>/<code>g.short_qty</code> 维护权威仓位。订单可能被拒绝、延迟、部分成交或按交易所规则取整。推进策略周期前必须读取同步后的分腿仓位和订单状态。
 
@@ -988,6 +988,7 @@ def rebalance(context, data):
 | <code>strategyV2.initializeParamsUnavailable</code> | 在清单发现阶段读取参数 | 把读取移到处理器 |
 | <code>strategyV2.directionModeViolation:...</code> | 开仓方向超出声明能力 | 修正 metadata 或信号方向；平仓仍允许 |
 | <code>strategyV2.dualDirectionHedgeModeRequired:...</code> | 账户没有开启双向持仓 | 在交易所开启 hedge/双向持仓模式 |
+| <code>strategyV2.oneWayPositionModeRequired:...</code> | 单向持仓策略连接了双向持仓账户 | 将交易所账户切换为单向持仓，或改用显式分腿策略 |
 | <code>strategyV2.hedgeModeUnknown:...</code> | 无法确认账户持仓模式 | 修复凭证/API 权限后重试 |
 | <code>strategyV2.liveLegConflict:...</code> | 另一实盘策略已占用该腿 | 停止或调整冲突策略 |
 | <code>position_drift_detected:...</code> | 账户、策略和保护基线存在未知差额 | 在“持仓归属与修复”中重新核对、保护用户仓位或恢复严格模式；不要绕过 |
@@ -1003,12 +1004,12 @@ def rebalance(context, data):
 
 ### 系统预设策略模板
 
-系统预设目录当前使用 <code>system_seed version=11</code>，包含 8 个 CTA 模板（单均线、双均线、阳线穿三线、趋势过滤阳线穿三线、海龟、指标共振、MACD/KDJ、SuperTrend）和 4 个组合模板（市值杠铃、动量 Top N、低波动、质量成长）。预设模板既是示例，也是当前 Strategy API V2 推荐契约的可执行基线。
+系统预设目录包含 8 个 CTA 模板和 4 个组合模板。单向持仓双均线模板使用 <code>system_seed version=12</code>，其余模板仍为 version 11。预设模板既是示例，也是当前 Strategy API V2 推荐契约的可执行基线。
 
 系统预设必须满足：
 
-- 每个模板显式声明 <code>direction_mode</code>；Crypto swap 模板显式读取和操作 <code>position_side</code> 分腿。
-- 双向趋势模板执行“先平反向腿，等待成交与仓位同步，再开目标腿”，不能用一个净仓位变量代替两条腿。
+- 每个模板显式声明 <code>direction_mode</code>。<code>one_way</code> 模板使用不带 <code>position_side</code> 的有符号净持仓；双向持仓模板显式读取和操作分腿。
+- 单向持仓趋势模板先平当前反向仓位，等待成交与空仓同步后，再开目标方向。
 - 可从交易所仓位恢复的状态应以同步后的 <code>amount</code>、<code>avg_cost</code> 和订单状态为准；无法可靠重建的状态必须启用 <code>PERSIST_RUNTIME_STATE</code>。
 - 每次目录更新都必须通过参数契约、编译、方向能力和合成回测测试。复制模板后如果修改了市场、方向或周期，应重新验证 manifest，而不是继续依赖模板身份。
 

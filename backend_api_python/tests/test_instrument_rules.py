@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -265,6 +265,28 @@ def test_historical_backtest_without_snapshot_never_fetches_todays_rules(tmp_pat
     rules = snapshot.get("Crypto:BTC/USDT@okx:swap")
     assert rules.source == "historical_fallback_no_snapshot"
     assert rules.amount_step == 1e-8
+
+
+def test_same_day_completed_bar_uses_historical_rules_without_network(tmp_path):
+    def unexpected_fetch(*_args):
+        raise AssertionError("completed market data must not fetch newer exchange rules")
+
+    provider = InstrumentRulesProvider(
+        raw_fetcher=unexpected_fetch,
+        snapshot_store=InstrumentRulesSnapshotStore(tmp_path),
+    )
+    snapshot = provider.historical_snapshot(
+        [{
+            "market": "Crypto",
+            "symbol": "BTC/USDT",
+            "exchange_id": "okx",
+            "market_type": "swap",
+        }],
+        as_of=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    rules = snapshot.get("Crypto:BTC/USDT@okx:swap")
+    assert rules.source == "historical_fallback_no_snapshot"
 
 
 def test_historical_backtest_automatically_reuses_latest_eligible_snapshot(tmp_path):

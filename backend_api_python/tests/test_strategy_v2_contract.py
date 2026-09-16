@@ -423,6 +423,22 @@ def handle_data(context, data):
     assert manifest.metadata()["directionMode"] == "both"
 
 
+def test_manifest_accepts_one_way_net_position_capability():
+    code = """
+def initialize(context):
+    context.set_universe(["Crypto:BTC/USDT@okx:swap"])
+    context.subscribe(frequency="1h")
+    context.set_metadata(direction_mode="one_way")
+
+def handle_data(context, data):
+    pass
+"""
+    manifest = compile_strategy_v2(code).manifest
+
+    assert manifest.direction_mode == "one_way"
+    assert manifest.metadata()["directionMode"] == "one_way"
+
+
 def test_set_metadata_accepts_positional_key_value_pair():
     code = """
 def initialize(context):

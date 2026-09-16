@@ -217,7 +217,7 @@ class StrategyV2BacktestService:
             rules_snapshot = self.instrument_rules_provider.historical_snapshot(
                 candidates,
                 snapshot_id=instrument_rules_snapshot_id,
-                as_of=end_date,
+                as_of=_instrument_rules_as_of(frames, end_date),
                 persist=self.data_kind == "market" and persist,
             )
 
@@ -592,6 +592,28 @@ def _instrument_member(item: InstrumentSpec) -> dict[str, Any]:
         "market_type": item.market_type,
         "instrument_id": item.instrument_id,
     }
+
+
+def _instrument_rules_as_of(
+    frames: dict[str, pd.DataFrame],
+    requested_end: datetime,
+) -> datetime:
+    """Use the last common market-data timestamp for historical rule lookup."""
+    timestamps = []
+    for frame in frames.values():
+        if frame is None or frame.empty:
+            continue
+        timestamp = pd.Timestamp(frame.index.max())
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+        timestamps.append(timestamp)
+    if not timestamps:
+        return requested_end
+
+    end_timestamp = pd.Timestamp(requested_end)
+    if end_timestamp.tzinfo is not None:
+        end_timestamp = end_timestamp.tz_convert("UTC").tz_localize(None)
+    return min(end_timestamp, *timestamps).to_pydatetime()
 
 
 def _attach_catalog_products(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:

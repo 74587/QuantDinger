@@ -158,7 +158,7 @@ def _load_credential_config(credential_id: int, user_id: int = 1) -> Dict[str, A
         cur = db.cursor()
         cur.execute(
             """
-            SELECT encrypted_config
+            SELECT exchange_id, encrypted_config
             FROM qd_exchange_credentials
             WHERE id = %s AND user_id = %s
             """,
@@ -172,7 +172,13 @@ def _load_credential_config(credential_id: int, user_id: int = 1) -> Dict[str, A
     except ValueError as e:
         logger.warning(f"decrypt credential_id={credential_id}: {e}")
         return {}
-    return _safe_json_loads(plain, {}) or {}
+    config = _safe_json_loads(plain, {}) or {}
+    if not isinstance(config, dict):
+        config = {}
+    exchange_id = str(row.get("exchange_id") or "").strip().lower()
+    if exchange_id:
+        config.setdefault("exchange_id", exchange_id)
+    return config
 
 
 def resolve_exchange_config(exchange_config: Dict[str, Any], user_id: int = 1) -> Dict[str, Any]:

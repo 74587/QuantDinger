@@ -144,10 +144,16 @@ def get_trades():
                        t.commission, t.commission_ccy, t.commission_quote, t.profit, t.close_reason,
                        t.matched_entry_price, t.grid_matched_profit, t.fee_status, t.fee_source, t.created_at,
                        t.fill_source, t.exchange_order_id, t.exchange_fill_id,
+                       t.credential_id, t.market_type, t.strategy_run_id, t.grid_order_id, t.commission_breakdown,
+                       i.client_order_id AS grid_client_reference,
+                       c.exchange_id,
+                       r.purpose AS grid_order_purpose, r.extra AS grid_order_extra,
                        p.price AS request_price, p.payload_json AS request_payload,
                        r.price AS grid_request_price
                 FROM qd_strategy_trades t
+                LEFT JOIN qd_exchange_credentials c ON c.id = t.credential_id AND c.user_id = t.user_id
                 LEFT JOIN pending_orders p ON p.id = t.pending_order_id AND p.strategy_id = t.strategy_id
+                LEFT JOIN strategy_order_intents i ON i.id = t.order_intent_id AND i.strategy_id = t.strategy_id
                 LEFT JOIN qd_grid_resting_orders r ON r.id = t.grid_order_id AND r.strategy_id = t.strategy_id
                     AND r.exchange_order_id = t.exchange_order_id AND t.exchange_order_id <> ''
                 WHERE t.strategy_id = ?
@@ -184,17 +190,27 @@ def get_trades():
             processed_rows.append(trade)
 
         enrich_trades_net_pnl(processed_rows)
+        from app.services.grid.order_pnl import enrich_grid_order_pnl, execution_fee
+        enrich_grid_order_pnl(processed_rows)
+        from app.services.execution_streams.pnl_reconciliation import enrich_reported_order_pnl
+        try:
+            enrich_reported_order_pnl(processed_rows, user_id=user_id, trading_config=trading_config)
+        except Exception:
+            logger.warning("Reported P&L unavailable for strategy=%s", strategy_id, exc_info=True)
         processed_rows = [
             _normalize_trade_row_for_api(trade, leverage=leverage, market_type=market_type)
             for trade in processed_rows
         ]
 
         from app.utils.trade_close_reason import is_exit_trade_type
+        paired_grid = any(t.get("pnl_source") == "grid_exchange_order_pairs" for t in processed_rows)
         opening_commission = 0.0
         closing_commission = 0.0
         gross_realized = 0.0
         for trade in processed_rows:
-            fee = float(trade.get("commission_quote") if trade.get("commission_quote") is not None else trade.get("commission") or 0.0)
+            fee = float(execution_fee(trade) or 0) if paired_grid else float(
+                trade.get("commission_quote") if trade.get("commission_quote") is not None else trade.get("commission") or 0.0
+            )
             if is_exit_trade_type(str(trade.get("type") or "")):
                 closing_commission += fee
                 if trade.get("profit_gross") is not None:
@@ -207,11 +223,15 @@ def get_trades():
         broker_payment = float(broker.get("broker_activity_payment") or 0.0)
         trading_fees = opening_commission + closing_commission
         net_realized = gross_realized - trading_fees + funding_payment + broker_payment
+        pending_fees = [t for t in processed_rows if paired_grid and execution_fee(t) is None]
+        pnl_pending = len({int(t["id"]) for t in processed_rows
+                           if t.get("pnl_status") in {"unmatched", "fees_pending"}
+                           or (paired_grid and execution_fee(t) is None)})
         cost_summary = {
-            "gross_realized_pnl": round(gross_realized, 8),
-            "opening_commission": round(opening_commission, 8),
-            "closing_commission": round(closing_commission, 8),
-            "trading_commission": round(trading_fees, 8),
+            "gross_realized_pnl": round(gross_realized, 8) if not any(t.get("pnl_status") == "unmatched" for t in processed_rows) else None,
+            "opening_commission": round(opening_commission, 8) if not any(not is_exit_trade_type(t["type"]) for t in pending_fees) else None,
+            "closing_commission": round(closing_commission, 8) if not any(is_exit_trade_type(t["type"]) for t in pending_fees) else None,
+            "trading_commission": round(trading_fees, 8) if not pending_fees else None,
             "funding_payment": round(funding_payment, 8),
             "funding_cost": round(-funding_payment, 8),
             "broker_activity_payment": round(broker_payment, 8),
@@ -220,7 +240,9 @@ def get_trades():
             "margin_interest_payment": round(float(broker.get("margin_interest_payment") or 0.0), 8),
             "other_broker_payment": round(float(broker.get("other_broker_payment") or 0.0), 8),
             "broker_activity_applicable": is_alpaca_strategy(strategy_id, user_id=user_id),
-            "net_realized_pnl": round(net_realized, 8),
+            "net_realized_pnl": round(net_realized, 8) if not pnl_pending else None,
+            "pnl_pending_count": pnl_pending,
+            "pnl_status": "pending" if pnl_pending else "complete",
         }
 
         return jsonify({'code': 1, 'msg': 'success', 'data': {

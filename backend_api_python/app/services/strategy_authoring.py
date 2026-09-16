@@ -97,7 +97,7 @@ def handle_data(context, data):
 def get_strategy_authoring_contract() -> dict[str, Any]:
     """Return the canonical source-ownership and runtime API contract."""
     return {
-        "version": "strategy-api-v2-exchange-equities-2026-09",
+        "version": "strategy-api-v2-one-way-2026-09",
         "doc": "docs/trading/STRATEGY_DEV_GUIDE.md",
         "instrument_identity": {
             "contract": STRATEGY_INSTRUMENT_IDENTITY_CONTRACT,
@@ -251,10 +251,12 @@ def get_strategy_authoring_contract() -> dict[str, Any]:
         },
         "direction_modes": {
             "allowed": sorted(DIRECTION_MODES),
-            "bidirectional": "both",
+            "net_bidirectional": "one_way",
+            "hedged_bidirectional": "both",
             "swap_rule": (
-                "Every new Crypto swap strategy declares direction_mode and passes "
-                "position_side on each contract position read and order."
+                "Every new Crypto swap strategy declares direction_mode. one_way uses a signed "
+                "net position and omits position_side; hedge-leg modes pass position_side on each "
+                "contract position read and order."
             ),
         },
         "capability_packs": strategy_ai_capability_catalog(),

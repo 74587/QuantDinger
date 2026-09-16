@@ -113,24 +113,26 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
     ),
     "crypto_swap": StrategyAICapability(
         name="crypto_swap",
-        summary="Crypto perpetual direction, hedge-leg, and leverage semantics.",
+        summary="Crypto perpetual net-position, hedge-leg, and leverage semantics.",
         rules={
             "direction_modes": sorted(DIRECTION_MODES),
             "position_sides": ["long", "short"],
             "direction_mode_required": True,
-            "position_side_required_on": ["get_position", *sorted(ORDER_CALLS)],
+            "position_side_required_for": ["long_only", "short_only", "both", "neutral"],
+            "position_side_forbidden_for": ["one_way"],
         },
         contract=f"""
 ## Crypto perpetual contract
 - Every new Crypto `@swap` strategy must declare `context.set_metadata(direction_mode=...)` in `initialize`; accepted values are exactly {_DIRECTION_VALUES}.
 - `direction_mode` is strategy capability metadata. `position_side` is the concrete `long` or `short` hedge leg on a position read or order. They are not interchangeable.
-- Every `get_position(...)` and every order call for a swap instrument must explicitly pass `position_side="long"` or `position_side="short"` (a variable resolving to one of those values is also valid).
+- `one_way` means one signed net position. Use `get_position(symbol)` and omit `position_side` from every order. Positive targets open or maintain long exposure; negative targets open or maintain short exposure; close the current position before opening the opposite side.
+- For `long_only`, `short_only`, `both`, and `neutral`, every `get_position(...)` and order call for a swap instrument must explicitly pass `position_side="long"` or `position_side="short"` (a variable resolving to one of those values is also valid).
 - In hedge mode, `get_position(symbol)` is not a synthetic net position. Read each owned leg explicitly and test `abs(position.amount)`.
 - Short targets use negative quantity, value, or percent while still declaring `position_side="short"`. Closing either leg uses a zero target for that same `position_side`.
-- `both` and `neutral` require exchange hedge mode in live trading. `allow_leverage` remains a separate source permission and must never be multiplied into order sizing.
+- `one_way` requires exchange one-way mode in live trading. `both` and `neutral` require exchange hedge mode. `allow_leverage` remains a separate source permission and must never be multiplied into order sizing.
 """,
         repair="""
-- For every Crypto swap position read and order, add an explicit valid `position_side`.
+- For `one_way`, remove `position_side` and implement signed net-position reversal. For all hedge-leg modes, add an explicit valid `position_side` to every Crypto swap position read and order.
 - Add the canonical `direction_mode` declaration and keep it consistent with the implemented legs.
 """,
     ),
@@ -180,14 +182,14 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
     ),
     "bidirectional": StrategyAICapability(
         name="bidirectional",
-        summary="Independent long and short behavior for direction_mode=both.",
+        summary="Independent hedge legs for direction_mode=both.",
         rules={
             "requested_direction_mode": "both",
             "required_order_sides": ["long", "short"],
         },
         contract="""
 ## Bidirectional swap behavior
-- A long-and-short or bidirectional request means `direction_mode="both"`.
+- `direction_mode="both"` means independent long and short hedge legs and requires exchange hedge mode.
 - Implement independent long entry, long exit, short entry, and short exit behavior. A long exit is not a short entry, and a short exit is not a long entry.
 - Read both legs explicitly with `get_position(symbol, position_side="long")` and `get_position(symbol, position_side="short")` when position state is needed.
 - Orders for the long leg pass `position_side="long"`; orders for the short leg pass `position_side="short"`. Target-style short entries use a negative target and short exits use zero.
@@ -196,6 +198,25 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
         repair="""
 - Do not repair a bidirectional request by changing metadata alone.
 - Ensure order calls visibly cover both `long` and `short` position sides with independent entry/exit conditions.
+""",
+    ),
+    "one_way_reversal": StrategyAICapability(
+        name="one_way_reversal",
+        summary="Long/short reversal on one signed net position.",
+        rules={
+            "requested_direction_mode": "one_way",
+            "position_side": "forbidden",
+        },
+        contract="""
+## One-way long/short reversal
+- A general long-and-short request means `direction_mode="one_way"` unless the user explicitly requests hedge mode or simultaneous independent legs.
+- Read the signed position with `get_position(symbol)` and omit `position_side` from all orders.
+- Express reversal as four intents: close short, open long, close long, and open short. Submit the close first and do not assume it filled immediately before opening the opposite side.
+- Positive target quantities, values, or percentages represent long exposure; negative targets represent short exposure; zero closes the current net position.
+""",
+        repair="""
+- Remove hedge-leg `position_side` arguments and use the signed net position.
+- Keep close and opposite-side entry as separate order intents so the live executor can serialize the reversal safely.
 """,
     ),
     "order_lifecycle": StrategyAICapability(
@@ -299,16 +320,34 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
 }
 
 
-_BIDIRECTIONAL_TERMS = (
+_ONE_WAY_TERMS = (
     "多空双向",
     "双向/多空",
-    "双向持仓",
     "多空都",
     "多空交易",
+    "单向持仓",
+    "净持仓",
+    "开多平空",
+    "开空平多",
     "long and short",
     "long/short",
     "bidirectional",
     "both directions",
+    "one way",
+    "one-way",
+    "one_way",
+    "net position",
+    "single position",
+    'direction_mode="one_way"',
+    "direction_mode='one_way'",
+)
+_BIDIRECTIONAL_TERMS = (
+    "双向持仓",
+    "对冲模式",
+    "独立多空腿",
+    "hedge mode",
+    "hedged",
+    "independent long and short legs",
     "both",
     'direction_mode="both"',
     "direction_mode='both'",
@@ -339,6 +378,7 @@ _LONG_ONLY_TERMS = (
 _DIRECTION_TERM_MAP = {
     **{term: "neutral" for term in _NEUTRAL_TERMS},
     **{term: "both" for term in _BIDIRECTIONAL_TERMS},
+    **{term: "one_way" for term in _ONE_WAY_TERMS},
     **{term: "short_only" for term in _SHORT_ONLY_TERMS},
     **{term: "long_only" for term in _LONG_ONLY_TERMS},
 }
@@ -502,15 +542,15 @@ def _source_factor_ids(source: str) -> tuple[str, ...]:
 def _requested_direction(prompt: str, existing_code: str) -> str:
     request = str(prompt or "").lower()
     mentions = [
-        (request.rfind(term.lower()), mode)
+        (request.rfind(term.lower()), len(term), mode)
         for term, mode in _DIRECTION_TERM_MAP.items()
         if request.rfind(term.lower()) >= 0
     ]
     if mentions:
-        return max(mentions, key=lambda item: item[0])[1]
+        return max(mentions, key=lambda item: (item[0], item[1]))[2]
     matches = list(re.finditer(
         r"(?:direction_mode\s*=|['\"]direction_mode['\"]\s*[:,])\s*"
-        r"['\"](long_only|short_only|both|neutral)['\"]",
+        r"['\"](long_only|short_only|one_way|both|neutral)['\"]",
         str(existing_code or ""),
         flags=re.IGNORECASE,
     ))
@@ -556,6 +596,8 @@ def resolve_strategy_generation_intent(
         capabilities.add("technical_factors")
     if direction in {"both", "neutral"}:
         capabilities.update(("crypto_swap", "bidirectional"))
+    if direction == "one_way":
+        capabilities.update(("crypto_swap", "one_way_reversal"))
     if _contains_any(combined, _PROTECTION_TERMS):
         capabilities.add("protection")
     if _contains_any(combined, _ORDER_LIFECYCLE_TERMS):
@@ -1078,7 +1120,7 @@ def validate_strategy_ai_semantics(
         raise StrategyV2ContractError(
             f"strategyV2.aiDirectionModeMismatch:{declared_direction_mode}:{direction_mode or 'missing'}"
         )
-    if not swap_scope and direction_mode in {"short_only", "both", "neutral"}:
+    if not swap_scope and direction_mode in {"short_only", "one_way", "both", "neutral"}:
         raise StrategyV2ContractError("strategyV2.aiShortRequiresCryptoSwap")
 
     swap_instrument_keys = {
@@ -1113,6 +1155,12 @@ def validate_strategy_ai_semantics(
     if swap_scope:
         for node in [*swap_position_calls, *swap_order_calls]:
             side_node = _keyword(node, "position_side")
+            if direction_mode == "one_way":
+                if side_node is not None:
+                    raise StrategyV2ContractError(
+                        f"strategyV2.aiOneWayPositionSideForbidden:{_call_name(node)}"
+                    )
+                continue
             if side_node is None:
                 raise StrategyV2ContractError(
                     f"strategyV2.aiSwapPositionSideRequired:{_call_name(node)}"
@@ -1145,6 +1193,15 @@ def validate_strategy_ai_semantics(
             opening_sides.add("long")
         if "short" in possible_sides and any(value < 0 for value in nonzero_values):
             opening_sides.add("short")
+        if direction_mode == "one_way" and not possible_sides:
+            if any(value > 0 for value in nonzero_values):
+                opening_sides.add("long")
+            if any(value < 0 for value in nonzero_values):
+                opening_sides.add("short")
+            if not static_values and not _is_definitely_zero(
+                value_node, assignment_expressions
+            ):
+                opening_sides.update(valid_position_sides)
         if possible_sides and not static_values and not _is_definitely_zero(
             value_node, assignment_expressions
         ):
@@ -1181,8 +1238,10 @@ def validate_strategy_ai_semantics(
             required_protected_sides = {"long"}
         elif direction_mode == "short_only":
             required_protected_sides = {"short"}
-        else:
+        elif direction_mode in {"both", "neutral", "one_way"}:
             required_protected_sides = set(required_bidirectional_sides)
+        else:
+            required_protected_sides = set()
         missing_protection = required_protected_sides - protected_open_sides
         if missing_protection:
             raise StrategyV2ContractError(
