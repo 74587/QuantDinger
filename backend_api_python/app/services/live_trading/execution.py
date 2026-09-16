@@ -134,7 +134,7 @@ def place_order_from_signal(
             qty, _meta = clamp_spot_close_quantity(client, symbol=symbol, requested_qty=qty)
             if qty <= 0:
                 raise LiveTradingError(
-                    "Insufficient spot base balance to close (fees or balance mismatch)"
+                    "strategyRuntime.spotBalanceInsufficient"
                 )
         elif side == "buy" and not reduce_only:
             if quote_amt <= 0 and qty > 0:

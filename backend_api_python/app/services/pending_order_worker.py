@@ -1941,23 +1941,6 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
 
         fills = FillAccumulator()
 
-        # Spot close: cap to exchange free base (fees often make DB size > sellable free).
-        if reduce_only and market_type == "spot" and side == "sell":
-            try:
-                from app.services.live_trading.spot_sizing import clamp_spot_close_quantity
-
-                new_amt, spot_meta = clamp_spot_close_quantity(
-                    client, symbol=str(symbol), requested_qty=float(amount or 0.0)
-                )
-                if spot_meta.get("adjusted"):
-                    phases["spot_close_adjustment"] = spot_meta
-                amount = new_amt
-            except Exception as e:
-                logger.warning(
-                    "Spot close amount adjustment failed: pending_id=%s, err=%s", order_id, e
-                )
-                phases["spot_close_adjust_error"] = str(e)
-
         spot_quote_amt = 0.0
         spot_market_buy_uses_quote = False
         if market_type == "spot":
@@ -1986,20 +1969,6 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
             amount, phases["exchange_quantity_normalization"] = exchange_quantity_snapshot(
                 client, exchange_id=exchange_id, symbol=symbol, market_type=market_type,
                 requested=amount, exchange_config=exchange_config)
-        self._log_live_order_sizing(
-            strategy_id=strategy_id,
-            client=client,
-            exchange_id=exchange_id, market_type=market_type,
-            symbol=symbol,
-            signal_type=signal_type,
-            reduce_only=reduce_only,
-            amount=amount,
-            ref_price=ref_price,
-            leverage=leverage,
-            payload=payload,
-            phases=phases,
-        )
-
         # Decide if we should use limit-first flow.
         use_limit_first = order_mode in ("maker", "limit", "limit_first", "maker_then_market")
 
@@ -2058,6 +2027,37 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                     e,
                 )
                 phases["close_size_retry"]["error"] = str(e)
+
+        # Validate sellable inventory after every ledger retry and size conversion.
+        if reduce_only and market_type == "spot" and side == "sell" and remaining > 0:
+            try:
+                from app.services.live_trading.spot_sizing import clamp_spot_close_quantity
+
+                amount, spot_meta = clamp_spot_close_quantity(
+                    client, symbol=str(symbol), requested_qty=remaining,
+                )
+                remaining = amount
+                phases["spot_close_adjustment"] = spot_meta
+                if remaining <= 0:
+                    raise LiveTradingError("strategyRuntime.spotBalanceInsufficient")
+            except Exception as exc:
+                error = str(exc) if isinstance(exc, LiveTradingError) else "strategyRuntime.spotBalanceUnavailable"
+                logger.warning("Spot close rejected: pending_id=%s, err=%s", order_id, exc)
+                self._mark_failed(order_id=order_id, error=error)
+                _notify_live_best_effort(status="failed", error=error, amount_hint=amount)
+                append_strategy_log(strategy_id, "error", error)
+                return
+
+        self._log_live_order_sizing(
+            strategy_id=strategy_id,
+            client=client,
+            exchange_id=exchange_id, market_type=market_type,
+            symbol=symbol, signal_type=signal_type,
+            reduce_only=reduce_only, amount=amount,
+            ref_price=ref_price, leverage=leverage,
+            payload=payload,
+            phases=phases,
+        )
 
         if remaining <= 0 and not (spot_market_buy_uses_quote and spot_quote_amt > 0):
             friendly_error = self._friendly_order_error(

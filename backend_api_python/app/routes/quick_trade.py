@@ -1569,7 +1569,7 @@ def close_position(body):
                 return jsonify(
                     {
                         "code": 0,
-                        "msg": "Available spot balance is too low to close this position. Fees may have reduced the sellable amount.",
+                        "msg": "strategyRuntime.spotBalanceInsufficient",
                     }
                 ), 400
             if spot_meta.get("adjusted"):

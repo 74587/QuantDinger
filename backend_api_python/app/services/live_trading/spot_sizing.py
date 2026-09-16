@@ -7,10 +7,11 @@ Full-position buys often leave recorded size slightly above sellable free balanc
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any, Dict, Optional, Tuple
 
-from app.services.live_trading.base import BaseRestClient
+from app.services.live_trading.base import BaseRestClient, LiveTradingError
 from app.services.live_trading.symbols import _split_base_quote
 
 logger = logging.getLogger(__name__)
@@ -98,14 +99,42 @@ def get_spot_base_holding(
     *,
     symbol: str,
     strict: bool = False,
+    require_available: bool = False,
 ) -> Dict[str, float]:
     """
     Best-effort spot base-asset holding (total + available/free).
 
     Used by Quick Trade spot position display and close sizing.
     """
+    strict = strict or require_available
+    balance_read = False
+
+    def rows(value):
+        if require_available and (
+            not isinstance(value, list) or any(not isinstance(row, dict) for row in value)
+        ):
+            raise LiveTradingError("strategyRuntime.spotBalanceUnavailable")
+        return value or []
+
+    def available(row, *keys):
+        if not require_available:
+            return _pick_free_from_row(row, *keys)
+        for key in keys:
+            value = row.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(result) and result >= 0:
+                return result
+        raise LiveTradingError("strategyRuntime.spotBalanceUnavailable")
+
     base, _ = _split_base_quote(str(symbol or ""))
     if not base:
+        if require_available:
+            raise LiveTradingError("strategyRuntime.spotBalanceUnavailable")
         return {"total": 0.0, "available": 0.0, "avg_cost": 0.0}
     base_u = base.upper()
 
@@ -114,13 +143,15 @@ def get_spot_base_holding(
 
         if isinstance(client, GateStockClient):
             raw = client.get_positions(symbol=base_u)
-            for row in client._rows(raw):
+            balance_read = True
+            data = raw.get("data") if isinstance(raw, dict) else None
+            for row in rows(data.get("list") if isinstance(data, dict) else None):
                 if str(row.get("symbol") or "").upper() != base_u:
                     continue
                 total = _pick_free_from_row(row, "volume")
-                available = _pick_free_from_row(row, "available")
+                avail = available(row, "available")
                 avg_cost = _pick_cost_from_row(row, "avg_cost_price", "diluted_cost_price")
-                return _spot_holding(total, available, avg_cost)
+                return _spot_holding(total, avail, avg_cost)
     except Exception as e:
         if strict:
             raise
@@ -131,11 +162,12 @@ def get_spot_base_holding(
 
         if isinstance(client, BinanceSpotClient):
             raw = client.get_account() or {}
-            for b in raw.get("balances") or []:
+            balance_read = True
+            for b in rows(raw.get("balances")):
                 if not isinstance(b, dict):
                     continue
                 if str(b.get("asset") or "").upper() == base_u:
-                    free = _pick_free_from_row(b, "free")
+                    free = available(b, "free")
                     locked = _pick_free_from_row(b, "locked")
                     return _spot_holding(free + locked, free)
     except Exception as e:
@@ -148,14 +180,16 @@ def get_spot_base_holding(
 
         if isinstance(client, OkxClient):
             raw = client.get_balance() or {}
-            data = (raw.get("data") or []) if isinstance(raw, dict) else []
+            balance_read = True
+            data = rows(raw.get("data") if isinstance(raw, dict) else None)
             first = data[0] if isinstance(data, list) and data else {}
             if isinstance(first, dict):
-                for det in first.get("details") or []:
+                for det in rows(first.get("details")):
                     if not isinstance(det, dict):
                         continue
                     if str(det.get("ccy") or "").upper() == base_u:
-                        avail = _pick_free_from_row(det, "availBal", "cashBal")
+                        keys = ("availBal",) if require_available else ("availBal", "cashBal")
+                        avail = available(det, *keys)
                         total = _pick_free_from_row(det, "eq", "cashBal", "availBal")
                         frozen = _pick_free_from_row(det, "frozenBal")
                         if total <= 0:
@@ -174,14 +208,13 @@ def get_spot_base_holding(
 
         if isinstance(client, GateSpotClient):
             raw = client.get_accounts()
-            rows = raw if isinstance(raw, list) else (raw.get("data") if isinstance(raw, dict) else [])
-            if not isinstance(rows, list):
-                rows = []
-            for row in rows:
+            balance_read = True
+            account_rows = rows(raw if isinstance(raw, list) else raw.get("data") if isinstance(raw, dict) else None)
+            for row in account_rows:
                 if not isinstance(row, dict):
                     continue
                 if str(row.get("currency") or "").upper() == base_u:
-                    avail = _pick_free_from_row(row, "available", "available_balance")
+                    avail = available(row, "available", "available_balance")
                     locked = _pick_free_from_row(row, "locked", "freeze")
                     return _spot_holding(avail + locked, avail)
     except Exception as e:
@@ -194,12 +227,13 @@ def get_spot_base_holding(
 
         if isinstance(client, BitgetSpotClient):
             raw = client.get_assets() or {}
-            data = (raw.get("data") or []) if isinstance(raw, dict) else []
+            balance_read = True
+            data = rows(raw.get("data") if isinstance(raw, dict) else None)
             for row in data if isinstance(data, list) else []:
                 if not isinstance(row, dict):
                     continue
                 if str(row.get("coin") or row.get("currency") or "").upper() == base_u:
-                    avail = _pick_free_from_row(row, "available", "avail", "free")
+                    avail = available(row, "available", "avail", "free")
                     frozen = _pick_free_from_row(row, "frozen", "lock")
                     total = _pick_free_from_row(row, "total", "balance")
                     if total <= 0:
@@ -218,17 +252,19 @@ def get_spot_base_holding(
 
         if isinstance(client, BybitClient) and (getattr(client, "category", "") or "").strip().lower() == "spot":
             raw = client.get_wallet_balance(account_type="SPOT") or {}
-            lst = ((raw.get("result") or {}).get("list") or []) if isinstance(raw, dict) else []
+            balance_read = True
+            lst = rows((raw.get("result") or {}).get("list") if isinstance(raw, dict) else None)
             for acct in lst:
                 if not isinstance(acct, dict):
                     continue
-                for coin in acct.get("coin") or []:
+                for coin in rows(acct.get("coin")):
                     if not isinstance(coin, dict):
                         continue
                     if str(coin.get("coin") or "").upper() == base_u:
-                        avail = _pick_free_from_row(
-                            coin, "availableToWithdraw", "free", "walletBalance"
-                        )
+                        keys = ("availableToWithdraw", "free")
+                        if not require_available:
+                            keys += ("walletBalance",)
+                        avail = available(coin, *keys)
                         total = _pick_free_from_row(coin, "walletBalance", "equity", "availableToWithdraw")
                         avg_cost = _pick_cost_from_row(
                             coin, "avgPrice", "sessionAvgPrice", "accAvgPx", "avgCost"
@@ -244,7 +280,8 @@ def get_spot_base_holding(
 
         if isinstance(client, HtxClient) and getattr(client, "market_type", "") == "spot":
             balance = client.get_balance()
-            items = (((balance.get("data") or {}).get("list")) if isinstance(balance, dict) else None) or []
+            balance_read = True
+            items = rows((balance.get("data") or {}).get("list") if isinstance(balance, dict) else None)
             # HTX splits one currency over several rows: ``trade`` is the
             # sellable part, ``frozen`` is locked by resting orders and still
             # owned.  Order is not guaranteed, so accumulate instead of
@@ -265,7 +302,7 @@ def get_spot_base_holding(
                 elif balance_type == "trade":
                     matched = True
                     tradable += _pick_free_from_row(item, "balance")
-                    avail += _pick_free_from_row(item, "available", "balance")
+                    avail += available(item, "available", "balance")
                 # Other balance types are not part of this spot trading inventory.
             if matched:
                 return _spot_holding(tradable + frozen, avail)
@@ -274,15 +311,17 @@ def get_spot_base_holding(
             raise
         logger.warning("spot base holding (htx): %s", e)
 
+    if require_available and not balance_read:
+        raise LiveTradingError("strategyRuntime.spotBalanceUnavailable")
     return {"total": 0.0, "available": 0.0, "avg_cost": 0.0}
 
 
-def get_spot_free_base_balance(client: BaseRestClient, *, symbol: str) -> float:
+def get_spot_free_base_balance(client: BaseRestClient, *, symbol: str, strict: bool = False) -> float:
     """
     Best-effort free/available base asset on the connected spot account.
-    Returns 0.0 if unknown or on error.
+    Strict execution reads reject unknown balances; display reads remain best-effort.
     """
-    holding = get_spot_base_holding(client, symbol=symbol)
+    holding = get_spot_base_holding(client, symbol=symbol, strict=strict, require_available=strict)
     return max(0.0, float(holding.get("available") or 0.0))
 
 
@@ -437,21 +476,30 @@ def clamp_spot_close_quantity(
     Cap sell size to exchange free base (with safety ratio) and normalize down to lot step.
     """
     req = float(requested_qty or 0.0)
+    if not math.isfinite(req):
+        raise LiveTradingError("strategyRuntime.spotCloseQuantityInvalid")
     meta: Dict[str, Any] = {"requested": req}
     if req <= 0:
         return 0.0, meta
 
     ratio = float(safety_ratio) if safety_ratio is not None else _close_safety_ratio()
-    free = get_spot_free_base_balance(client, symbol=symbol)
+    if not math.isfinite(ratio) or not 0 < ratio <= 1:
+        raise LiveTradingError("strategyRuntime.spotCloseQuantityInvalid")
+    try:
+        free = get_spot_free_base_balance(client, symbol=symbol, strict=True)
+        if not math.isfinite(free) or free < 0:
+            raise LiveTradingError("strategyRuntime.spotBalanceUnavailable")
+    except Exception as exc:
+        raise LiveTradingError("strategyRuntime.spotBalanceUnavailable") from exc
     meta["exchange_free"] = free
     meta["safety_ratio"] = ratio
 
-    cap = req
-    if free > 0:
-        cap = min(req, free * ratio)
-        meta["capped_before_normalize"] = cap
+    cap = min(req, free * ratio)
+    meta["capped_before_normalize"] = cap
 
     final = normalize_spot_base_quantity(client, symbol=symbol, quantity=cap, for_market=True)
+    if not math.isfinite(final) or final < 0 or final > cap:
+        raise LiveTradingError("strategyRuntime.spotCloseQuantityInvalid")
     meta["final"] = final
     if final < req * 0.999:
         meta["adjusted"] = True
