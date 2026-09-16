@@ -19,6 +19,7 @@ Sources (official API docs):
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+from math import isfinite
 
 from app.services.live_trading.base import BaseRestClient
 from app.services.live_trading.binance import BinanceFuturesClient
@@ -39,7 +40,8 @@ logger = get_logger(__name__)
 
 def _float(v: Any) -> float:
     try:
-        return float(v or 0)
+        value = float(v or 0)
+        return value if isfinite(value) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -212,7 +214,6 @@ def extract_grid_fill_avg_price(
         or data.get("avg_price")
         or data.get("fill_price")
         or data.get("trade_avg_price")
-        or data.get("price")
     )
     if avg <= 0 and data.get("filled_total") and data.get("filled_amount"):
         filled_amt = _float(data.get("filled_amount"))

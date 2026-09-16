@@ -8,6 +8,7 @@ from collections import deque
 
 from app.services.live_trading.fill_accounting import base_quantity, contract_multiplier
 from app.services.live_trading.base import LiveTradingError
+from app.services.live_trading.fill_evidence import require_execution
 
 _snapshot_lock = threading.Lock()
 _snapshots = {}
@@ -134,6 +135,9 @@ def combine_pending_snapshot(event, pending):
     matching.update(filled_qty=event["cumulative_quantity"], avg_price=event["cumulative_average_price"])
     if "_snapshot_fees" in event and event.get("fee_status") != "pending":
         matching["fees_by_ccy"] = event["_snapshot_fees"]
+    for leg in legs:
+        if float(leg.get("filled_qty") or 0) > 0:
+            require_execution(leg["filled_qty"], leg.get("avg_price"))
     quantity = sum(float(leg.get("filled_qty") or 0) for leg in legs)
     value = sum(float(leg.get("filled_qty") or 0) * float(leg.get("avg_price") or 0) for leg in legs)
     other_fees = {}

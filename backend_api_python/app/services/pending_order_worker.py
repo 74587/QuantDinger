@@ -2263,7 +2263,7 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
             )
             if rec_filled > 0:
                 filled_final = rec_filled
-                avg_final = rec_avg if rec_avg > 0 else float(ref_price or 0.0)
+                avg_final = rec_avg
                 phases["fill_recovery"] = {
                     "source": rec_src,
                     "filled": rec_filled,
@@ -2692,19 +2692,6 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                 fee_ccy=commission_ccy,
                 fill_price=avg_price,
             )
-
-            if avg_price <= 0 and ref_price > 0:
-                if filled > 0:
-                    logger.warning(
-                        f"[worker] Alpaca order avg_price=0, using ref_price={ref_price} as fallback: "
-                        f"strategy_id={strategy_id} pending_id={order_id}"
-                    )
-                    avg_price = ref_price
-                else:
-                    logger.info(
-                        f"[worker] Alpaca order submitted but not filled yet: "
-                        f"strategy_id={strategy_id} pending_id={order_id} status={result.status}"
-                    )
 
             executed_at = int(time.time())
 

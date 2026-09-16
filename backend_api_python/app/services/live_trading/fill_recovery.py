@@ -10,20 +10,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 from app.services.grid.exchange_orders import query_grid_order_fill
-from app.services.live_trading.position_query import query_exchange_position_size
+from app.services.live_trading.fill_evidence import positive_number
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-_ENTRY_SIGNALS = frozenset(
-    {
-        "open_long",
-        "open_short",
-        "add_long",
-        "add_short",
-    }
-)
-
 
 def try_recover_zero_fill(
     client: Any,
@@ -39,17 +29,9 @@ def try_recover_zero_fill(
     pre_position_qty: float,
     ref_price: float,
 ) -> Tuple[float, float, str]:
-    """
-    Best-effort fill recovery when polling reported filled=0.
-
-    Returns (filled_base_qty, avg_price, source) where source is
-    ``order_requery``, ``position_delta``, or empty when nothing recovered.
-    """
+    """Recover only execution quantities and prices returned for this order."""
     ex_oid = str(exchange_order_id or "").strip()
     coid = str(client_order_id or "").strip()
-    req = float(requested_qty or 0.0)
-    pre = max(0.0, float(pre_position_qty or 0.0))
-    px_hint = float(ref_price or 0.0)
     ex_cfg = exchange_config if isinstance(exchange_config, dict) else {}
 
     if ex_oid or coid:
@@ -62,8 +44,8 @@ def try_recover_zero_fill(
                 client_order_id=coid,
                 exchange_config=ex_cfg,
             )
-            if filled > 0:
-                use_avg = float(avg or 0.0) or px_hint
+            if positive_number(filled) is not None and positive_number(avg) is not None:
+                use_avg = float(avg)
                 logger.info(
                     "fill_recovery order_requery: symbol=%s oid=%s filled=%s avg=%s status=%s",
                     symbol,
@@ -76,44 +58,4 @@ def try_recover_zero_fill(
         except Exception as e:
             logger.debug("fill_recovery order_requery failed symbol=%s: %s", symbol, e)
 
-    sig = str(signal_type or "").strip().lower()
-    if sig not in _ENTRY_SIGNALS or req <= 0:
-        return 0.0, 0.0, ""
-
-    side = str(pos_side or "").strip().lower()
-    if side not in ("long", "short"):
-        return 0.0, 0.0, ""
-
-    try:
-        post = float(
-            query_exchange_position_size(
-                client=client,
-                symbol=str(symbol),
-                pos_side=side,
-                market_type=str(market_type or "swap"),
-                exchange_config=ex_cfg,
-            )
-            or 0.0
-        )
-    except Exception as e:
-        logger.debug("fill_recovery position query failed symbol=%s: %s", symbol, e)
-        return 0.0, 0.0, ""
-
-    delta = max(0.0, post - pre)
-    if delta < req * 0.85:
-        return 0.0, 0.0, ""
-
-    record_qty = min(delta, req * 1.15) if req > 0 else delta
-    if record_qty <= 0:
-        return 0.0, 0.0, ""
-
-    logger.info(
-        "fill_recovery position_delta: symbol=%s signal=%s pre=%s post=%s delta=%s record=%s",
-        symbol,
-        sig,
-        pre,
-        post,
-        delta,
-        record_qty,
-    )
-    return float(record_qty), px_hint, "position_delta"
+    return 0.0, 0.0, ""

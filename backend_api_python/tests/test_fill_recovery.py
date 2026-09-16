@@ -76,15 +76,13 @@ def test_try_recover_zero_fill_order_requery():
     assert avg == pytest.approx(72000.0)
 
 
-def test_try_recover_zero_fill_position_delta():
+def test_try_recover_zero_fill_does_not_infer_execution_from_account_position():
     client = MagicMock()
     with patch(
         "app.services.live_trading.fill_recovery.query_grid_order_fill",
         return_value=(0.0, 0.0, "unknown"),
-    ), patch(
-        "app.services.live_trading.fill_recovery.query_exchange_position_size",
-        return_value=0.005,
     ):
+        client.get_positions.return_value = [{"size": 0.005, "entryPrice": 71000}]
         filled, avg, src = try_recover_zero_fill(
             client,
             symbol="BTC/USDT",
@@ -98,9 +96,8 @@ def test_try_recover_zero_fill_position_delta():
             pre_position_qty=0.0,
             ref_price=71000.0,
         )
-    assert src == "position_delta"
-    assert filled == pytest.approx(0.005)
-    assert avg == pytest.approx(71000.0)
+    assert (filled, avg, src) == (0.0, 0.0, "")
+    client.get_positions.assert_not_called()
 
 
 def test_try_recover_zero_fill_skips_close_signals():

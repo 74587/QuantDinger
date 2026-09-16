@@ -1688,13 +1688,13 @@ class GridEngine:
         if not cell:
             return
         purpose = str(order.purpose or "")
-        fq = float(filled_qty or order.quantity or 0)
+        fq = float(filled_qty or 0)
         from app.services.pending_orders.fill_records import spot_position_fill_quantity
         from app.services.grid.fill_handler import _PURPOSE_TO_SIGNAL
         fq = spot_position_fill_quantity(market_type=self.trading_config.get('market_type') or 'swap',
             symbol=self.symbol, signal_type=_PURPOSE_TO_SIGNAL.get(purpose, ''),
             gross_quantity=fq, fees_by_ccy=fees_by_ccy or {})
-        px = float(avg_price or order.price or 0)
+        px = float(avg_price or 0)
         persisted_cell = self._cell_record(cell.index)
         persisted_state = GridCellState.parse(
             getattr(persisted_cell, "state", GridCellState.IDLE)

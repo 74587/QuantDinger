@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 from app.utils.db import get_db_connection, get_db_transaction
 from app.services.live_trading.fill_accounting import cumulative_delta, posted_totals, lock_strategy_fills
 from app.services.live_trading.leg_context import resolve_leg_context
+from app.services.live_trading.fill_evidence import require_execution
 from app.services.live_trading.records import (
     apply_fill_to_local_position,
     record_trade,
@@ -167,6 +168,7 @@ def _persist_strategy_fill(
         )
         return profit, matched_entry_price
 
+    require_execution(filled_qty, avg_px)
     leg = resolve_leg_context(
         strategy_id=int(strategy_id),
         symbol=str(symbol or ""),

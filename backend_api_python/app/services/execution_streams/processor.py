@@ -199,10 +199,13 @@ class ExecutionEventProcessor:
             else:
                 delta = event_qty
                 target = previous + delta
-            price = float(event.get("price") or pending.get("avg_price") or 0.0)
+            price = float(event.get("price") or 0.0)
             previous_avg = posted["average"]
             if event.get("cumulative_average_price"):
                 delta, price = cumulative_delta(previous, previous_avg, cumulative, event["cumulative_average_price"])
+            if delta > 0:
+                from app.services.live_trading.fill_evidence import require_execution
+                require_execution(delta, price)
             aggregate_avg = (
                 ((previous * previous_avg) + (delta * price)) / target
                 if target > 0 and delta > 0 and price > 0

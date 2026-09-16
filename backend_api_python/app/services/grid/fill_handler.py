@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from app.services.grid.resting_orders_repo import GridRestingOrder
+from app.services.live_trading.fill_evidence import require_execution
 from app.services.live_trading.grid_cells import GridCellRepository
 from app.services.live_trading.leg_context import resolve_leg_context
 from app.services.live_trading.records import (
@@ -78,10 +79,9 @@ def apply_grid_fill_to_local_state(
     signal_type = _PURPOSE_TO_SIGNAL.get(purpose, "")
     if not signal_type:
         return
-    px = float(avg_price or order.price or 0)
-    qty = float(filled_qty or order.quantity or 0)
-    if qty <= 0 or px <= 0:
-        return
+    px = float(avg_price or 0)
+    qty = float(filled_qty or 0)
+    require_execution(qty, px)
     tc = trading_config if isinstance(trading_config, dict) else {}
     from app.services.pending_orders.fill_records import spot_position_fill_quantity
     grid_entry_price = _matched_grid_entry_price(int(strategy_id), sym, order)
@@ -167,8 +167,7 @@ def _record_grid_market_fill(
         return 0
     px = float(avg_price or 0)
     qty = float(filled_qty or 0)
-    if qty <= 0 or px <= 0:
-        return 0
+    require_execution(qty, px)
     tc = trading_config if isinstance(trading_config, dict) else {}
     leg = resolve_leg_context(
         strategy_id=int(strategy_id),

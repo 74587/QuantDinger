@@ -140,12 +140,18 @@ def get_trades():
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT id, strategy_id, symbol, type, price, amount, value,
-                       commission, commission_ccy, commission_quote, profit, close_reason,
-                       matched_entry_price, grid_matched_profit, fee_status, fee_source, created_at
-                FROM qd_strategy_trades
-                WHERE strategy_id = ?
-                ORDER BY id DESC
+                SELECT t.id, t.strategy_id, t.symbol, t.type, t.price, t.amount, t.value,
+                       t.commission, t.commission_ccy, t.commission_quote, t.profit, t.close_reason,
+                       t.matched_entry_price, t.grid_matched_profit, t.fee_status, t.fee_source, t.created_at,
+                       t.fill_source, t.exchange_order_id, t.exchange_fill_id,
+                       p.price AS request_price, p.payload_json AS request_payload,
+                       r.price AS grid_request_price
+                FROM qd_strategy_trades t
+                LEFT JOIN pending_orders p ON p.id = t.pending_order_id AND p.strategy_id = t.strategy_id
+                LEFT JOIN qd_grid_resting_orders r ON r.id = t.grid_order_id AND r.strategy_id = t.strategy_id
+                    AND r.exchange_order_id = t.exchange_order_id AND t.exchange_order_id <> ''
+                WHERE t.strategy_id = ?
+                ORDER BY t.id DESC
                 """,
                 (strategy_id,)
             )
@@ -154,9 +160,10 @@ def get_trades():
 
         from app.utils.trade_close_reason import enrich_trade_row
         from app.utils.trade_net_pnl import enrich_trades_net_pnl
+        from app.utils.trade_execution import enrich_execution_reference
         processed_rows = []
         for row in rows:
-            trade = dict(row)
+            trade = enrich_execution_reference(row)
             created_at = trade.get('created_at')
             if created_at:
                 if hasattr(created_at, 'timestamp'):

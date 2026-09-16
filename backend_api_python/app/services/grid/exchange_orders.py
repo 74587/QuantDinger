@@ -845,25 +845,8 @@ def _parse_grid_order_fill(data: Dict[str, Any]) -> Tuple[float, float, str]:
         or data.get("trade_volume")
         or 0
     )
-    avg = float(
-        data.get("avgPx")
-        or data.get("avgPrice")
-        or data.get("avg_price")
-        or data.get("fill_price")
-        or data.get("trade_avg_price")
-        or data.get("price")
-        or 0
-    )
-    if avg <= 0 and data.get("filled_total") and data.get("filled_amount"):
-        try:
-            filled_amt = float(data.get("filled_amount") or filled or 0)
-            filled_total = float(data.get("filled_total") or 0)
-            if filled_amt > 0 and filled_total > 0:
-                avg = filled_total / filled_amt
-                if filled <= 0:
-                    filled = filled_amt
-        except Exception:
-            pass
+    from app.services.grid.fill_units import extract_grid_fill_avg_price
+    avg = extract_grid_fill_avg_price(None, data=data, filled_base=filled)
     return filled, avg, order_status_from_data(data)
 
 

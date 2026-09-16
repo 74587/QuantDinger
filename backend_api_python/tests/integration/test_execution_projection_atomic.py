@@ -338,3 +338,20 @@ def test_compound_order_ws_does_not_compare_one_leg_to_total(projection):
     assert float(totals["quantity"]) == 3
     assert float(totals["value"]) == 320
     assert float(totals["fee"]) == pytest.approx(0.3)
+
+
+def test_missing_execution_price_does_not_reuse_previous_fill_and_can_replay(projection):
+    from app.services.live_trading.base import LiveTradingError
+    processor, event, binding, query = projection
+    processor._process_pending_order(event, binding)
+    missing = dict(event, id=12, exchange_fill_id="fill-2", cumulative_quantity=2, price=0)
+    with pytest.raises(LiveTradingError, match="fillSnapshotNotReady"):
+        processor._process_pending_order(missing, binding)
+    assert_ledger(query, 1)
+    actual = dict(missing, price=110)
+    processor._process_pending_order(actual, binding)
+    processor._process_pending_order(actual, binding)
+    rows = query("SELECT amount, price FROM qd_strategy_trades ORDER BY id")
+    assert len(rows) == 2
+    assert [float(r["price"]) for r in rows] == [100, 110]
+    assert float(query("SELECT entry_price FROM qd_strategy_positions")[0]["entry_price"]) == 105

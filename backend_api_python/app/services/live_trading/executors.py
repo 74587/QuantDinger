@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from app.services.live_trading.base import LiveOrderResult, LiveTradingError
 from app.services.live_trading.contracts import ExchangeOrderAdapter, FillSnapshot, OrderIntent
+from app.services.live_trading.fill_evidence import positive_number
 from app.services.pending_orders.sent_order_recovery import normalize_live_order_status
 
 
@@ -60,12 +61,13 @@ class MarketOrderExecutor:
                 max_wait_sec=self.max_wait_sec,
             )
             if fill:
+                quantity, average = _execution_pair(result, fill)
                 return OrderExecutionResult(
                     success=True,
                     exchange_id=str(result.exchange_id or ""),
                     exchange_order_id=str(result.exchange_order_id or ""),
-                    filled_qty=float(fill.filled_qty or result.filled or 0.0),
-                    avg_price=float(fill.avg_price or result.avg_price or 0.0),
+                    filled_qty=quantity,
+                    avg_price=average,
                     status=fill.status or "submitted",
                     raw={"place": dict(result.raw or {}), "fill": dict(fill.raw or {})},
                     fees_by_ccy=dict(fill.fees_by_ccy or {}),
@@ -208,9 +210,20 @@ class LimitThenMarketExecutor:
             raise
 
 
+def _execution_pair(result: LiveOrderResult, fill: Optional[FillSnapshot]) -> tuple[float, float]:
+    """Keep quantity and average from the same cumulative execution snapshot."""
+    placed = float(result.filled or 0.0)
+    observed = float(fill.filled_qty or 0.0) if fill else 0.0
+    if fill is not None and observed >= placed:
+        average = positive_number(fill.avg_price) or 0.0
+        if observed == placed and not average:
+            average = positive_number(result.avg_price) or 0.0
+        return observed, average
+    return placed, positive_number(result.avg_price) or 0.0
+
+
 def _limit_result(result: LiveOrderResult, fill: Optional[FillSnapshot], *, pending: bool = False) -> OrderExecutionResult:
-    quantity = max(float(result.filled or 0.0), float(fill.filled_qty or 0.0) if fill else 0.0)
-    average = float(fill.avg_price or result.avg_price or 0.0) if fill else float(result.avg_price or 0.0)
+    quantity, average = _execution_pair(result, fill)
     return OrderExecutionResult(
         success=True,
         exchange_id=str(result.exchange_id or ""),
@@ -245,7 +258,9 @@ def _weighted_avg(*fills: tuple[float, float]) -> float:
     notional = 0.0
     for qty, price in fills:
         q = max(0.0, float(qty or 0.0))
-        p = max(0.0, float(price or 0.0))
+        p = positive_number(price) or 0.0
+        if q > 0 and not p:
+            return 0.0
         notional += q * p
     return notional / total_qty if notional > 0 else 0.0
 

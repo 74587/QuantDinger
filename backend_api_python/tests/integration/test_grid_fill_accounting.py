@@ -324,3 +324,33 @@ def test_cell_failure_rolls_back_fill_and_never_places_exit(ledger, monkeypatch,
     assert ledger.query("SELECT * FROM qd_strategy_trades") == []
     assert ledger.query("SELECT * FROM qd_strategy_positions") == []
     engine._ensure_cell_exit_coverage.assert_not_called()
+
+
+def test_trade_api_separates_grid_instruction_and_execution_and_hides_raw_payload(ledger, monkeypatch):
+    from flask import Flask, g
+    from app.routes import strategy_ledger_routes as routes
+    from app.services.live_trading import funding_reconciliation as funding
+    from app.services.live_trading import alpaca_activity_reconciliation as alpaca
+    ledger.processor._process_grid(*ledger.event(average="2370", price="2370"))
+    monkeypatch.setattr(routes, "get_strategy_service", lambda: SimpleNamespace(
+        get_strategy=lambda *a, **k: {"trading_config": {"market_type":"swap", "bot_type":"grid"}}))
+    monkeypatch.setattr(funding, "sync_strategy_funding", lambda *a, **k: None)
+    monkeypatch.setattr(funding, "load_strategy_funding_summary", lambda *a, **k: {})
+    monkeypatch.setattr(alpaca, "sync_strategy_alpaca_activities", lambda *a, **k: None)
+    monkeypatch.setattr(alpaca, "load_strategy_broker_activity_summary", lambda *a, **k: {})
+    monkeypatch.setattr(alpaca, "is_alpaca_strategy", lambda *a, **k: False)
+    app = Flask(__name__)
+    with app.test_request_context("/strategies/trades?id=1"):
+        g.user_id = 1
+        from inspect import unwrap
+        response = unwrap(routes.get_trades)()
+    data = response.get_json()
+    assert data["code"] == 1
+    row = data["data"]["trades"][0]
+    assert row["price"] == 2370
+    assert row["reference_price"] == 2376.11
+    assert row["reference_kind"] == "limit"
+    assert row["price_deviation_pct"] == pytest.approx((2370 / 2376.11 - 1) * 100)
+    assert row["exchange_order_id"] == "open-1"
+    assert "request_payload" not in row
+    assert "grid_request_price" not in row
