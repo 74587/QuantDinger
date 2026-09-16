@@ -196,6 +196,20 @@ def test_binance_futures_uses_futures_trade_history():
     assert signed.call_args.kwargs["params"]["orderId"] == "34"
 
 
+def test_binance_futures_unwraps_signed_list_response_for_fee_history():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    rows = [{"orderId": 34, "qty": "0.1", "commission": "0.03", "commissionAsset": "USDT"}]
+    with patch.object(client, "_signed_request", return_value={"raw": rows}):
+        assert client.get_user_trades(symbol="BTC/USDT", order_id="34") == rows
+
+
+def test_binance_spot_unwraps_signed_list_response_for_fee_history():
+    client = BinanceSpotClient(api_key="key", secret_key="secret")
+    rows = [{"orderId": 12, "qty": "0.1", "commission": "0.00003", "commissionAsset": "BNB"}]
+    with patch.object(client, "_signed_request", return_value={"raw": rows}):
+        assert client.get_my_trades(symbol="BTC/USDT", order_id="12") == rows
+
+
 def test_binance_futures_open_orders_are_scoped_to_symbol():
     client = BinanceFuturesClient(api_key="key", secret_key="secret")
     with patch.object(client, "_signed_request", return_value=[]) as signed:
@@ -206,6 +220,13 @@ def test_binance_futures_open_orders_are_scoped_to_symbol():
         "/fapi/v1/openOrders",
         params={"symbol": "SOLUSDT"},
     )
+
+
+def test_binance_futures_open_orders_unwraps_signed_list_response():
+    client = BinanceFuturesClient(api_key="key", secret_key="secret")
+    rows = [{"orderId": 34, "symbol": "SOLUSDT"}]
+    with patch.object(client, "_signed_request", return_value={"raw": rows}):
+        assert client.get_open_orders(symbol="SOL/USDT") == rows
 
 
 def test_binance_zero_commission_fill_is_authoritative():

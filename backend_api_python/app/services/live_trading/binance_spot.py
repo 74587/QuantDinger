@@ -643,7 +643,11 @@ class BinanceSpotClient(BaseRestClient):
         lim = max(1, min(1000, lim))
         params["limit"] = lim
         data = self._signed_request("GET", "/api/v3/myTrades", params=params)
-        return data
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("raw"), list):
+            return data["raw"]
+        return []
 
     def get_fee_for_order(self, *, symbol: str, order_id: str, max_retries: int = 3) -> Tuple[float, str]:
         """

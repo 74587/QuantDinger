@@ -467,14 +467,23 @@ class BinanceFuturesClient(BaseRestClient):
             params["startTime"] = max(0, int(end_time_ms) - 7 * 86400000 + 1)
         params["limit"] = lim
         data = self._signed_request("GET", "/fapi/v1/userTrades", params=params)
-        return data
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("raw"), list):
+            return data["raw"]
+        return []
 
     def get_open_orders(self, *, symbol: str = "") -> Any:
         """Return current USD-M futures orders, optionally scoped to one symbol."""
         params: Dict[str, Any] = {}
         if symbol:
             params["symbol"] = to_binance_futures_symbol(symbol)
-        return self._signed_request("GET", "/fapi/v1/openOrders", params=params)
+        data = self._signed_request("GET", "/fapi/v1/openOrders", params=params)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("raw"), list):
+            return data["raw"]
+        return []
 
     def get_fee_for_order(self, *, symbol: str, order_id: str, max_retries: int = 3) -> Tuple[float, str]:
         """
