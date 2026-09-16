@@ -220,6 +220,20 @@ class GridRestingOrderRepository:
             return []
         return [GridRestingOrder.from_row(dict(r)) for r in rows]
 
+    def list_reconciliation(self, limit: int = 200) -> List[GridRestingOrder]:
+        """Retry terminal orders with unposted fills or unsettled fees."""
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("""SELECT o.* FROM qd_grid_resting_orders o
+                WHERE o.status IN ('filled', 'cancelled') AND o.filled_quantity > 0
+                  AND (o.processed_fill_qty + 1e-12 < o.filled_quantity OR EXISTS (
+                    SELECT 1 FROM qd_strategy_trades t WHERE t.grid_order_id = o.id
+                    AND COALESCE(t.fee_status, 'pending') = 'pending'))
+                ORDER BY o.updated_at ASC, o.id ASC LIMIT %s""", (max(1, int(limit)),))
+            rows = cur.fetchall() or []
+            cur.close()
+        return [GridRestingOrder.from_row(dict(row)) for row in rows]
+
     def list_open(self, strategy_id: Optional[int] = None) -> List[GridRestingOrder]:
         try:
             with get_db_connection() as db:

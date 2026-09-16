@@ -772,7 +772,18 @@ class BybitClient(BaseRestClient):
             params["symbol"] = to_bybit_symbol(symbol)
         else:
             raise LiveTradingError("Bybit get_executions requires an order id or symbol")
-        return self._signed_request("GET", "/v5/execution/list", params=params)
+        rows = []
+        for _ in range(10):
+            raw = self._signed_request('GET', '/v5/execution/list', params=params)
+            result = raw.get('result') or {}
+            rows.extend(result.get('list') or [])
+            cursor = result.get('nextPageCursor')
+            if not cursor:
+                return {**raw, 'result': {**result, 'list': rows}}
+            if cursor == params.get('cursor'):
+                break
+            params['cursor'] = cursor
+        raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
 
     def _execution_fee_breakdown(
         self,
@@ -790,18 +801,19 @@ class BybitClient(BaseRestClient):
         fees: Dict[str, float] = {}
         if not isinstance(rows, list):
             return fees
-        default_ccy = "USDT" if self.category == "linear" else ""
+        from app.services.live_trading.fee_quote import symbol_currencies
+        default_ccy = symbol_currencies(symbol)[1] if self.category == "linear" else ""
         for row in rows:
             if not isinstance(row, dict):
+                continue
+            if row.get("execType") not in (None, "", "Trade"):
                 continue
             if order_id and str(row.get("orderId") or "") != str(order_id):
                 continue
             try:
-                amount = abs(float(row.get("execFee") or 0.0))
+                amount = float(row.get("execFee") or 0.0)
             except (TypeError, ValueError):
                 amount = 0.0
-            if amount <= 0:
-                continue
             currency = str(row.get("feeCurrency") or default_ccy).strip().upper() or "UNKNOWN"
             fees[currency] = fees.get(currency, 0.0) + amount
         return fees
@@ -841,24 +853,25 @@ class BybitClient(BaseRestClient):
             if isinstance(fee_detail, dict) and fee_detail:
                 for k, v in fee_detail.items():
                     try:
-                        fv = abs(float(v or 0.0))
+                        fv = float(v or 0.0)
                     except Exception:
                         fv = 0.0
-                    if fv > 0:
+                    if v is not None:
                         key = str(k or "").strip().upper() or "UNKNOWN"
                         fees_by_ccy[key] = fees_by_ccy.get(key, 0.0) + fv
                 fee = sum(fees_by_ccy.values())
                 if len(fees_by_ccy) == 1:
                     fee_ccy = next(iter(fees_by_ccy))
-            if fee <= 0:
+            if not fees_by_ccy:
                 try:
-                    fee = abs(float(last.get("cumExecFee") or 0.0))
+                    fee = float(last.get("cumExecFee") or 0.0)
                 except Exception:
                     fee = 0.0
-                if fee > 0 and self.category == "linear":
-                    fee_ccy = "USDT"
+                if fee != 0 and self.category == "linear":
+                    from app.services.live_trading.fee_quote import symbol_currencies
+                    fee_ccy = symbol_currencies(symbol)[1] or "UNKNOWN"
                     fees_by_ccy = {fee_ccy: fee}
-            if filled > 0:
+            if filled > 0 and not fees_by_ccy:
                 try:
                     execution_fees = self._execution_fee_breakdown(
                         symbol=symbol,
@@ -873,12 +886,12 @@ class BybitClient(BaseRestClient):
                     logger.debug("Bybit execution fee query failed for order %s: %s", order_id, exc)
             # cumExecFee / cumFeeDetail can lag slightly after fill shows up.
             if filled > 0 and avg_price > 0:
-                if fee <= 0 and not timed_out:
+                if not fees_by_ccy and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
             if status.lower() in ("filled", "cancelled", "canceled", "rejected"):
-                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                if not fees_by_ccy and filled > 0 and avg_price > 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}

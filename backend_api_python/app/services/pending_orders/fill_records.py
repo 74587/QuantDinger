@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
-from app.utils.db import get_db_connection
+from app.utils.db import get_db_connection, get_db_transaction
+from app.services.live_trading.fill_accounting import cumulative_delta, posted_totals, lock_strategy_fills
 from app.services.live_trading.leg_context import resolve_leg_context
 from app.services.live_trading.records import (
     apply_fill_to_local_position,
@@ -32,7 +33,7 @@ def spot_position_fill_quantity(
     from app.services.live_trading.fee_quote import symbol_currencies
 
     base, _quote = symbol_currencies(symbol)
-    base_fee = max(0.0, float((fees_by_ccy or {}).get(base, 0.0) or 0.0))
+    base_fee = float((fees_by_ccy or {}).get(base, 0.0) or 0.0)
     signal = str(signal_type or "").strip().lower()
     if signal in {"open_long", "add_long"}:
         return max(0.0, gross - base_fee)
@@ -66,7 +67,62 @@ def proportional_spot_position_fill_quantity(
     )
 
 
-def persist_strategy_fill(
+def persist_strategy_fill(**kwargs):
+    """Serialize every writer before checking its already-posted quantity."""
+    cumulative = kwargs.pop('cumulative_filled', None)
+    cumulative_fees = kwargs.pop('cumulative_fees', None)
+    cumulative_average = kwargs.pop('cumulative_average_price', kwargs.get('avg_price'))
+    cumulative_quote = kwargs.pop('cumulative_commission_quote', kwargs.get('commission_quote'))
+    with get_db_transaction():
+        lock_strategy_fills(int(kwargs['strategy_id']))
+        order_id = int(kwargs.get('order_id') or 0)
+        with get_db_connection() as db:
+            cur = db.cursor()
+            if order_id:
+                cur.execute('SELECT id FROM pending_orders WHERE id = %s FOR UPDATE', (order_id,))
+                cur.fetchone()
+            if int(kwargs.get('execution_event_id') or 0):
+                cur.execute('SELECT id FROM qd_strategy_trades WHERE execution_event_id = %s', (kwargs['execution_event_id'],))
+                if cur.fetchone():
+                    cur.close()
+                    return None, None
+            cur.close()
+        if cumulative is not None and order_id:
+            posted = posted_totals('pending_order_id', order_id)
+            quantity, price = cumulative_delta(posted['quantity'], posted['average'], float(cumulative), cumulative_average)
+            if float(cumulative) + 1e-12 < posted['quantity']:
+                return None, None
+            kwargs['filled'], kwargs['avg_price'] = quantity, price
+            fees = cumulative_fees
+            if fees is None:
+                currency = kwargs.get('commission_ccy')
+                fees = {currency: float(kwargs.get('commission') or 0)} if currency else {}
+            fees_known = bool(fees) or kwargs.get('fee_status') in {'actual', 'actual_zero'}
+            cumulative_fee_status = 'actual' if any(fees.values()) else 'actual_zero'
+            fees = {ccy: fees.get(ccy, 0.0) - posted['fees'].get(ccy, 0.0) for ccy in fees.keys() | posted['fees'].keys()} if fees_known else {}
+            kwargs['fees_by_ccy'] = fees
+            if fees_known:
+                kwargs['fee_status'] = 'actual' if any(fees.values()) else 'actual_zero'
+                kwargs['fee_source'] = kwargs.get('fee_source') or 'rest'
+            if len(fees) == 1:
+                kwargs['commission_ccy'], kwargs['commission'] = next(iter(fees.items()))
+            elif fees:
+                kwargs['commission_ccy'], kwargs['commission'] = 'MIXED', 0.0
+            kwargs['commission_quote'] = cumulative_quote - posted['quote'] if cumulative_quote is not None and fees_known else None
+            if quantity <= 0:
+                if posted['quantity'] > 0 and fees_known:
+                    from app.services.live_trading.fill_accounting import adjust_order_fee
+                    adjust_order_fee('pending_order_id', order_id, fees, kwargs['commission_quote'],
+                        cumulative_fee_status,
+                        kwargs.get('fee_source') or 'rest')
+                return None, None
+            kwargs['position_filled'] = spot_position_fill_quantity(
+                market_type=kwargs['market_type'], symbol=kwargs['symbol'], signal_type=kwargs['signal_type'],
+                gross_quantity=quantity, fees_by_ccy=fees)
+        return _persist_strategy_fill(**kwargs)
+
+
+def _persist_strategy_fill(
     *,
     strategy_id: int,
     symbol: str,
@@ -93,6 +149,7 @@ def persist_strategy_fill(
     position_filled: Optional[float] = None,
     exchange_fill_id: str = "",
     execution_event_id: int = 0,
+    fees_by_ccy: Optional[Dict[str, float]] = None,
     fee_status: str = "pending",
     fee_source: str = "",
 ) -> Tuple[Optional[float], Optional[float]]:
@@ -153,6 +210,8 @@ def persist_strategy_fill(
         exchange_fill_id=str(exchange_fill_id or ""),
         fee_status=str(fee_status or "pending"),
         fee_source=str(fee_source or ""),
+        fees_by_ccy=fees_by_ccy,
+        exchange_order_id=exchange_order_id,
     )
 
     _record_runtime_fill(

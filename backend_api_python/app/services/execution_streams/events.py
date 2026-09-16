@@ -78,6 +78,8 @@ class ExecutionEvent:
     quantity: float = 0.0
     cumulative_quantity: float = 0.0
     is_cumulative: bool = False
+    cumulative_average_price: float = 0.0
+    fees_cumulative: bool = False
     realized_pnl: Optional[float] = None
     maker: Optional[bool] = None
     fee_status: str = "pending"
@@ -93,7 +95,7 @@ class ExecutionEvent:
         if stable_fill:
             basis = (
                 f"{self.exchange_id}|{self.credential_id}|{self.market_type}|"
-                f"{self.exchange_order_id}|{stable_fill}"
+                f"{self.symbol}|{self.exchange_order_id}|{stable_fill}"
             )
         else:
             basis = json.dumps(
@@ -113,4 +115,8 @@ class ExecutionEvent:
                 sort_keys=True,
                 separators=(",", ":"),
             )
+        if self.fees_cumulative:
+            basis += json.dumps({"q": self.cumulative_quantity, "p": self.cumulative_average_price,
+                "fees": sorted((f.currency, f.fee_type, f.amount) for f in self.fees),
+                "status": self.fee_status}, sort_keys=True)
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()

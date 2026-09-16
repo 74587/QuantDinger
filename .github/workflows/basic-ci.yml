@@ -138,6 +138,15 @@ jobs:
           fi
           python -m pytest "${selected[@]}" -m "not integration and not stress" -q
 
+      - name: Verify transactional execution accounting
+        if: matrix.shard_index == 0
+        working-directory: ./backend_api_python
+        shell: bash
+        run: |
+          QD_TEST_POSTGRES_DSN="$DATABASE_URL" python -m pytest \
+            tests/integration/test_execution_projection_atomic.py \
+            tests/integration/test_grid_fill_accounting.py -q
+
       - name: Run release gates independently
         if: matrix.shard_index == 0
         working-directory: ./backend_api_python

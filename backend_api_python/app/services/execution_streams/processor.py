@@ -15,6 +15,13 @@ from app.services.pending_orders.live_order_support import bind_instrument_produ
 from app.utils.db import get_db_connection, get_db_transaction
 from app.utils.logger import get_logger
 from app.utils.strategy_runtime_logs import append_strategy_log
+from app.services.live_trading.fill_accounting import (
+    cumulative_delta,
+    posted_totals,
+    lock_strategy_fills,
+    adjust_order_fee,
+)
+from app.services.execution_streams.fill_snapshot import prepare_event, complete_snapshot, combine_pending_snapshot
 
 logger = get_logger(__name__)
 
@@ -90,7 +97,17 @@ class ExecutionEventProcessor:
         symbol: str,
         price: float,
     ) -> Tuple[Dict[str, float], Optional[float]]:
-        components = self.repository.fee_components(int(event.get("id") or 0))
+        if event.get("fees_cumulative"):
+            price = float(event.get("cumulative_average_price") or price)
+        components = (
+            [dict(currency=ccy, amount=amount) for ccy, amount in event["_snapshot_fees"].items()]
+            if "_snapshot_fees" in event
+            else self.repository.fee_components(int(event.get("id") or 0))
+        )
+        if event.get("fees_cumulative"):
+            components = list(components) + [
+                dict(currency=ccy, amount=amount) for ccy, amount in event.get("_other_fees", {}).items()
+            ]
         fees: Dict[str, float] = {}
         quote_total = 0.0
         quote_known = True
@@ -123,7 +140,23 @@ class ExecutionEventProcessor:
         return 0.0, ""
 
     def _process_pending_order(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
+        sc = load_strategy_configs(int(binding.get("strategy_id") or 0))
+        saved = dict(sc.get("exchange_config") or {})
+        credential = int(event.get("credential_id") or binding.get("credential_id") or 0)
+        if credential:
+            saved.update(credential_id=credential, exchange_id=event.get("exchange_id"))
+        cfg = resolve_exchange_config(saved, user_id=int(sc.get("user_id") or 1))
+        cfg = bind_instrument_product_contract(
+            cfg,
+            sc.get("trading_config") or {},
+            symbol=event.get("symbol") or "",
+            exchange_id=event.get("exchange_id") or "",
+            market_type=event.get("market_type") or "swap",
+        )
+        client = create_client(cfg, market_type=event.get("market_type") or "swap")
+        event = complete_snapshot(prepare_event(event, client, cfg))
         with get_db_transaction():
+            lock_strategy_fills(int(binding.get("strategy_id") or 0))
             self._project_pending_order(event, binding)
 
     def _project_pending_order(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
@@ -141,8 +174,23 @@ class ExecutionEventProcessor:
                 cur.close()
                 return
             pending = dict(pending)
+            if event.get("fees_cumulative") and "_snapshot_fees" not in event:
+                native, _ = self._fees(
+                    event,
+                    client=event.get("_client"),
+                    symbol=event.get("symbol") or "",
+                    price=float(event.get("price") or 0),
+                )
+                event["_snapshot_fees"] = native
+            event, response = combine_pending_snapshot(event, pending)
+            if response:
+                cur.execute(
+                    "UPDATE pending_orders SET exchange_response_json = %s WHERE id = %s",
+                    (json.dumps(response), pending_id),
+                )
             payload = self._json(pending.get("payload_json"))
-            previous = float(pending.get("filled") or 0.0)
+            posted = posted_totals("pending_order_id", pending_id)
+            previous = posted["quantity"]
             event_qty = max(0.0, float(event.get("quantity") or 0.0))
             cumulative = max(0.0, float(event.get("cumulative_quantity") or 0.0))
             if bool(event.get("is_cumulative")) or cumulative > 0:
@@ -152,7 +200,9 @@ class ExecutionEventProcessor:
                 delta = event_qty
                 target = previous + delta
             price = float(event.get("price") or pending.get("avg_price") or 0.0)
-            previous_avg = float(pending.get("avg_price") or 0.0)
+            previous_avg = posted["average"]
+            if event.get("cumulative_average_price"):
+                delta, price = cumulative_delta(previous, previous_avg, cumulative, event["cumulative_average_price"])
             aggregate_avg = (
                 ((previous * previous_avg) + (delta * price)) / target
                 if target > 0 and delta > 0 and price > 0
@@ -224,13 +274,16 @@ class ExecutionEventProcessor:
             exchange_id=str(event.get("exchange_id") or exchange_config.get("exchange_id") or ""),
             market_type=market_type,
         )
-        client = create_client(exchange_config, market_type=market_type)
-        price = float(event.get("price") or pending.get("avg_price") or 0.0)
+        exchange_config = event.get("_exchange_config") or exchange_config
+        client = event.get("_client") or create_client(exchange_config, market_type=market_type)
         fees, commission_quote = self._fees(event, client=client, symbol=symbol, price=price)
+        fees, commission_quote = self._incremental_fees(event, posted, delta, fees, commission_quote)
         commission, commission_ccy = self._fee_storage(fees)
 
         if delta > 1e-12 and price > 0:
-            signal_type = str(binding.get("signal_type") or pending.get("signal_type") or payload.get("signal_type") or "")
+            signal_type = str(
+                binding.get("signal_type") or pending.get("signal_type") or payload.get("signal_type") or ""
+            )
             position_filled = self._spot_position_quantity(
                 market_type=market_type,
                 symbol=symbol,
@@ -252,7 +305,8 @@ class ExecutionEventProcessor:
                 commission=commission,
                 commission_ccy=commission_ccy,
                 commission_quote=commission_quote,
-                profit=float(event.get("realized_pnl")) if event.get("realized_pnl") is not None else None,
+                fees_by_ccy=fees,
+                profit=None,
                 close_reason=trade_close_reason_from_payload(payload, signal_type),
                 strategy_run_id=int(binding.get("strategy_run_id") or pending.get("strategy_run_id") or 0),
                 order_intent_id=int(binding.get("order_intent_id") or pending.get("order_intent_id") or 0),
@@ -269,10 +323,19 @@ class ExecutionEventProcessor:
                 "trade",
                 f"Private stream fill: {signal_type} {symbol} qty={delta:.8f} @ {price:.8f}",
             )
+        elif (
+            event.get("fees_cumulative")
+            and posted["quantity"] > 0
+            and event.get("fee_status") in {"actual", "actual_zero"}
+        ):
+            adjust_order_fee(
+                "pending_order_id", pending_id, fees, commission_quote, str(event.get("fee_status") or "pending")
+            )
         elif fees:
             self._apply_late_fee(
                 execution_event_id=int(event.get("id") or 0),
                 pending_order_id=pending_id,
+                exchange_fill_id=str(event.get("exchange_fill_id") or "").removesuffix(":commission"),
                 fees=fees,
                 commission_quote=commission_quote,
                 fee_status=str(event.get("fee_status") or "actual"),
@@ -304,6 +367,7 @@ class ExecutionEventProcessor:
         *,
         execution_event_id: int,
         pending_order_id: int,
+        exchange_fill_id: str = "",
         fees: Dict[str, float],
         commission_quote: Optional[float],
         fee_status: str,
@@ -327,14 +391,14 @@ class ExecutionEventProcessor:
                 return
             cur.execute(
                 """
-                SELECT id, commission, commission_ccy, commission_quote,
+                SELECT id, commission, commission_ccy, commission_quote, commission_breakdown,
                        fee_status, fee_source
                 FROM qd_strategy_trades
                 WHERE pending_order_id = %s
-                ORDER BY id DESC LIMIT 1
+                ORDER BY CASE WHEN exchange_fill_id = %s THEN 0 ELSE 1 END, id DESC LIMIT 1
                 FOR UPDATE
                 """,
-                (int(pending_order_id),),
+                (int(pending_order_id), exchange_fill_id),
             )
             row = cur.fetchone()
             if not row:
@@ -348,49 +412,54 @@ class ExecutionEventProcessor:
                 # A REST response may already contain the authoritative fee.
                 # Do not add the matching private-stream fee a second time.
                 if not (
-                    existing_actual
-                    and existing_source not in {"", "websocket"}
-                    and abs(existing_commission) > 1e-18
+                    existing_actual and existing_source not in {"", "websocket"} and abs(existing_commission) > 1e-18
                 ):
-                    append = existing_source == "websocket"
-                    cur.execute(
-                        """
-                        UPDATE qd_strategy_trades
-                        SET commission = CASE
-                                WHEN %s THEN COALESCE(commission, 0) + %s
-                                ELSE %s
-                            END,
-                            commission_ccy = CASE
-                                WHEN %s AND COALESCE(commission_ccy, '') NOT IN ('', %s)
-                                    THEN 'MIXED'
-                                ELSE %s
-                            END,
-                            commission_quote = CASE
-                                WHEN %s THEN COALESCE(commission_quote, 0) + COALESCE(%s, 0)
-                                ELSE %s
-                            END,
-                            fee_status = %s,
-                            fee_source = 'websocket'
-                        WHERE id = %s
-                        """,
-                        (
-                            append,
-                            commission,
-                            commission,
-                            append,
-                            ccy,
-                            ccy,
-                            append,
-                            commission_quote,
-                            commission_quote,
-                            fee_status,
-                            int(row.get("id") or 0),
-                        ),
-                    )
+                    adjust_order_fee("id", int(row["id"]), fees, commission_quote, fee_status)
             db.commit()
             cur.close()
 
     def _process_grid(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
+        from app.services.grid.runner import get_runner
+
+        runner = get_runner(int(binding.get("strategy_id") or 0))
+        if not runner:
+            raise RuntimeError("Grid runner is not ready for execution projection")
+        cfg = bind_instrument_product_contract(
+            runner.exchange_config,
+            runner.engine.trading_config,
+            symbol=event.get("symbol") or "",
+            exchange_id=event.get("exchange_id") or "",
+            market_type=event.get("market_type") or "swap",
+        )
+        client = create_client(cfg, market_type=event.get("market_type") or "swap")
+        event = complete_snapshot(prepare_event(event, client, cfg))
+        with get_db_transaction():
+            lock_strategy_fills(int(binding.get("strategy_id") or 0))
+            if self._already_projected(int(event.get("id") or 0)):
+                return
+            self._project_grid(event, binding)
+
+    @staticmethod
+    def _incremental_fees(event, posted, delta, fees, quote):
+        if event.get("fee_status") == "pending":
+            return {}, None
+        if event.get("fees_cumulative"):
+            if float(event.get("cumulative_quantity") or 0) + 1e-12 < posted["quantity"]:
+                return {}, 0.0
+            difference = {
+                ccy: fees.get(ccy, 0.0) - posted["fees"].get(ccy, 0.0) for ccy in fees.keys() | posted["fees"].keys()
+            }
+            return difference, (quote - posted["quote"]) if quote is not None else None
+        if delta <= 1e-12:
+            if str(event.get("exchange_fill_id") or "").endswith(":commission"):
+                return fees, quote
+            return {}, 0.0
+        if abs(delta - float(event.get("quantity") or 0)) > max(1e-12, delta * 1e-8):
+            event["fee_status"] = "pending"
+            return {}, None
+        return fees, quote
+
+    def _project_grid(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
         order_id = int(binding.get("owner_id") or 0)
         with get_db_connection() as db:
             cur = db.cursor()
@@ -400,8 +469,9 @@ class ExecutionEventProcessor:
                 cur.close()
                 return
             row = dict(row)
+            posted = posted_totals("grid_order_id", order_id)
             observed_previous = float(row.get("filled_quantity") or 0.0)
-            processed_previous = float(row.get("processed_fill_qty") or 0.0)
+            processed_previous = posted["quantity"]
             event_qty = max(0.0, float(event.get("quantity") or 0.0))
             cumulative = max(0.0, float(event.get("cumulative_quantity") or 0.0))
             total = (
@@ -413,12 +483,22 @@ class ExecutionEventProcessor:
             price = float(event.get("price") or row.get("price") or 0.0)
             observed_delta = max(0.0, total - observed_previous)
             delta = max(0.0, total - processed_previous)
+            if event.get("cumulative_average_price"):
+                delta, price = cumulative_delta(
+                    processed_previous, posted["average"], cumulative, event["cumulative_average_price"]
+                )
             avg = (
                 ((observed_previous * previous_avg) + (observed_delta * price)) / total
                 if total > 0 and observed_delta > 0
                 else previous_avg or price
             )
+            if cumulative >= observed_previous and event.get("cumulative_average_price"):
+                avg = event["cumulative_average_price"]
             status = str(event.get("order_status") or "")
+            if cumulative + 1e-12 < observed_previous:
+                return
+            if status not in {"filled", "cancelled"} and row.get("status") in {"filled", "cancelled"}:
+                status = row["status"]
             cur.execute(
                 """
                 UPDATE qd_grid_resting_orders
@@ -437,29 +517,39 @@ class ExecutionEventProcessor:
             )
             db.commit()
             cur.close()
-        if delta <= 1e-12 or price <= 0:
-            if self.repository.fee_components(int(event.get("id") or 0)):
-                self._apply_grid_trade_fee(
-                    event=event,
-                    binding=binding,
-                    grid_order_id=order_id,
-                )
-            return
         strategy_id = int(binding.get("strategy_id") or row.get("strategy_id") or 0)
         from app.services.grid.runner import get_runner
 
-        runner = get_runner(strategy_id)
+        runner = event.get("_runner") or get_runner(strategy_id)
         if not runner:
             return
         exchange_config = runner.exchange_config
-        client = create_client(exchange_config, market_type=str(event.get("market_type") or "swap"))
+        client = event.get("_client") or create_client(
+            exchange_config, market_type=str(event.get("market_type") or "swap")
+        )
         fees, commission_quote = self._fees(
             event,
             client=client,
             symbol=str(event.get("symbol") or row.get("symbol") or ""),
-            price=price,
+            price=price or float(event.get("cumulative_average_price") or 0),
         )
+        fees, commission_quote = self._incremental_fees(event, posted, delta, fees, commission_quote)
         commission, commission_ccy = self._fee_storage(fees)
+        if delta <= 1e-12:
+            if (
+                event.get("fees_cumulative")
+                and posted["quantity"] > 0
+                and event.get("fee_status") in {"actual", "actual_zero"}
+            ):
+                adjust_order_fee(
+                    "grid_order_id",
+                    order_id,
+                    fees,
+                    commission_quote,
+                    event.get("fee_status") or "pending",
+                    str(event.get("fee_source") or "websocket"),
+                )
+            return
         from app.services.grid.resting_orders_repo import GridRestingOrder
 
         order = GridRestingOrder.from_row(row)
@@ -471,7 +561,8 @@ class ExecutionEventProcessor:
             commission_ccy=commission_ccy,
             commission_quote=commission_quote,
             fee_status=str(event.get("fee_status") or "pending"),
-            fee_source="websocket",
+            fee_source=str(event.get("fee_source") or "websocket"),
+            fees_by_ccy=fees,
             exchange_fill_id=str(event.get("exchange_fill_id") or ""),
             execution_event_id=int(event.get("id") or 0),
         )
@@ -490,297 +581,155 @@ class ExecutionEventProcessor:
             cur.close()
 
     def _process_grid_market(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
-        """Enrich an already-recorded synchronous grid market fill.
+        from app.services.live_trading.records import apply_fill_to_local_position
+        from app.services.live_trading.leg_context import LegContext
 
-        The market quantity is written synchronously before the private event
-        is projected, so this path applies authoritative fees and identifiers
-        without posting the position or trade quantity a second time.
-        """
-        self._apply_grid_trade_fee(
-            event=event,
-            binding=binding,
-            trade_id=int(binding.get("owner_id") or 0),
+        strategy_id = int(binding.get("strategy_id") or 0)
+        trade_id = int(binding.get("owner_id") or 0)
+        sc = load_strategy_configs(strategy_id)
+        saved = dict(sc.get("exchange_config") or {})
+        saved.update(
+            credential_id=event.get("credential_id") or binding.get("credential_id") or saved.get("credential_id"),
+            exchange_id=event.get("exchange_id") or saved.get("exchange_id"),
         )
-
-    def _apply_grid_trade_fee(
-        self,
-        *,
-        event: Dict[str, Any],
-        binding: Dict[str, Any],
-        grid_order_id: int = 0,
-        trade_id: int = 0,
-    ) -> None:
-        event_id = int(event.get("id") or 0)
-        if event_id <= 0:
-            return
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute(
-                """
-                INSERT INTO qd_execution_owner_projections
-                    (execution_event_id, owner_type, owner_id)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (execution_event_id, owner_type, owner_id) DO NOTHING
-                RETURNING execution_event_id
-                """,
-                (
-                    event_id,
-                    str(binding.get("owner_type") or "grid"),
-                    int(binding.get("owner_id") or trade_id or grid_order_id),
-                ),
-            )
-            if not cur.fetchone():
-                db.commit()
+        cfg = resolve_exchange_config(saved, user_id=int(sc.get("user_id") or 1))
+        cfg = bind_instrument_product_contract(
+            cfg,
+            sc.get("trading_config") or {},
+            symbol=event.get("symbol") or "",
+            exchange_id=event.get("exchange_id") or "",
+            market_type=event.get("market_type") or "swap",
+        )
+        client = create_client(cfg, market_type=event.get("market_type") or "swap")
+        event = complete_snapshot(prepare_event(event, client, cfg))
+        with get_db_transaction():
+            lock_strategy_fills(strategy_id)
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("SELECT * FROM qd_strategy_trades WHERE id = %s FOR UPDATE", (trade_id,))
+                trade = cur.fetchone()
+                if not trade:
+                    raise RuntimeError("Grid market trade is not ready")
+                cur.execute(
+                    """INSERT INTO qd_execution_owner_projections
+                    (execution_event_id, owner_type, owner_id) VALUES (%s, 'grid_market', %s)
+                    ON CONFLICT DO NOTHING RETURNING execution_event_id""",
+                    (event["id"], trade_id),
+                )
+                if not cur.fetchone():
+                    cur.close()
+                    return
+                total = float(event.get("cumulative_quantity") or 0)
+                previous = float(trade.get("amount") or 0)
+                if total + 1e-12 < previous:
+                    cur.close()
+                    return
+                average = float(event["cumulative_average_price"])
+                delta, price = cumulative_delta(previous, float(trade.get("price") or 0), total, average)
+                native = self._json(trade.get("commission_breakdown"))
+                if not native and trade.get("commission_ccy") not in (None, "", "MIXED"):
+                    native = {trade["commission_ccy"]: float(trade.get("commission") or 0)}
+                posted = dict(quantity=previous, fees=native, quote=float(trade.get("commission_quote") or 0))
+                fees, quote = self._fees(event, client=client, symbol=event["symbol"], price=price or average)
+                fees, quote = self._incremental_fees(event, posted, delta, fees, quote)
+                if delta > 1e-12:
+                    signal = trade["type"]
+                    quantity = self._spot_position_quantity(
+                        market_type=event["market_type"],
+                        symbol=event["symbol"],
+                        signal_type=signal,
+                        gross_quantity=delta,
+                        fees=fees,
+                    )
+                    profit, _, _ = apply_fill_to_local_position(
+                        strategy_id=strategy_id,
+                        symbol=event["symbol"],
+                        signal_type=signal,
+                        filled=quantity,
+                        avg_price=price,
+                        leg=LegContext(
+                            market_type=event["market_type"], credential_id=int(trade.get("credential_id") or 0)
+                        ),
+                    )
+                    cur.execute(
+                        """UPDATE qd_strategy_trades SET amount = %s, price = %s, value = %s,
+                        profit = CASE WHEN %s IS NULL THEN profit ELSE COALESCE(profit, 0) + %s END
+                        WHERE id = %s""",
+                        (total, average, total * average, profit, profit, trade_id),
+                    )
+                if event.get("fee_status") in {"actual", "actual_zero"}:
+                    adjust_order_fee("id", trade_id, fees, quote, event["fee_status"], update_inventory=delta <= 1e-12)
                 cur.close()
-                return
-            if trade_id > 0:
-                cur.execute(
-                    "SELECT * FROM qd_strategy_trades WHERE id = %s FOR UPDATE",
-                    (int(trade_id),),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT *
-                    FROM qd_strategy_trades
-                    WHERE grid_order_id = %s
-                    ORDER BY id DESC LIMIT 1
-                    FOR UPDATE
-                    """,
-                    (int(grid_order_id),),
-                )
-            trade = cur.fetchone()
-            if not trade:
-                db.rollback()
-                cur.close()
-                raise RuntimeError("grid trade row is not ready for fee projection")
-            trade = dict(trade)
-
-            strategy_id = int(binding.get("strategy_id") or trade.get("strategy_id") or 0)
-            sc = load_strategy_configs(strategy_id)
-            exchange_config = resolve_exchange_config(
-                sc.get("exchange_config") or {},
-                user_id=int(sc.get("user_id") or trade.get("user_id") or 1),
-            )
-            market_type = str(event.get("market_type") or trade.get("market_type") or "swap")
-            exchange_config = bind_instrument_product_contract(
-                exchange_config,
-                sc.get("trading_config") if isinstance(sc.get("trading_config"), dict) else {},
-                symbol=str(event.get("symbol") or trade.get("symbol") or ""),
-                exchange_id=str(event.get("exchange_id") or exchange_config.get("exchange_id") or ""),
-                market_type=market_type,
-            )
-            client = create_client(exchange_config, market_type=market_type)
-            fees, commission_quote = self._fees(
-                event,
-                client=client,
-                symbol=str(event.get("symbol") or trade.get("symbol") or ""),
-                price=float(event.get("price") or trade.get("price") or 0.0),
-            )
-            commission, commission_ccy = self._fee_storage(fees)
-            existing_status = str(trade.get("fee_status") or "")
-            existing_source = str(trade.get("fee_source") or "")
-            existing_commission = float(trade.get("commission") or 0.0)
-            rest_is_authoritative = (
-                existing_status in {"actual", "actual_zero"}
-                and existing_source not in {"", "websocket"}
-                and (abs(existing_commission) > 1e-18 or existing_status == "actual_zero")
-            )
-            append = existing_source == "websocket" and not rest_is_authoritative
-            if fees and not rest_is_authoritative:
-                cur.execute(
-                    """
-                    UPDATE qd_strategy_trades
-                    SET commission = CASE
-                            WHEN %s THEN COALESCE(commission, 0) + %s
-                            ELSE %s
-                        END,
-                        commission_ccy = CASE
-                            WHEN %s AND COALESCE(commission_ccy, '') NOT IN ('', %s)
-                                THEN 'MIXED'
-                            ELSE %s
-                        END,
-                        commission_quote = CASE
-                            WHEN %s THEN COALESCE(commission_quote, 0) + COALESCE(%s, 0)
-                            ELSE %s
-                        END,
-                        fee_status = %s,
-                        fee_source = 'websocket',
-                        execution_event_id = CASE
-                            WHEN COALESCE(execution_event_id, 0) = 0 THEN %s
-                            ELSE execution_event_id
-                        END,
-                        exchange_fill_id = COALESCE(NULLIF(%s, ''), exchange_fill_id)
-                    WHERE id = %s
-                    """,
-                    (
-                        append,
-                        commission,
-                        commission,
-                        append,
-                        commission_ccy,
-                        commission_ccy,
-                        append,
-                        commission_quote,
-                        commission_quote,
-                        str(event.get("fee_status") or "actual"),
-                        event_id,
-                        str(event.get("exchange_fill_id") or ""),
-                        int(trade.get("id") or 0),
-                    ),
-                )
-            elif str(event.get("fee_status") or "") == "actual_zero" and not rest_is_authoritative:
-                cur.execute(
-                    """
-                    UPDATE qd_strategy_trades
-                    SET fee_status = 'actual_zero',
-                        fee_source = 'websocket',
-                        execution_event_id = CASE
-                            WHEN COALESCE(execution_event_id, 0) = 0 THEN %s
-                            ELSE execution_event_id
-                        END,
-                        exchange_fill_id = COALESCE(NULLIF(%s, ''), exchange_fill_id)
-                    WHERE id = %s
-                    """,
-                    (
-                        event_id,
-                        str(event.get("exchange_fill_id") or ""),
-                        int(trade.get("id") or 0),
-                    ),
-                )
-            cur.execute(
-                """
-                UPDATE qd_live_order_bindings
-                SET observed_filled = GREATEST(observed_filled, %s),
-                    exchange_order_id = COALESCE(NULLIF(%s, ''), exchange_order_id),
-                    status = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                """,
-                (
-                    float(event.get("cumulative_quantity") or event.get("quantity") or 0.0),
-                    str(event.get("exchange_order_id") or ""),
-                    str(event.get("order_status") or "filled"),
-                    int(binding.get("id") or 0),
-                ),
-            )
-            db.commit()
-            cur.close()
 
     def _process_quick_trade(self, event: Dict[str, Any], binding: Dict[str, Any]) -> None:
         trade_id = int(binding.get("owner_id") or 0)
         event_id = int(event.get("id") or 0)
-        fees = self.repository.fee_components(event_id)
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute(
-                """
-                INSERT INTO qd_execution_owner_projections
-                    (execution_event_id, owner_type, owner_id)
-                VALUES (%s, 'quick_trade', %s)
-                ON CONFLICT (execution_event_id, owner_type, owner_id) DO NOTHING
-                RETURNING execution_event_id
-                """,
-                (event_id, trade_id),
-            )
-            if not cur.fetchone():
-                db.commit()
+        config = resolve_exchange_config(
+            {"credential_id": event.get("credential_id"), "exchange_id": event.get("exchange_id")},
+            user_id=int(event.get("user_id") or 1),
+        )
+        config = bind_instrument_product_contract(
+            config,
+            {},
+            symbol=event.get("symbol") or "",
+            exchange_id=event.get("exchange_id") or "",
+            market_type=event.get("market_type") or "spot",
+        )
+        client = create_client(config, market_type=event.get("market_type") or "spot")
+        event = complete_snapshot(prepare_event(event, client, config))
+        with get_db_transaction():
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("SELECT * FROM qd_quick_trades WHERE id = %s FOR UPDATE", (trade_id,))
+                current = cur.fetchone()
+                if not current:
+                    raise RuntimeError("Quick trade is not ready for execution projection")
+                cur.execute(
+                    """INSERT INTO qd_execution_owner_projections
+                    (execution_event_id, owner_type, owner_id) VALUES (%s, 'quick_trade', %s)
+                    ON CONFLICT DO NOTHING RETURNING execution_event_id""",
+                    (event_id, trade_id),
+                )
+                if not cur.fetchone():
+                    cur.close()
+                    return
+                previous = float(current.get("filled_amount") or 0)
+                total = float(event.get("cumulative_quantity") or 0)
+                if total < previous:
+                    cur.close()
+                    return
+                average = float(event["cumulative_average_price"])
+                delta, price = cumulative_delta(previous, float(current.get("avg_fill_price") or 0), total, average)
+                raw = self._json(current.get("raw_result"))
+                old_fees = raw.get("_qd_fees") or {}
+                if not old_fees and current.get("commission_ccy") not in (None, "", "MIXED"):
+                    old_fees = {current["commission_ccy"]: float(current.get("commission") or 0)}
+                posted = dict(quantity=previous, fees=old_fees, quote=float(current.get("commission_quote") or 0))
+                fees, quote = self._fees(event, client=client, symbol=event["symbol"], price=price or average)
+                fees, quote = self._incremental_fees(event, posted, delta, fees, quote)
+                merged = dict(old_fees)
+                for currency, amount in fees.items():
+                    merged[currency] = float(merged.get(currency) or 0) + amount
+                commission, currency = self._fee_storage(merged)
+                raw["_qd_fees"] = merged
+                cur.execute(
+                    """UPDATE qd_quick_trades SET filled_amount = %s, avg_fill_price = %s,
+                    commission = %s, commission_ccy = %s, commission_quote = %s,
+                    raw_result = %s::jsonb, status = CASE WHEN %s IN ('filled', 'cancelled') THEN %s ELSE status END
+                    WHERE id = %s""",
+                    (
+                        total,
+                        average,
+                        commission,
+                        currency,
+                        posted["quote"] + quote if quote is not None else current.get("commission_quote"),
+                        json.dumps(raw),
+                        event.get("order_status"),
+                        event.get("order_status"),
+                        trade_id,
+                    ),
+                )
                 cur.close()
-                return
-            cur.execute("SELECT * FROM qd_quick_trades WHERE id = %s FOR UPDATE", (trade_id,))
-            current = cur.fetchone()
-            if not current:
-                db.rollback()
-                cur.close()
-                return
-            current = dict(current)
-            previous = float(current.get("filled_amount") or 0.0)
-            event_qty = max(0.0, float(event.get("quantity") or 0.0))
-            cumulative = max(0.0, float(event.get("cumulative_quantity") or 0.0))
-            if bool(event.get("is_cumulative")) or cumulative > 0:
-                total = max(previous, cumulative)
-            elif (
-                str(event.get("order_status") or "") == "filled"
-                and str(current.get("status") or "") == "filled"
-                and previous > 0
-            ):
-                # The synchronous REST result already captured the final fill.
-                # Non-cumulative private events for the same completed order
-                # enrich its fees but must not add the quantity again.
-                total = previous
-            else:
-                total = previous + event_qty
-            delta = max(0.0, total - previous)
-            price = float(event.get("price") or 0.0)
-            previous_avg = float(current.get("avg_fill_price") or 0.0)
-            avg = (
-                ((previous * previous_avg) + (delta * price)) / total
-                if total > 0 and delta > 0 and price > 0
-                else previous_avg or price
-            )
-
-            # REST enrichment may already have persisted the exchange's actual
-            # commission.  In that case the same private-stream fill must not
-            # add it a second time.  An empty currency means the REST result
-            # did not provide a usable fee and WS remains authoritative.
-            existing_fee_actual = bool(str(current.get("commission_ccy") or "").strip())
-            commission = 0.0
-            commission_ccy = str(current.get("commission_ccy") or "")
-            commission_quote = current.get("commission_quote")
-            if fees and not existing_fee_actual:
-                by_ccy: Dict[str, float] = {}
-                quote_total = 0.0
-                quote_known = True
-                for fee in fees:
-                    ccy = str(fee.get("currency") or "").upper()
-                    by_ccy[ccy] = by_ccy.get(ccy, 0.0) + float(fee.get("amount") or 0.0)
-                    if fee.get("quote_amount") is None:
-                        quote_known = False
-                    else:
-                        quote_total += float(fee.get("quote_amount") or 0.0)
-                if len(by_ccy) == 1:
-                    commission_ccy, commission = next(iter(by_ccy.items()))
-                elif by_ccy:
-                    commission_ccy = "MIXED"
-                commission_quote = quote_total if quote_known else None
-            cur.execute(
-                """
-                UPDATE qd_quick_trades
-                SET filled_amount = GREATEST(COALESCE(filled_amount, 0), %s),
-                    avg_fill_price = CASE WHEN %s > 0 THEN %s ELSE avg_fill_price END,
-                    commission = CASE
-                        WHEN %s THEN COALESCE(commission, 0)
-                        ELSE COALESCE(commission, 0) + %s
-                    END,
-                    commission_ccy = CASE
-                        WHEN %s THEN commission_ccy
-                        ELSE %s
-                    END,
-                    commission_quote = CASE
-                        WHEN %s THEN commission_quote
-                        WHEN %s IS NULL THEN commission_quote
-                        ELSE COALESCE(commission_quote, 0) + %s
-                    END,
-                    status = CASE WHEN %s = 'filled' THEN 'filled' ELSE status END
-                WHERE id = %s
-                """,
-                (
-                    total,
-                    avg,
-                    avg,
-                    existing_fee_actual,
-                    commission,
-                    existing_fee_actual,
-                    commission_ccy,
-                    existing_fee_actual,
-                    commission_quote,
-                    commission_quote,
-                    str(event.get("order_status") or ""),
-                    trade_id,
-                ),
-            )
-            db.commit()
-            cur.close()
 
     @staticmethod
     def _json(value: Any) -> Dict[str, Any]:

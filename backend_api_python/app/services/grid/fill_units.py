@@ -26,7 +26,8 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
-from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient, to_gate_currency_pair
+from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient, to_gate_currency_pair
+from app.services.live_trading.fill_accounting import contract_multiplier
 from app.services.live_trading.gate_spot_fill import parse_gate_spot_fill
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
@@ -47,14 +48,7 @@ def _okx_ct_val(client: OkxClient, symbol: str, market_type: str) -> float:
     mt = str(market_type or "swap").strip().lower()
     if mt == "spot":
         return 1.0
-    try:
-        inst_id = to_okx_swap_inst_id(str(symbol))
-        inst = client.get_instrument(inst_type="SWAP", inst_id=inst_id) or {}
-        ct = _float(inst.get("ctVal"))
-        return ct if ct > 0 else 1.0
-    except Exception as e:
-        logger.debug("okx ctVal lookup failed symbol=%s: %s", symbol, e)
-        return 1.0
+    return contract_multiplier(client, "okx", symbol)
 
 
 def okx_swap_position_base_size(
@@ -78,44 +72,11 @@ def okx_swap_position_base_size(
 
 
 def _gate_quanto_multiplier(client: GateUsdtFuturesClient, symbol: str) -> float:
-    try:
-        contract = to_gate_currency_pair(str(symbol))
-        meta = client.get_contract(contract=contract) or {}
-        qm = _float(meta.get("quanto_multiplier") or meta.get("quantoMultiplier"))
-        return qm if qm > 0 else 1.0
-    except Exception as e:
-        logger.debug("gate quanto_multiplier lookup failed symbol=%s: %s", symbol, e)
-        return 1.0
+    return contract_multiplier(client, "gate", symbol)
 
 
 def _htx_contract_size(client: HtxClient, symbol: str) -> float:
-    try:
-        info = client.get_contract_info(symbol=str(symbol)) or {}
-        cs = _float(info.get("contract_size") or info.get("contractSize"))
-        return cs if cs > 0 else 1.0
-    except Exception as e:
-        logger.debug("htx contract_size lookup failed symbol=%s: %s", symbol, e)
-        return 1.0
-
-
-def _bitget_contract_size(
-    client: BitgetMixClient,
-    symbol: str,
-    exchange_config: Optional[Dict[str, Any]],
-) -> float:
-    ex_cfg = exchange_config if isinstance(exchange_config, dict) else {}
-    product_type = str(ex_cfg.get("product_type") or ex_cfg.get("productType") or "USDT-FUTURES")
-    try:
-        contract = client.get_contract(symbol=str(symbol), product_type=product_type) or {}
-        cs = _float(
-            contract.get("contractSize")
-            or contract.get("contractSz")
-            or contract.get("ctVal")
-        )
-        return cs if cs > 0 else 1.0
-    except Exception as e:
-        logger.debug("bitget contractSize lookup failed symbol=%s: %s", symbol, e)
-        return 1.0
+    return contract_multiplier(client, "htx", symbol)
 
 
 def extract_grid_fill_base_qty(
@@ -145,13 +106,7 @@ def extract_grid_fill_base_qty(
         base_vol = _float(data.get("baseVolume"))
         if base_vol > 0:
             return base_vol
-        # Fallback: some responses only expose contract fillSize.
-        fill_sz = _float(data.get("fillSize") or data.get("filledQty"))
-        if fill_sz > 0 and mt == "swap":
-            cs = _bitget_contract_size(client, symbol, ex_cfg)
-            if cs != 1.0:
-                return fill_sz * cs
-        return _float(data.get("filled") or data.get("filledQty") or fill_sz)
+        return _float(data.get('filled') or data.get('filledQty'))
 
     if isinstance(client, BitgetSpotClient):
         return _float(data.get("baseVolume") or data.get("dealSize") or data.get("filled"))
@@ -163,7 +118,7 @@ def extract_grid_fill_base_qty(
         return contracts * _okx_ct_val(client, symbol, mt)
 
     if isinstance(client, GateUsdtFuturesClient):
-        contracts = _float(data.get("filled_size") or data.get("filledSize"))
+        contracts = abs(_float(data.get("filled_size") or data.get("filledSize")))
         if contracts <= 0:
             size = abs(_float(data.get("size")))
             left = abs(_float(data.get("left")))
@@ -172,6 +127,9 @@ def extract_grid_fill_base_qty(
         if contracts <= 0:
             return 0.0
         return abs(contracts) * _gate_quanto_multiplier(client, symbol)
+
+    if isinstance(client, GateStockClient):
+        return _float(data.get("fill_volume"))
 
     if isinstance(client, GateSpotClient):
         return parse_gate_spot_fill(data)[0]
@@ -182,7 +140,6 @@ def extract_grid_fill_base_qty(
         contracts = _float(
             data.get("trade_volume")
             or data.get("tradeVolume")
-            or data.get("volume")
         )
         if contracts <= 0:
             return 0.0
@@ -213,7 +170,8 @@ def extract_grid_fill_avg_price(
         return 0.0
 
     if isinstance(client, (BinanceFuturesClient, BinanceSpotClient)):
-        return _float(data.get("avgPrice"))
+        quote = _float(data.get("cummulativeQuoteQty") or data.get("cumQuote"))
+        return quote / filled_base if quote > 0 and filled_base > 0 else _float(data.get("avgPrice"))
 
     if isinstance(client, BybitClient):
         return _float(data.get("avgPrice"))
@@ -224,21 +182,26 @@ def extract_grid_fill_avg_price(
     if isinstance(client, OkxClient):
         return _float(data.get("avgPx") or data.get("fillPx"))
 
+    if isinstance(client, GateStockClient):
+        return _float(data.get("avg_fill_price"))
+
     if isinstance(client, GateSpotClient):
         return parse_gate_spot_fill(data)[1]
 
     if isinstance(client, (GateUsdtFuturesClient,)):
-        return _float(data.get("fill_price") or data.get("fillPrice") or data.get("price"))
+        return _float(data.get("fill_price") or data.get("fillPrice"))
 
     if isinstance(client, HtxClient):
+        cash = _float(data.get("field-cash-amount"))
+        if cash > 0 and filled_base > 0:
+            return cash / filled_base
         avg = _float(data.get("trade_avg_price") or data.get("tradeAvgPrice"))
         if avg > 0:
             return avg
         turnover = _float(data.get("trade_turnover") or data.get("tradeTurnover"))
-        vol = _float(data.get("trade_volume") or data.get("tradeVolume"))
-        if turnover > 0 and vol > 0:
-            return turnover / vol
-        return _float(data.get("price"))
+        if turnover > 0 and filled_base > 0:
+            return turnover / filled_base
+        return 0.0
 
     if client is None and "filled_amount" in data:
         return parse_gate_spot_fill(data)[1]
@@ -264,12 +227,15 @@ def order_status_from_data(data: Dict[str, Any]) -> str:
     if not data:
         return "unknown"
     st_raw = str(
-        data.get("state")
+        data.get("status_desc")
+        or data.get("state")
         or data.get("status")
         or data.get("orderStatus")
         or data.get("order_status")
         or ""
     ).lower()
+    if st_raw in {"closed", "finished"} and str(data.get("finish_as") or "").lower() in {"cancelled", "canceled", "ioc", "stp", "reduce_only"}:
+        return "cancelled"
     if st_raw in ("filled", "full_fill", "full-fill", "fullfill", "success", "done", "closed", "finished"):
         return "filled"
     if st_raw in ("canceled", "cancelled", "expired", "rejected", "deactivated"):

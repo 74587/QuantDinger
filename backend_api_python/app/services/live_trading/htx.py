@@ -548,9 +548,9 @@ class HtxClient(BaseRestClient):
         if req <= 0:
             return 0
         info = self.get_contract_info(symbol=symbol) or {}
-        contract_size = self._to_dec(info.get("contract_size") or info.get("contractSize") or "1")
+        contract_size = self._to_dec(info.get("contract_size") or info.get("contractSize") or "0")
         if contract_size <= 0:
-            contract_size = Decimal("1")
+            raise LiveTradingError("strategyRuntime.fillContractMetadataUnavailable")
         contracts = req / contract_size
         val = self._floor_to_int(contracts)
         return val if val > 0 else 0
@@ -1039,6 +1039,8 @@ class HtxClient(BaseRestClient):
             # Prefer per-match rows over an order-level aggregate to avoid double-counting.
             return nested_rows or [value]
 
+        if isinstance(data, dict) and int(data.get("total_page") or 1) > 1:
+            raise LiveTradingError("strategyRuntime.fillSnapshotNotReady")
         rows = _fee_rows(data)
 
         fees: Dict[str, float] = {}
@@ -1060,18 +1062,20 @@ class HtxClient(BaseRestClient):
                 or default_ccy
             )
             try:
-                fee = abs(float(fee_value or 0.0))
+                fee = float(fee_value or 0.0)
+                if "filled-fees" not in row:
+                    fee = -fee
             except (TypeError, ValueError):
                 fee = 0.0
-            if fee <= 0:
+            if fee == 0:
                 # HTX spot may deduct points or HT instead of the received asset.
                 try:
-                    fee = abs(float(row.get("filled-points") or 0.0))
+                    fee = float(row.get("filled-points") or 0.0)
                 except (TypeError, ValueError):
                     fee = 0.0
-                if fee > 0:
+                if fee != 0:
                     fee_currency = row.get("fee-deduct-currency") or "POINT"
-            if fee <= 0:
+            if fee == 0:
                 continue
             key = str(fee_currency or "").strip().upper() or "UNKNOWN"
             fees[key] = fees.get(key, 0.0) + fee
@@ -1090,13 +1094,8 @@ class HtxClient(BaseRestClient):
         last: Dict[str, Any] = {}
         contract_size = 1.0
         if self.market_type != "spot":
-            try:
-                info = self.get_contract_info(symbol=str(symbol)) or {}
-                cs = float(info.get("contract_size") or info.get("contractSize") or 0.0)
-                if cs > 0:
-                    contract_size = cs
-            except Exception:
-                contract_size = 1.0
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            contract_size = contract_multiplier(self, "htx", symbol)
 
         while True:
             timed_out = time.time() >= end_ts
@@ -1161,11 +1160,13 @@ class HtxClient(BaseRestClient):
             except Exception:
                 avg_price = 0.0
             try:
-                fee = abs(float(last.get("fee") or last.get("trade_fee") or 0.0))
+                fee = float(last.get("filled-fees") or last.get("fee") or last.get("trade_fee") or 0.0)
+                if self.market_type != "spot":
+                    fee = -fee
             except Exception:
                 fee = 0.0
             fee_ccy = str(last.get("fee_asset") or last.get("fee_currency") or fee_ccy or "").strip() or "USDT"
-            if fee > 0:
+            if fee != 0:
                 fees_by_ccy = {fee_ccy.upper(): fee}
             if filled > 0:
                 try:
@@ -1178,7 +1179,7 @@ class HtxClient(BaseRestClient):
                         match_raw,
                         default_ccy="USDT" if self.market_type != "spot" else "",
                     )
-                    if match_fees:
+                    if match_fees and not fees_by_ccy:
                         fees_by_ccy = match_fees
                         fee = sum(match_fees.values())
                         fee_ccy = next(iter(match_fees)) if len(match_fees) == 1 else "MIXED"
@@ -1186,7 +1187,7 @@ class HtxClient(BaseRestClient):
                     logger.debug("HTX match fee query failed for order %s: %s", order_id, exc)
 
             if filled > 0 and avg_price > 0:
-                if fee <= 0 and not timed_out:
+                if fee == 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
                 return {
@@ -1201,7 +1202,7 @@ class HtxClient(BaseRestClient):
             if str(status).lower() in (
                 "filled", "partial-filled", "partial_filled", "canceled", "cancelled", "6", "7", "3", "4"
             ):
-                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                if fee == 0 and filled > 0 and avg_price > 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
                 return {

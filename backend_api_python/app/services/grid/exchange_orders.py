@@ -13,7 +13,7 @@ from app.services.live_trading.binance_spot import BinanceSpotClient
 from app.services.live_trading.bitget import BitgetMixClient
 from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
-from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient, to_gate_currency_pair
+from app.services.live_trading.gate import GateSpotClient, GateStockClient, GateUsdtFuturesClient, to_gate_currency_pair
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.symbols import to_okx_spot_inst_id, to_okx_swap_inst_id
@@ -458,6 +458,17 @@ def wait_grid_market_fill(
     coid = str(client_order_id or "")
 
     try:
+        if isinstance(client, OkxClient):
+            q = client.wait_for_fill(symbol=str(symbol), ord_id=ex_oid, cl_ord_id=coid,
+                market_type=mt, max_wait_sec=max_wait_sec)
+            if details is not None:
+                details.update(q)
+            return float(q.get('filled') or 0), float(q.get('avg_price') or 0)
+        if isinstance(client, GateStockClient):
+            q = client.wait_for_fill(symbol=str(symbol), order_id=ex_oid, max_wait_sec=max_wait_sec)
+            if details is not None:
+                details.update(q)
+            return float(q.get('filled') or 0), float(q.get('avg_price') or 0)
         if isinstance(client, BitgetMixClient) and hasattr(client, "wait_for_fill"):
             product_type = str(ex_cfg.get("product_type") or ex_cfg.get("productType") or "USDT-FUTURES")
             q = client.wait_for_fill(
@@ -741,16 +752,6 @@ def _extract_order_id_from_payload(data: Dict[str, Any], fallback: str = "") -> 
     return str(fallback or "")
 
 
-def _bitget_contract_size(client: BitgetMixClient, symbol: str, exchange_config: Dict[str, Any]) -> float:
-    product_type = str(exchange_config.get("product_type") or exchange_config.get("productType") or "USDT-FUTURES")
-    try:
-        contract = client.get_contract(symbol=str(symbol), product_type=product_type) or {}
-        ct = _float(contract.get("contractSize") or contract.get("contractSz") or contract.get("ctVal"))
-        return ct if ct > 0 else 1.0
-    except Exception:
-        return 1.0
-
-
 def _unwrap_bitget_fills(raw: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw, dict):
         return []
@@ -797,7 +798,6 @@ def _aggregate_bitget_grid_fills(
     mt = str(market_type or "swap").strip().lower()
     if mt in ("futures", "future", "perp", "perpetual"):
         mt = "swap"
-    ct = _bitget_contract_size(client, symbol, exchange_config) if isinstance(client, BitgetMixClient) else 1.0
 
     total_base = 0.0
     total_quote = 0.0
@@ -808,9 +808,6 @@ def _aggregate_bitget_grid_fills(
             amount = _float(f.get("amount") or f.get("quoteVolume"))
         else:
             qty = _float(f.get("baseVolume"))
-            if qty <= 0:
-                contracts = _float(f.get("size") or f.get("fillSize") or f.get("filledQty"))
-                qty = contracts * ct if contracts > 0 and mt == "swap" else contracts
             px = _float(f.get("fillPrice") or f.get("priceAvg") or f.get("price"))
             amount = _float(f.get("quoteVolume") or f.get("amount"))
         if qty <= 0:
@@ -823,7 +820,7 @@ def _aggregate_bitget_grid_fills(
     if total_base <= 0:
         return 0.0, 0.0, "unknown"
     avg = total_quote / total_base if total_quote > 0 else 0.0
-    return total_base, avg, "filled"
+    return total_base, avg, "partial"
 
 
 def _parse_grid_order_fill(data: Dict[str, Any]) -> Tuple[float, float, str]:
@@ -882,6 +879,8 @@ def _fetch_grid_client_order(
     mt = str(market_type or "swap").strip().lower()
     oid = str(exchange_order_id or "")
     coid = str(client_order_id or "")
+    if isinstance(client, GateStockClient):
+        return client.get_order(order_id=oid, symbol=str(symbol))
     if isinstance(client, OkxClient):
         inst_id = to_okx_spot_inst_id(symbol) if mt == "spot" else to_okx_swap_inst_id(symbol)
         return client.get_order(inst_id=inst_id, ord_id=oid, cl_ord_id=coid)

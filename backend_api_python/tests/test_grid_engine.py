@@ -580,7 +580,8 @@ def test_grid_shutdown_releases_cancelled_cell_states(monkeypatch):
     ]
 
 
-def test_initial_market_recovers_from_exchange_without_new_order(monkeypatch):
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_initial_market_requires_its_order_fill_without_new_order(monkeypatch, confirmed):
     from app.services.grid.engine import GridEngine
 
     tc = {
@@ -617,10 +618,12 @@ def test_initial_market_recovers_from_exchange_without_new_order(monkeypatch):
     target = engine._target_initial_base_qty(72710.0)
     monkeypatch.setattr("app.services.grid.engine.GridEngine._leg_position_qty", lambda self, side: target)
 
+    monkeypatch.setattr("app.services.grid.engine.wait_grid_market_fill",
+                        lambda *a, **kw: (target, 72600.0) if confirmed else (0, 0))
     ok = engine.run_initial_market_position(72710.0)
-    assert ok is True
-    assert engine._initial_done is True
-    assert recorded["calls"] == 1
+    assert ok is confirmed
+    assert engine._initial_done is confirmed
+    assert recorded["calls"] == int(confirmed)
 
 
 def test_sync_exit_coverage_places_long_exit_for_uncovered_position(monkeypatch):
@@ -1264,9 +1267,9 @@ def test_run_initial_market_stops_when_okx_net_position_exists(monkeypatch):
     monkeypatch.setattr("app.services.grid.engine.GridEngine._leg_position_qty", lambda self, side: target)
 
     ok = engine.run_initial_market_position(679.0)
-    assert ok is True
-    assert engine._initial_done is True
-    assert recorded["calls"] == 1
+    assert ok is False
+    assert engine._initial_done is False
+    assert recorded["calls"] == 0
     assert recorded["market"] == 0
 
 
@@ -1414,6 +1417,7 @@ def test_on_order_filled_long_entry_marks_held_even_if_exit_hangs(monkeypatch):
     class FakeCells:
         def update_state(self, *args, **kwargs):
             updates.append(kwargs)
+            return True
 
     cell = GridCellSpec(index=1, lower_price=691.4, upper_price=691.5)
     order = GridRestingOrder(
@@ -1471,6 +1475,7 @@ def test_on_order_filled_long_exit_rehangs_entry_immediately(monkeypatch):
     class FakeCells:
         def update_state(self, *args, **kwargs):
             state["value"] = kwargs["state"]
+            return True
 
     cell = GridCellSpec(index=1, lower_price=691.4, upper_price=691.5)
     order = GridRestingOrder(
@@ -1555,6 +1560,7 @@ def test_on_order_filled_short_exit_rehangs_entry_immediately(monkeypatch):
     class FakeCells:
         def update_state(self, *args, **kwargs):
             state["value"] = kwargs["state"]
+            return True
 
     cell = GridCellSpec(index=1, lower_price=691.4, upper_price=691.5)
     order = GridRestingOrder(
@@ -1715,7 +1721,11 @@ def test_grid_fill_ledger_failure_is_not_silently_marked_processed(monkeypatch):
 def test_grid_market_fill_ledger_failure_is_not_silently_accepted(monkeypatch):
     from app.services.grid import fill_handler
 
-    monkeypatch.setattr(fill_handler, "resolve_leg_context", lambda **kwargs: None)
+    from contextlib import nullcontext
+    from app.services.live_trading.leg_context import LegContext
+    monkeypatch.setattr('app.utils.db.get_db_transaction', nullcontext)
+    monkeypatch.setattr('app.services.live_trading.fill_accounting.lock_strategy_fills', lambda *a: None)
+    monkeypatch.setattr(fill_handler, "resolve_leg_context", lambda **kwargs: LegContext())
     monkeypatch.setattr(
         fill_handler,
         "apply_fill_to_local_position",

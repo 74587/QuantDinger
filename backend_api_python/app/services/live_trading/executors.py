@@ -186,12 +186,14 @@ class LimitThenMarketExecutor:
                     "limit_fill": dict((fill.raw if fill else {}) or {}),
                     "limit_summary": {
                         "exchange_order_id": str(result.exchange_order_id or ""),
+                        "fees_by_ccy": dict((fill.fees_by_ccy if fill else {}) or {}),
                         "filled_qty": limit_filled,
                         "avg_price": limit_avg,
                     },
                     "market": dict(market.raw or {}),
                     "market_summary": {
                         "exchange_order_id": str(market.exchange_order_id or ""),
+                        "fees_by_ccy": dict(market.fees_by_ccy or {}),
                         "filled_qty": float(market.filled_qty or 0.0),
                         "avg_price": market_avg,
                     },
@@ -253,11 +255,9 @@ def _merge_fee_breakdowns(*items: Dict[str, float]) -> Dict[str, float]:
     for item in items:
         for currency, amount in (item or {}).items():
             try:
-                fee = abs(float(amount or 0.0))
+                fee = float(amount or 0.0)
             except (TypeError, ValueError):
                 fee = 0.0
-            if fee <= 0:
-                continue
             key = str(currency or "").strip().upper() or "UNKNOWN"
             merged[key] = merged.get(key, 0.0) + fee
     return merged

@@ -1120,14 +1120,9 @@ def _fetch_exchange_positions_raw(
             except Exception:
                 vol = 0.0
             if abs(vol) > 1e-12 and cc:
-                try:
-                    info = client.get_contract_info(symbol=symbol or cc) or {}
-                    cs = float(info.get("contract_size") or 1)
-                    if cs <= 0:
-                        cs = 1.0
-                    q["positionAmt"] = abs(vol) * cs
-                except Exception:
-                    pass
+                from app.services.live_trading.fill_accounting import contract_multiplier
+                cs = contract_multiplier(client, 'htx', cc.replace('-', '/'))
+                q['positionAmt'] = abs(vol) * cs
             out_items.append(q)
         logger.info("HTX positions for %s: %d items, sizes=%s", symbol, len(out_items),
                      [(p.get("contract_code"), p.get("volume"), p.get("positionAmt")) for p in out_items])

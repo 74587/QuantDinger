@@ -236,9 +236,10 @@ class OkxClient(BaseRestClient):
 
         # Convert base qty -> contracts for swaps if ctVal is provided.
         if mt != "spot":
-            ct_val = self._to_dec((inst or {}).get("ctVal") or "0")
-            if ct_val > 0:
-                req = req / ct_val
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            canonical_symbol = iid.replace("-SWAP", "").replace("-", "/")
+            ct_val = Decimal(str(contract_multiplier(self, "okx", canonical_symbol)))
+            req = req / ct_val
 
         # Align to lot size step.
         if lot_sz > 0:
@@ -810,14 +811,8 @@ class OkxClient(BaseRestClient):
         inst_id = to_okx_spot_inst_id(symbol) if mt == "spot" else to_okx_swap_inst_id(symbol)
         ct_val = Decimal("0")
         if mt != "spot":
-            try:
-                inst = self.get_instrument(inst_type="SWAP", inst_id=inst_id) or {}
-                ct_val = self._to_dec(inst.get("ctVal") or "0")
-            except Exception:
-                ct_val = Decimal("0")
-            if ct_val <= 0:
-                # Fallback: keep quantities unchanged if ctVal is unavailable (best-effort).
-                ct_val = Decimal("1")
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            ct_val = Decimal(str(contract_multiplier(self, "okx", symbol)))
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last_order: Dict[str, Any] = {}
         last_fills: Dict[str, Any] = {}
@@ -847,6 +842,13 @@ class OkxClient(BaseRestClient):
                 filled = float(filled_base_dec or 0)
             except Exception:
                 filled = 0.0
+
+            if filled > 0 and avg_price > 0 and last_order.get('fee') not in (None, '') and last_order.get('feeCcy'):
+                fee = -float(last_order['fee'])
+                currency = str(last_order['feeCcy']).upper()
+                return dict(filled=filled, avg_price=avg_price, fee=fee, fee_ccy=currency,
+                    fees_by_ccy={currency: fee}, fee_status='actual' if fee else 'actual_zero',
+                    state=state, order=last_order, filled_unit='base')
 
             # Prefer fills endpoint for fee (and more reliable avg/filled aggregation).
             try:
@@ -879,9 +881,9 @@ class OkxClient(BaseRestClient):
                                 total_base += sz_base
                                 total_quote += sz_base * px
                                 got_any_fill = True
-                            if fee != 0.0:
-                                # OKX fees are often negative for costs; store absolute cost.
-                                abs_fee = abs(float(fee))
+                            if fee_v is not None and ccy:
+                                # OKX debits are negative and rebates are positive.
+                                abs_fee = -float(fee)
                                 total_fee += abs_fee
                                 if (not fee_ccy) and ccy:
                                     fee_ccy = ccy
@@ -892,7 +894,7 @@ class OkxClient(BaseRestClient):
                 # If fills are present, they are the best source of fee/avg aggregation.
                 # However, OKX may lag in exposing fills right after an order is filled.
                 # To avoid losing commission, do not fall back early when we haven't seen any fills yet.
-                if got_any_fill and total_base > 0 and total_quote > 0:
+                if got_any_fill and total_base > 0 and total_quote > 0 and float(total_base) + 1e-12 >= filled:
                     return {
                         "filled": float(total_base),
                         "avg_price": float(total_quote / total_base),

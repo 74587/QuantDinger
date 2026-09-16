@@ -670,7 +670,7 @@ class BinanceSpotClient(BaseRestClient):
                     fee = 0.0
                 ccy = str(t.get("commissionAsset") or "").strip()
                 if fee != 0.0:
-                    total_fee += abs(float(fee))
+                    total_fee += float(fee)
                     if (not fee_ccy) and ccy:
                         fee_ccy = ccy
             if total_fee > 0 or attempt >= max_retries - 1:

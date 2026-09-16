@@ -61,3 +61,20 @@ def test_explicit_nested_rollback_prevents_commit(connection):
             with db.get_pg_connection() as helper:
                 helper.rollback()
     assert connection.commits == 0
+
+
+def test_external_action_runs_only_after_commit_and_context_reset(connection):
+    observations = []
+    with db.get_pg_transaction():
+        db.run_after_commit(lambda: observations.append((connection.commits, db._active_transaction.get())))
+        assert observations == []
+    assert observations == [(1, None)]
+
+
+def test_rolled_back_fill_does_not_submit_followup_order(connection):
+    orders = []
+    with pytest.raises(RuntimeError):
+        with db.get_pg_transaction():
+            db.run_after_commit(orders.append, 'exit')
+            raise RuntimeError('injected fill failure')
+    assert orders == []

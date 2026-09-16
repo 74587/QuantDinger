@@ -290,7 +290,7 @@ def test_htx_spot_and_swap_fees_are_parsed():
                 "direction": "sell",
                 "trade_price": "65200",
                 "trade_volume": "2",
-                "trade_fee": "0.15",
+                "trade_fee": "-0.15",
                 "fee_asset": "USDT",
                 "real_profit": "3.2",
             },

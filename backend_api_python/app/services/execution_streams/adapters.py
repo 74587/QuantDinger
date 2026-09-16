@@ -240,6 +240,7 @@ class PrivateWebSocketAdapter:
 
                 self._ws = websocket.WebSocketApp(
                     url,
+                    header={"X-Gate-Size-Decimal": "1"} if isinstance(self, GateExecutionAdapter) else None,
                     on_open=_open,
                     on_message=_message,
                     on_error=_error,
@@ -640,7 +641,7 @@ class HtxExecutionAdapter(PrivateWebSocketAdapter):
         return False
 
     def url(self) -> str:
-        return "wss://api.htx.com/ws/v2" if self.market_type == "spot" else "wss://api.hbdm.com/swap-notification"
+        return "wss://api.htx.com/ws/v2" if self.market_type == "spot" else "wss://api.hbdm.com/linear-swap-notification"
 
     def _auth_params(self) -> Dict[str, str]:
         parsed = urlparse(self.url())
@@ -651,10 +652,13 @@ class HtxExecutionAdapter(PrivateWebSocketAdapter):
             "SignatureVersion": "2",
             "Timestamp": timestamp,
         }
-        path = parsed.path or ("/ws/v2" if self.market_type == "spot" else "/swap-notification")
+        if self.market_type == 'spot':
+            params = {'accessKey': params['AccessKeyId'], 'signatureMethod': 'HmacSHA256',
+                      'signatureVersion': '2.1', 'timestamp': timestamp}
+        path = parsed.path
         encoded = urlencode(sorted(params.items()))
         payload = f"GET\n{parsed.hostname}\n{path}\n{encoded}"
-        params["Signature"] = _b64_hmac(
+        params['signature' if self.market_type == 'spot' else 'Signature'] = _b64_hmac(
             str(self.config.get("secret_key") or self.config.get("secret") or ""),
             payload,
         )

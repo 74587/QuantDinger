@@ -241,12 +241,8 @@ def _fetch_swap_positions_snapshot(client: Any, exchange_id: str, errors: List[s
                 row = dict(item)
                 row["size"] = sz_ct
                 row["symbol"] = contract
-                qm = 1.0
-                try:
-                    meta = client.get_contract(contract=contract) or {}
-                    qm = float(meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0) or 1.0
-                except Exception:
-                    qm = 1.0
+                from app.services.live_trading.fill_accounting import contract_multiplier
+                qm = contract_multiplier(client, 'gate', contract.replace('_', '/'))
                 for leg in _parse_swap_position_items([row], market_type="swap"):
                     leg["size"] = float(leg.get("size") or 0) * qm
                     parsed.append(leg)
@@ -254,7 +250,15 @@ def _fetch_swap_positions_snapshot(client: Any, exchange_id: str, errors: List[s
         if isinstance(client, HtxClient):
             resp = client.get_positions() or {}
             data = (resp.get("data") or []) if isinstance(resp, dict) else []
-            return _parse_swap_position_items(data if isinstance(data, list) else [], market_type="swap")
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            parsed = []
+            for row in data if isinstance(data, list) else []:
+                symbol = str(row.get('contract_code') or '').replace('-', '/')
+                multiplier = contract_multiplier(client, 'htx', symbol)
+                for leg in _parse_swap_position_items([row], market_type='swap'):
+                    leg['size'] = float(leg.get('size') or 0) * multiplier
+                    parsed.append(leg)
+            return parsed
         if hasattr(client, "get_positions"):
             resp = client.get_positions() or {}
             if isinstance(resp, list):
@@ -383,15 +387,8 @@ def _parse_gate_futures_orders(payload: Any, *, client: Any = None) -> List[Dict
 
         multiplier = multiplier_cache.get(contract)
         if multiplier is None:
-            multiplier = 1.0
-            if client is not None and hasattr(client, "get_contract"):
-                try:
-                    meta = client.get_contract(contract=contract) or {}
-                    multiplier = float(
-                        meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0
-                    ) or 1.0
-                except Exception:
-                    multiplier = 1.0
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            multiplier = contract_multiplier(client, 'gate', contract.replace('_', '/'))
             multiplier_cache[contract] = multiplier
         amount = abs(signed_size) * multiplier
         remaining = abs(signed_left) * multiplier

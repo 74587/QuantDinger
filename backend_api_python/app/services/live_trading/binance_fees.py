@@ -26,7 +26,7 @@ def aggregate_commissions(trades, order_id, filled):
         except (KeyError, TypeError, ValueError, OverflowError):
             return {}
         key = currency or "UNKNOWN"
-        fees[key] = fees.get(key, 0.0) + abs(commission)
+        fees[key] = fees.get(key, 0.0) + commission
     if has_qty and abs(total_qty - filled) > max(1e-12, abs(filled) * 1e-8):
         return {}
     return fees

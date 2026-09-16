@@ -598,7 +598,9 @@ class GridEngine:
             return False
         if filled <= 0:
             return False
-        px = float(avg or price or 0)
+        px = float(avg or 0)
+        if px <= 0:
+            return False
         from app.services.pending_orders.fee_reconciliation import (
             fee_breakdown_snapshot,
             fee_breakdown_to_quote,
@@ -626,6 +628,7 @@ class GridEngine:
             self.trading_config,
             reason=reason,
             commission=commission,
+            fees_by_ccy=fees,
             commission_ccy=commission_ccy,
             commission_quote=commission_quote,
             client_order_id=coid,
@@ -656,47 +659,25 @@ class GridEngine:
         signal_type: str,
         reason: str,
     ) -> bool:
-        """When fill polling fails but the exchange already holds the initial leg, sync local state."""
-        if current_price <= 0:
-            return False
+        """Recover only from the strategy's order, never from an account balance."""
         pos_side = self._pos_side_for_signal(signal_type)
-        target_qty = self._target_initial_base_qty(current_price)
-        if target_qty <= 0:
+        if self._initial_exchange_delta(pos_side) <= 0:
             return False
-        exch_qty = self._initial_exchange_delta(pos_side)
-        if exch_qty <= 0:
-            return False
-        if exch_qty < target_qty * 0.85:
-            return False
-        record_qty = min(exch_qty, target_qty)
-        if exch_qty > target_qty * 1.05:
-            append_strategy_log(
-                self.strategy_id,
-                "error",
-                f"Grid initial over-filled on exchange: {exch_qty:.6f} > target {target_qty:.6f}; "
-                "stopping initial retries (check OKX position manually)",
-            )
         if self._has_initial_market_trade():
             self._initial_done = True
             persist_grid_resting_state(self.strategy_id, {"initial_market_done": True})
             return True
-        record_grid_market_fill(
-            self.strategy_id,
-            self.symbol,
-            signal_type,
-            record_qty,
-            current_price,
-            self.trading_config,
-            reason=reason,
-        )
-        append_strategy_log(
-            self.strategy_id,
-            "info",
-            f"Grid initial market recovered from exchange: {record_qty:.6f} {pos_side} @ ~{current_price:.4f}",
-        )
-        self._initial_done = True
-        persist_grid_resting_state(self.strategy_id, {"initial_market_done": True})
-        return True
+        coid = make_grid_initial_client_order_id(self.strategy_id, leg=pos_side)
+        try:
+            recovered = self._probe_initial_client_order_fill(
+                self._create_client(), coid, signal_type, reason, current_price)
+        except Exception:
+            logger.warning("Grid initial fill recovery deferred sid=%s", self.strategy_id, exc_info=True)
+            return False
+        if recovered:
+            self._initial_done = True
+            persist_grid_resting_state(self.strategy_id, {"initial_market_done": True})
+        return recovered
 
     def _sync_initial_market_leg(
         self,
@@ -719,8 +700,8 @@ class GridEngine:
         )
         pos_side = self._pos_side_for_signal(signal_type)
         exch_qty = self._initial_exchange_delta(pos_side)
-        if qty > 0 and exch_qty >= qty * 0.85:
-            return self._try_recover_initial_from_exchange(price, signal_type, reason)
+        if exch_qty > 0:
+            return False
         try:
             client = self._create_client()
             if self._probe_initial_client_order_fill(client, coid, signal_type, reason, price):
@@ -765,6 +746,7 @@ class GridEngine:
             self.trading_config,
             reason=reason,
             commission=float(getattr(execution, "commission", 0.0) or 0.0),
+            fees_by_ccy=getattr(execution, "fees_by_ccy", None),
             commission_ccy=str(getattr(execution, "commission_ccy", "") or ""),
             commission_quote=getattr(execution, "commission_quote", None),
             exchange_order_id=str(getattr(execution, "exchange_order_id", "") or ""),
@@ -812,29 +794,10 @@ class GridEngine:
             return True
 
         pos_side = self._pos_side_for_signal(sig)
-        target_qty = self._target_initial_base_qty(current_price)
         exch_qty = self._initial_exchange_delta(pos_side)
-        if target_qty > 0 and exch_qty >= target_qty * 0.85:
-            if self._try_recover_initial_from_exchange(current_price, sig, reason):
-                return True
-        if target_qty > 0 and exch_qty > target_qty * 1.05:
-            self._stop_initial_market_retries(
-                reason=(
-                    f"Grid initial market halted: exchange {pos_side} {exch_qty:.6f} "
-                    f"exceeds target {target_qty:.6f}"
-                ),
-            )
-            if not self._has_initial_market_trade():
-                record_grid_market_fill(
-                    self.strategy_id,
-                    self.symbol,
-                    sig,
-                    min(exch_qty, target_qty),
-                    current_price,
-                    self.trading_config,
-                    reason=reason,
-                )
-            return True
+        if exch_qty > 0:
+            # Unattributed inventory blocks another initial order until its fill is reconciled.
+            return False
 
         now = time.time()
         if now - float(self._last_initial_attempt_ts or 0.0) < float(self._initial_retry_sec):
@@ -1698,8 +1661,10 @@ class GridEngine:
         fee_source: str = "",
         exchange_fill_id: str = "",
         execution_event_id: int = 0,
+        fees_by_ccy: Dict[str, float] | None = None,
     ) -> None:
         from app.services.grid.fill_handler import apply_grid_fill_to_local_state
+        from app.utils.db_postgres import run_after_commit
 
         apply_grid_fill_to_local_state(
             self.strategy_id,
@@ -1715,6 +1680,7 @@ class GridEngine:
             fee_source=fee_source,
             exchange_fill_id=exchange_fill_id,
             execution_event_id=execution_event_id,
+            fees_by_ccy=fees_by_ccy,
         )
         _, cells = self._levels_and_cells()
         cell_map = {c.index: c for c in cells}
@@ -1723,6 +1689,11 @@ class GridEngine:
             return
         purpose = str(order.purpose or "")
         fq = float(filled_qty or order.quantity or 0)
+        from app.services.pending_orders.fill_records import spot_position_fill_quantity
+        from app.services.grid.fill_handler import _PURPOSE_TO_SIGNAL
+        fq = spot_position_fill_quantity(market_type=self.trading_config.get('market_type') or 'swap',
+            symbol=self.symbol, signal_type=_PURPOSE_TO_SIGNAL.get(purpose, ''),
+            gross_quantity=fq, fees_by_ccy=fees_by_ccy or {})
         px = float(avg_price or order.price or 0)
         persisted_cell = self._cell_record(cell.index)
         persisted_state = GridCellState.parse(
@@ -1738,11 +1709,9 @@ class GridEngine:
             "info",
             f"Grid fill {purpose} cell={order.cell_index} qty={fq:.6f} @ {px:.4f}",
         )
-        if self._paused_entries or self._runtime_params.get("waterfall_pause"):
-            if purpose.endswith("_exit"):
-                pass
-            elif self.cfg.boundary_action == "pause":
-                return
+        def update_cell(*args, **kwargs):
+            if not self._cells.update_state(*args, **kwargs):
+                raise RuntimeError("strategyRuntime.fillSnapshotNotReady")
 
         if purpose == "long_entry":
             prior_qty = persisted_qty if persisted_state == GridCellState.LONG_HELD else 0.0
@@ -1752,7 +1721,7 @@ class GridEngine:
                 if held_qty > 0
                 else px
             )
-            self._cells.update_state(
+            update_cell(
                 self.strategy_id,
                 self.symbol,
                 cell.index,
@@ -1760,7 +1729,7 @@ class GridEngine:
                 leg_size=held_qty,
                 leg_entry_price=held_entry,
             )
-            exit_ok = self._ensure_cell_exit_coverage(
+            exit_ok = run_after_commit(self._ensure_cell_exit_coverage,
                 cell,
                 purpose="long_exit",
                 side="sell",
@@ -1777,7 +1746,7 @@ class GridEngine:
         elif purpose == "long_exit":
             remaining = max(0.0, persisted_qty - fq)
             state = GridCellState.LONG_HELD if remaining > 1e-10 else GridCellState.IDLE
-            self._cells.update_state(
+            update_cell(
                 self.strategy_id,
                 self.symbol,
                 cell.index,
@@ -1786,7 +1755,7 @@ class GridEngine:
             )
             if remaining <= 1e-10 and not self._paused_entries:
                 if self._cell_allows_entry(cell.index, "long_entry", self._cell_state_by_index()):
-                    self._place_limit(
+                    run_after_commit(self._place_limit,
                         cell, "long_entry", "buy", cell.lower_price, reduce_only=False, pos_side="long", quantity=fq
                     )
         elif purpose == "short_entry":
@@ -1797,7 +1766,7 @@ class GridEngine:
                 if held_qty > 0
                 else px
             )
-            self._cells.update_state(
+            update_cell(
                 self.strategy_id,
                 self.symbol,
                 cell.index,
@@ -1805,7 +1774,7 @@ class GridEngine:
                 leg_size=held_qty,
                 leg_entry_price=held_entry,
             )
-            exit_ok = self._ensure_cell_exit_coverage(
+            exit_ok = run_after_commit(self._ensure_cell_exit_coverage,
                 cell,
                 purpose="short_exit",
                 side="buy",
@@ -1822,7 +1791,7 @@ class GridEngine:
         elif purpose == "short_exit":
             remaining = max(0.0, persisted_qty - fq)
             state = GridCellState.SHORT_HELD if remaining > 1e-10 else GridCellState.IDLE
-            self._cells.update_state(
+            update_cell(
                 self.strategy_id,
                 self.symbol,
                 cell.index,
@@ -1831,7 +1800,7 @@ class GridEngine:
             )
             if remaining <= 1e-10 and not self._paused_entries:
                 if self._cell_allows_entry(cell.index, "short_entry", self._cell_state_by_index()):
-                    self._place_limit(
+                    run_after_commit(self._place_limit,
                         cell, "short_entry", "sell", cell.upper_price, reduce_only=False, pos_side="short", quantity=fq
                     )
 

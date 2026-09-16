@@ -290,7 +290,7 @@ def test_signal_to_side_pos_reduce_rejects_unknown():
         raise AssertionError("expected LiveTradingError")
 
 
-def test_fill_accumulator_tracks_weighted_average_and_fees_by_currency():
+def test_fill_accumulator_tracks_weighted_average_and_signed_fees_by_currency():
     fills = FillAccumulator()
 
     fills.apply_fill(0.1, 100)
@@ -303,7 +303,7 @@ def test_fill_accumulator_tracks_weighted_average_and_fees_by_currency():
     assert round(fills.avg_price(), 8) == round(50 / 0.3, 8)
     assert fills.total_fee == 0
     assert fills.fee_ccy == "MIXED"
-    assert fills.fees_by_ccy == {"USDT": 0.003, "BTC": 0.002}
+    assert fills.fees_by_ccy == {"USDT": -0.003, "BTC": 0.002}
 
 
 def test_apply_execution_result_does_not_drop_exchange_fee():

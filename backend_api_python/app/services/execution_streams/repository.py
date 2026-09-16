@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
-from app.services.execution_streams.events import ExecutionEvent
+from app.services.execution_streams.events import ExecutionEvent, normalize_symbol
 from app.services.exchange_execution import coalesce_exchange_config_from_payload
 from app.utils.db import get_db_connection
 
@@ -84,8 +84,21 @@ class ExecutionEventRepository:
         from app.services.live_trading.partner_attribution import redact_partner_attribution
 
         raw = redact_partner_attribution(event.raw or {})
+        raw = dict(raw, _qd_execution={
+            "cumulative_average_price": event.cumulative_average_price,
+            "fees_cumulative": event.fees_cumulative,
+        })
         with get_db_connection() as db:
             cur = db.cursor()
+            if event.exchange_fill_id and not event.fees_cumulative:
+                cur.execute("""SELECT id FROM qd_execution_events WHERE credential_id = %s
+                    AND exchange_id = %s AND market_type = %s AND symbol = %s
+                    AND exchange_order_id = %s AND exchange_fill_id = %s LIMIT 1""",
+                    (int(event.credential_id or 0), event.exchange_id.lower(), event.market_type.lower(),
+                     event.symbol, event.exchange_order_id, event.exchange_fill_id))
+                if cur.fetchone():
+                    cur.close()
+                    return None
             cur.execute(
                 """
                 INSERT INTO qd_execution_events
@@ -179,7 +192,7 @@ class ExecutionEventRepository:
                 SELECT *
                 FROM qd_execution_events
                 WHERE processed_at IS NULL
-                  AND process_attempts < 20
+                  AND next_attempt_at <= NOW()
                 ORDER BY received_at ASC, id ASC
                 LIMIT %s
                 """,
@@ -214,7 +227,9 @@ class ExecutionEventRepository:
                 FROM qd_live_order_bindings
                 WHERE credential_id = %s
                   AND exchange_id = %s
-                  AND (market_type = %s OR market_type = '' OR %s = '')
+                  AND (market_type = %s OR market_type = '' OR %s = ''
+                    OR (market_type IN ('crypto', 'spot') AND %s IN ('crypto', 'spot')))
+                  AND (symbol = '' OR regexp_replace(upper(symbol), '[-/_]', '', 'g') = %s)
                   AND (
                     (%s <> '' AND exchange_order_id = %s)
                     OR (%s <> '' AND client_order_id = %s)
@@ -229,6 +244,8 @@ class ExecutionEventRepository:
                     exchange_id,
                     market_type,
                     market_type,
+                    market_type,
+                    normalize_symbol(event.get("symbol") or "").replace("/", "").replace("-", ""),
                     exchange_order_id,
                     exchange_order_id,
                     client_order_id,
@@ -255,6 +272,9 @@ class ExecutionEventRepository:
                 FROM pending_orders po
                 WHERE po.credential_id = %s
                   AND LOWER(COALESCE(po.exchange_id, '')) = %s
+                  AND (LOWER(COALESCE(po.market_type, '')) = %s
+                    OR (LOWER(po.market_type) IN ('crypto', 'spot') AND %s IN ('crypto', 'spot')))
+                  AND regexp_replace(upper(po.symbol), '[-/_]', '', 'g') = %s
                   AND (
                     (%s <> '' AND po.exchange_order_id = %s)
                     OR (%s <> '' AND po.client_order_id = %s)
@@ -264,6 +284,9 @@ class ExecutionEventRepository:
                 (
                     credential_id,
                     exchange_id,
+                    market_type,
+                    market_type,
+                    normalize_symbol(event.get("symbol") or "").replace("/", "").replace("-", ""),
                     exchange_order_id,
                     exchange_order_id,
                     client_order_id,
@@ -318,6 +341,8 @@ class ExecutionEventRepository:
     @staticmethod
     def _matching_grid_binding(candidate, event):
         data = dict(candidate)
+        if normalize_symbol(data.get("symbol") or "") != normalize_symbol(event.get("symbol") or ""):
+            return None
         for key in ("exchange_config", "trading_config"):
             raw = data.get(key)
             if isinstance(raw, str):
@@ -365,6 +390,7 @@ class ExecutionEventRepository:
                 """
                 UPDATE qd_execution_events
                 SET process_attempts = process_attempts + 1,
+                    next_attempt_at = NOW() + LEAST(300, POWER(2, LEAST(process_attempts, 8))) * INTERVAL '1 second',
                     process_error = %s
                 WHERE id = %s
                 """,

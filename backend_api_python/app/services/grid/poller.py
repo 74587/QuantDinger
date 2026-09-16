@@ -13,6 +13,7 @@ from app.services.grid.resting_orders_repo import GridRestingOrder, GridRestingO
 from app.services.grid.runner import get_runner
 from app.services.exchange_execution import resolve_exchange_config
 from app.services.live_trading.factory import create_client
+from app.services.pending_orders.live_order_support import bind_instrument_product_contract
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -117,6 +118,8 @@ class GridFillPoller:
                 continue
             last = self._last_poll_by_order.get(oid, 0.0)
             min_iv = self._min_order_interval * (0.5 if str(order.status or "") == "partial" else 1.0)
+            if str(order.status or "") in {"filled", "cancelled"}:
+                min_iv = max(min_iv, 60.0)
             runner = get_runner(sid)
             try:
                 from app.startup import get_execution_stream_supervisor
@@ -140,13 +143,16 @@ class GridFillPoller:
 
     def _poll_once(self) -> None:
         open_orders = self._repo.list_open()
+        extra = self._repo.list_reconciliation()
+        known = {order.id for order in open_orders}
+        open_orders += [order for order in extra if order.id not in known]
         if not open_orders:
             return
         selected = self._select_orders(open_orders)
         if not selected:
             return
 
-        clients: Dict[str, object] = {}
+        clients: Dict[tuple, object] = {}
         for order in selected:
             sid = int(order.strategy_id)
             runner = get_runner(sid)
@@ -156,15 +162,23 @@ class GridFillPoller:
             if not self._allow_credential_request(cred_key):
                 continue
             cfg = runner.engine.cfg
-            client = clients.get(cred_key)
+            client_key = (cred_key, sid, str(cfg.market_type), str(order.symbol))
+            client = clients.get(client_key)
             if client is None:
                 try:
                     ex_cfg = resolve_exchange_config(
                         runner.exchange_config if isinstance(runner.exchange_config, dict) else {},
                         user_id=int(getattr(runner, "user_id", 0) or 1),
                     )
+                    ex_cfg = bind_instrument_product_contract(
+                        ex_cfg,
+                        runner.engine.trading_config,
+                        symbol=order.symbol,
+                        exchange_id=str(ex_cfg.get("exchange_id") or ""),
+                        market_type=cfg.market_type,
+                    )
                     client = create_client(ex_cfg, market_type=cfg.market_type)
-                    clients[cred_key] = client
+                    clients[client_key] = client
                 except Exception as e:
                     logger.debug("grid poller client sid=%s: %s", sid, e)
                     continue
@@ -173,131 +187,70 @@ class GridFillPoller:
             self._poll_order(runner, client, order, cfg.market_type)
 
     def _poll_order(self, runner, client, order, market_type: str) -> None:
+        from app.services.execution_streams.processor import ExecutionEventProcessor
+        from app.services.pending_orders.fee_reconciliation import fee_breakdown_snapshot
+        from app.services.live_trading.fill_accounting import lock_strategy_fills
+        from app.utils.db import get_db_transaction
+        from app.utils.db_postgres import run_after_commit
+
         filled, avg, status = query_grid_order_fill(
             client,
             symbol=order.symbol,
             market_type=market_type,
             exchange_order_id=order.exchange_order_id,
             client_order_id=order.client_order_id,
-            exchange_config=runner.exchange_config if isinstance(runner.exchange_config, dict) else {},
+            exchange_config=runner.exchange_config,
         )
-        if status == "unknown":
+        if status == "unknown" or not order.id:
             return
-        oid = int(order.id or 0)
-        if not oid:
+        if status == "filled" and (filled <= 0 or avg <= 0):
             return
-
-        prev = float(order.processed_fill_qty or 0)
-        total_filled = float(filled or order.filled_quantity or 0)
-        if total_filled <= 0 and status == "filled":
-            total_filled = float(order.quantity or 0)
-
-        new_fill = total_filled - prev
-        processed = prev
-        if new_fill > 1e-12:
-            try:
-                details: Dict[str, object] = {}
-                wait_grid_market_fill(
-                    client,
-                    symbol=order.symbol,
-                    market_type=market_type,
-                    exchange_config=(
-                        runner.exchange_config
-                        if isinstance(runner.exchange_config, dict)
-                        else {}
-                    ),
-                    exchange_order_id=order.exchange_order_id,
-                    client_order_id=order.client_order_id,
-                    max_wait_sec=0.0,
-                    details=details,
-                )
-                from app.services.pending_orders.fee_reconciliation import (
-                    fee_breakdown_snapshot,
-                    fee_breakdown_to_quote,
-                    fee_storage_values,
-                )
-
-                fees = fee_breakdown_snapshot(details)
-                fee_status = str(
-                    details.get("fee_status")
-                    or ("actual" if fees else "pending")
-                )
-                commission, commission_ccy = fee_storage_values(fees)
-                fill_price = float(avg or order.price or 0.0)
-                commission_quote = (
-                    fee_breakdown_to_quote(
-                        client,
-                        symbol=order.symbol,
-                        fees=fees,
-                        fill_price=fill_price,
-                    )
-                    if fees and fill_price > 0
-                    else None
-                )
-                if fees or fee_status == "actual_zero":
-                    runner.engine.on_order_filled(
-                        order,
-                        new_fill,
-                        fill_price,
-                        commission=commission,
-                        commission_ccy=commission_ccy,
-                        commission_quote=commission_quote,
-                        fee_status=fee_status,
-                        fee_source="rest",
-                    )
-                else:
-                    runner.engine.on_order_filled(order, new_fill, fill_price)
-                processed = total_filled
-            except Exception as e:
-                logger.warning(
-                    "grid on_order_filled sid=%s oid=%s: %s",
-                    order.strategy_id,
-                    oid,
-                    e,
-                )
-                # Persist the exchange snapshot but leave processed_fill_qty
-                # untouched so list_unprocessed() retries the local posting.
-                self._repo.update_status(
-                    oid,
-                    status="partial" if total_filled > 0 else str(order.status or "open"),
-                    filled_quantity=total_filled,
-                    avg_fill_price=avg,
-                    processed_fill_qty=prev,
-                )
-                return
-
-        if status in ("open", "partial"):
-            local_status = "partial" if total_filled > 0 else "open"
-        elif status == "cancelled":
-            local_status = "cancelled"
-        elif status == "filled" or total_filled >= float(order.quantity or 0) > 0:
-            local_status = "filled"
-        else:
-            local_status = str(order.status or "open")
-
-        self._repo.update_status(
-            oid,
-            status=local_status,
-            filled_quantity=total_filled,
-            avg_fill_price=avg,
-            processed_fill_qty=processed,
+        details = {}
+        fee_qty, fee_avg = filled, avg
+        if filled > 0:
+            fee_qty, fee_avg = wait_grid_market_fill(
+                client,
+                symbol=order.symbol,
+                market_type=market_type,
+                exchange_config=runner.exchange_config,
+                exchange_order_id=order.exchange_order_id,
+                client_order_id=order.client_order_id,
+                max_wait_sec=0.0,
+                details=details,
+            )
+        fees = fee_breakdown_snapshot(details)
+        if fee_qty >= filled and fee_qty > 0 and fee_avg > 0:
+            filled, avg = fee_qty, fee_avg
+        elif fee_qty < filled:
+            fees = {}
+            details = {}
+        event = dict(
+            id=0,
+            exchange_id=runner.exchange_config.get("exchange_id"),
+            market_type=market_type,
+            symbol=order.symbol,
+            quantity=0,
+            cumulative_quantity=filled,
+            cumulative_average_price=avg,
+            is_cumulative=True,
+            fees_cumulative=True,
+            price=avg,
+            order_status=status,
+            _snapshot_fees=fees,
+            _runner=runner,
+            _client=client,
+            fee_status=details.get("fee_status") or ("actual" if fees else "pending"),
+            exchange_order_id=order.exchange_order_id,
+            fee_source="rest",
         )
-
-        # A cancelled partially-filled exit no longer protects its remaining
-        # cell inventory. Reconcile immediately instead of waiting for the
-        # runner's periodic 15-second coverage pass.
-        if status == "cancelled" and total_filled > 0:
-            try:
-                runner.engine.sync_held_cell_exits(
-                    avg or float(order.price or 0)
-                )
-            except Exception as e:
-                logger.warning(
-                    "grid cancelled-partial reconcile sid=%s oid=%s: %s",
-                    order.strategy_id,
-                    oid,
-                    e,
-                )
+        try:
+            with get_db_transaction():
+                lock_strategy_fills(order.strategy_id)
+                ExecutionEventProcessor()._project_grid(event, {"owner_id": order.id, "strategy_id": order.strategy_id})
+                if status == "cancelled" and filled > 0:
+                    run_after_commit(runner.engine.sync_held_cell_exits, avg)
+        except Exception:
+            logger.exception("Grid REST posting failed sid=%s oid=%s; retry required", order.strategy_id, order.id)
 
     def sync_strategy(self, strategy_id: int) -> int:
         """Poll every open order for one strategy immediately (UI refresh)."""
@@ -324,6 +277,13 @@ class GridFillPoller:
             ex_cfg = resolve_exchange_config(
                 runner.exchange_config if isinstance(runner.exchange_config, dict) else {},
                 user_id=int(getattr(runner, "user_id", 0) or 1),
+            )
+            ex_cfg = bind_instrument_product_contract(
+                ex_cfg,
+                runner.engine.trading_config,
+                symbol=runner.symbol,
+                exchange_id=str(ex_cfg.get("exchange_id") or ""),
+                market_type=cfg.market_type,
             )
             client = create_client(ex_cfg, market_type=cfg.market_type)
         except Exception as e:

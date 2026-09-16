@@ -159,7 +159,9 @@ def test_live_sent_sync_finalizes_after_restart_without_duplicate_fill(monkeypat
 
     worker._sync_one_live_sent_order(row)
 
-    assert persisted == []
+    assert len(persisted) == 1
+    assert persisted[0]["filled"] == 0
+    assert persisted[0]["cumulative_filled"] == pytest.approx(row["filled"])
     assert snapshots[0]["status"] == "filled"
     assert snapshots[0]["exchange_status"] == "filled"
 
@@ -195,7 +197,9 @@ def test_live_sent_sync_does_not_rebook_fill_hidden_by_stale_marker(monkeypatch)
 
     worker._sync_one_live_sent_order(row)
 
-    assert persisted == []
+    assert len(persisted) == 1
+    assert persisted[0]["filled"] == 0
+    assert persisted[0]["cumulative_filled"] == pytest.approx(row["filled"])
     assert snapshots[0]["status"] == "filled"
     assert snapshots[0]["filled"] == pytest.approx(0.1)
 

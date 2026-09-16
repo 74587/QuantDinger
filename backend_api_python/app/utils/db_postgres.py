@@ -634,6 +634,7 @@ class _TransactionConnection:
     def __init__(self, connection):
         self.connection = connection
         self.rollback_only = False
+        self.after_commit = []
 
     def cursor(self):
         return self.connection.cursor()
@@ -649,6 +650,15 @@ class _TransactionConnection:
 
 
 _active_transaction = ContextVar("postgres_active_transaction", default=None)
+
+
+def run_after_commit(callback, *args, **kwargs):
+    """Defer external effects until local accounting is durably committed."""
+    active = _active_transaction.get()
+    if active is None:
+        return callback(*args, **kwargs)
+    active.after_commit.append((callback, args, kwargs))
+    return True
 
 
 @contextmanager
@@ -675,6 +685,11 @@ def get_pg_transaction():
             raise
         finally:
             _active_transaction.reset(token)
+    for callback, args, kwargs in transaction.after_commit:
+        try:
+            callback(*args, **kwargs)
+        except Exception:
+            logger.exception("Post-commit action failed; periodic order reconciliation will retry")
 
 
 @contextmanager

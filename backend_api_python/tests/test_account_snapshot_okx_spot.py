@@ -41,6 +41,9 @@ def test_fetch_okx_snapshot_uses_balance_for_spot():
             assert inst_type == "SWAP"
             return {"data": [{"instId": "ETH-USDT-SWAP", "posSide": "net", "pos": "1", "avgPx": "2000"}]}
 
+        def get_instrument(self, **kwargs):
+            return {"ctVal": "0.1", "ctValCcy": "ETH"}
+
         def get_balance(self):
             return {
                 "data": [

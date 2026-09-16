@@ -70,21 +70,21 @@ def test_rest_wait_and_grid_query_agree_on_gate_spot_fill():
     assert (fill["filled"], fill["avg_price"]) == (base, price)
 
 
-def test_poller_posts_actual_unit_price_and_converts_base_fee_correctly():
+def test_poller_posts_actual_unit_price_and_converts_base_fee_correctly(monkeypatch):
+    from contextlib import nullcontext
+    from app.services.execution_streams.processor import ExecutionEventProcessor
+    from app.services.live_trading.fee_quote import fee_to_quote
     client = GateSpotClient(api_key="k", secret_key="s")
     runner = MagicMock()
     runner.exchange_config = {}
     poller = GridFillPoller()
-    order = GridRestingOrder(
-        id=1, strategy_id=168, symbol="BTC/USDT", exchange_order_id="123",
-        quantity=0.00016, price=79000, status="open",
-    )
-    with (
-        patch.object(client, "get_order", return_value=spot_order()),
-        patch.object(poller._repo, "update_status") as update,
-    ):
-        poller._poll_order(runner, client, order, "spot")
-    posted = runner.engine.on_order_filled.call_args
-    assert posted.args[1:] == pytest.approx((0.00016, 78063.75))
-    assert posted.kwargs["commission_quote"] == pytest.approx(0.0124902)
-    assert update.call_args.kwargs["avg_fill_price"] == pytest.approx(78063.75)
+    order = GridRestingOrder(id=1, strategy_id=168, symbol="BTC/USDT", exchange_order_id="123",
+        quantity=0.00016, price=79000, status="open")
+    monkeypatch.setattr('app.utils.db.get_db_transaction', nullcontext)
+    monkeypatch.setattr('app.services.live_trading.fill_accounting.lock_strategy_fills', lambda *a: None)
+    with patch.object(client, 'get_order', return_value=spot_order()), patch.object(ExecutionEventProcessor, '_project_grid') as project:
+        poller._poll_order(runner, client, order, 'spot')
+    event = project.call_args.args[0]
+    assert (event['cumulative_quantity'], event['cumulative_average_price']) == pytest.approx((.00016, 78063.75))
+    assert event['_snapshot_fees'] == {'BTC': .00000016}
+    assert fee_to_quote(client, symbol='BTC/USDT', fee=event['_snapshot_fees']['BTC'], fee_ccy='BTC', fill_price=event['cumulative_average_price']) == pytest.approx(.0124902)

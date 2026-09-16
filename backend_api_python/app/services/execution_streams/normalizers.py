@@ -44,7 +44,7 @@ def parse_binance(
         return []
     qty = as_float(data.get("l"))
     trade_id = str(data.get("t") or "")
-    if qty <= 0 and not trade_id:
+    if qty <= 0 or trade_id in {"", "-1"}:
         return []
     status = normalize_status(data.get("X"))
     fees = aggregate_commissions([
@@ -65,6 +65,11 @@ def parse_binance(
             price=as_float(data.get("L") or data.get("ap")),
             quantity=qty,
             cumulative_quantity=as_float(data.get("z")),
+            cumulative_average_price=(
+                as_float(data.get("Z")) / as_float(data.get("z"))
+                if market_type == "spot" and as_float(data.get("z")) > 0
+                else as_float(data.get("ap"))
+            ),
             realized_pnl=as_float(data.get("rp")) if data.get("rp") is not None else None,
             maker=bool(data.get("m")) if data.get("m") is not None else None,
             fee_status=fee_status,
@@ -87,8 +92,9 @@ def parse_okx(payload: Dict[str, Any]) -> List[ExecutionEvent]:
         fill_id = str(item.get("tradeId") or item.get("fillId") or "")
         if qty <= 0 and not fill_id:
             continue
-        fee_ccy = item.get("feeCcy") or item.get("fillFeeCcy")
-        fee_value = item.get("fee") if item.get("fee") not in (None, "") else item.get("fillFee")
+        cumulative_fees = str(arg.get("channel")) == "orders" and item.get("fee") not in (None, "")
+        fee_ccy = item.get("feeCcy") if cumulative_fees else item.get("fillFeeCcy")
+        fee_value = item.get("fee") if cumulative_fees else item.get("fillFee")
         rebate_ccy = item.get("rebateCcy")
         fees = _fee(fee_ccy, fee_value, signed_deduction=True)
         fees += _fee(rebate_ccy, -as_float(item.get("rebate")))
@@ -107,11 +113,13 @@ def parse_okx(payload: Dict[str, Any]) -> List[ExecutionEvent]:
                 price=as_float(item.get("fillPx") or item.get("avgPx")),
                 quantity=qty,
                 cumulative_quantity=as_float(item.get("accFillSz")),
+                cumulative_average_price=as_float(item.get("avgPx")),
+                fees_cumulative=cumulative_fees,
                 realized_pnl=as_float(item.get("fillPnl")) if item.get("fillPnl") not in (None, "") else None,
                 maker=str(item.get("execType") or "").upper() == "M"
                 if item.get("execType") not in (None, "")
                 else None,
-                fee_status="actual" if fees else "actual_zero",
+                fee_status=("actual" if fees else "actual_zero") if fee_value not in (None, "") else "pending",
                 occurred_at=as_millis_datetime(item.get("fillTime") or item.get("uTime")),
                 fees=fees,
                 raw=item,
@@ -127,11 +135,15 @@ def parse_bybit(payload: Dict[str, Any]) -> List[ExecutionEvent]:
     for item in payload.get("data") or []:
         if not isinstance(item, dict):
             continue
+        if str(item.get("execType") or "Trade").lower() != "trade":
+            continue
         qty = as_float(item.get("execQty"))
         fill_id = str(item.get("execId") or "")
         if qty <= 0 and not fill_id:
             continue
         category = str(item.get("category") or "").lower()
+        if category not in {'', 'spot', 'linear'}:
+            continue
         fee_value = as_float(item.get("execFee"))
         fees = _fee(item.get("feeCurrency"), fee_value)
         for extra in item.get("extraFees") or []:
@@ -161,7 +173,7 @@ def parse_bybit(payload: Dict[str, Any]) -> List[ExecutionEvent]:
                 quantity=qty,
                 realized_pnl=as_float(item.get("execPnl")) if item.get("execPnl") not in (None, "") else None,
                 maker=bool(item.get("isMaker")) if item.get("isMaker") is not None else None,
-                fee_status="actual" if fees else "actual_zero",
+                fee_status=("actual" if fees else "actual_zero") if item.get("execFee") not in (None, "") and item.get("feeCurrency") else "pending",
                 occurred_at=as_millis_datetime(item.get("execTime") or payload.get("creationTime")),
                 fees=fees,
                 raw=item,
@@ -180,9 +192,10 @@ def parse_bitget(payload: Dict[str, Any]) -> List[ExecutionEvent]:
         if not isinstance(item, dict):
             continue
         is_spot = inst_type == "SPOT"
+        is_order = str(arg.get("channel")) == "orders"
         qty = as_float(
             item.get("size")
-            if is_spot
+            if is_spot and not is_order
             else item.get("fillQty") or item.get("baseVolume") or item.get("execQty")
         )
         fill_id = str(item.get("tradeId") or item.get("execId") or "")
@@ -200,13 +213,13 @@ def parse_bitget(payload: Dict[str, Any]) -> List[ExecutionEvent]:
                     # Bitget classic spot fill reports totalFee as a
                     # positive cost, while classic futures/order channels
                     # report deductions as negative values. Both are fees.
-                    amount = abs(as_float(value))
-                    if currency and amount > 1e-18:
+                    amount = as_float(value) if is_spot and not is_order and detail.get('totalFee') not in (None, '') else -as_float(value)
+                    if currency and abs(amount) > 1e-18:
                         fees.append(FeeComponent(currency=str(currency).upper(), amount=amount))
         if not fees:
             currency = item.get("fillFeeCoin") or item.get("feeCoin")
-            amount = abs(as_float(item.get("fillFee") or item.get("fee")))
-            if currency and amount > 1e-18:
+            amount = -as_float(item.get("fillFee") or item.get("fee"))
+            if currency and abs(amount) > 1e-18:
                 fees = [FeeComponent(currency=str(currency).upper(), amount=amount)]
         out.append(
             ExecutionEvent(
@@ -221,16 +234,18 @@ def parse_bitget(payload: Dict[str, Any]) -> List[ExecutionEvent]:
                 order_status=normalize_status(item.get("status") or "partial"),
                 price=as_float(
                     item.get("priceAvg")
-                    if is_spot
+                    if is_spot and not is_order
                     else item.get("fillPrice") or item.get("price") or item.get("execPrice")
                 ),
                 quantity=qty,
-                cumulative_quantity=0.0 if is_spot else as_float(item.get("accBaseVolume")),
+                cumulative_quantity=as_float(item.get("accBaseVolume")),
+                cumulative_average_price=as_float(item.get("priceAvg")) if is_order else 0.0,
+                fees_cumulative=is_order and isinstance(details, list),
                 realized_pnl=as_float(item.get("profit")) if item.get("profit") not in (None, "") else None,
                 maker=str(item.get("tradeScope") or item.get("execType") or "").lower() == "maker"
                 if item.get("tradeScope") or item.get("execType")
                 else None,
-                fee_status="actual" if fees else "actual_zero",
+                fee_status=("actual" if fees else "actual_zero") if details is not None or item.get("fillFee") is not None else "pending",
                 occurred_at=as_millis_datetime(
                     item.get("cTime")
                     if is_spot
@@ -257,7 +272,9 @@ def parse_gate(payload: Dict[str, Any], *, market_type: str) -> List[ExecutionEv
         fill_id = str(item.get("id") or item.get("trade_id") or "")
         if qty <= 0 and not fill_id:
             continue
-        symbol = normalize_symbol(item.get("currency_pair") or item.get("contract"))
+        symbol = normalize_symbol(item.get("currency_pair") or item.get("contract") or (
+            f"{item['stock']}/{item['money']}" if item.get("stock") and item.get("money") else ""
+        ))
         fee_ccy = str(item.get("fee_currency") or "").strip().upper()
         if not fee_ccy and market_type != "spot" and "/" in symbol:
             fee_ccy = symbol.rsplit("/", 1)[-1]
@@ -276,7 +293,7 @@ def parse_gate(payload: Dict[str, Any], *, market_type: str) -> List[ExecutionEv
                 quantity=qty,
                 realized_pnl=as_float(item.get("pnl")) if item.get("pnl") not in (None, "") else None,
                 maker=str(item.get("role") or "").lower() == "maker" if item.get("role") else None,
-                fee_status="actual" if has_fee_field and abs(as_float(item.get("fee"))) > 1e-18 else "actual_zero",
+                fee_status=("actual" if abs(as_float(item.get("fee"))) > 1e-18 else "actual_zero") if has_fee_field and fee_ccy else "pending",
                 occurred_at=as_millis_datetime(item.get("create_time_ms") or item.get("time_ms") or item.get("create_time")),
                 fees=_fee(fee_ccy, item.get("fee")),
                 raw=item,
@@ -290,24 +307,26 @@ def parse_htx(payload: Dict[str, Any], *, market_type: str) -> List[ExecutionEve
     if "trade.clearing" not in topic and "matchOrders" not in topic:
         return []
     data = payload.get("data")
+    if market_type != "spot" and isinstance(payload.get("trade"), list):
+        data = [dict(payload, **trade) for trade in payload['trade'] if isinstance(trade, dict)]
     items: Iterable[Any] = data if isinstance(data, list) else [data]
     out: List[ExecutionEvent] = []
     for item in items:
         if not isinstance(item, dict):
             continue
         qty = abs(as_float(item.get("tradeVolume") or item.get("trade_volume") or item.get("volume")))
-        fill_id = str(item.get("tradeId") or item.get("trade_id") or item.get("match_id") or "")
+        fill_id = str(item.get("id") or item.get("tradeId") or item.get("trade_id") or item.get("match_id") or "")
         if qty <= 0 and not fill_id:
             continue
         fee_ccy = item.get("feeCurrency") or item.get("fee_asset") or item.get("feeCurrencyCode")
         fee_value = item.get("transactFee") if item.get("transactFee") is not None else item.get("trade_fee")
-        fees = _fee(fee_ccy, fee_value)
+        fees = _fee(fee_ccy, fee_value, signed_deduction=market_type != 'spot')
         out.append(
             ExecutionEvent(
                 exchange_id="htx",
                 market_type=market_type,
-                symbol=normalize_symbol(item.get("symbol") or item.get("contract_code")),
-                exchange_order_id=str(item.get("orderId") or item.get("order_id") or ""),
+                symbol=normalize_symbol(item.get("contract_code") or item.get("symbol")),
+                exchange_order_id=str(item.get("orderId") or item.get("order_id_str") or item.get("order_id") or ""),
                 client_order_id=str(item.get("clientOrderId") or item.get("client_order_id") or ""),
                 exchange_fill_id=fill_id,
                 side=str(item.get("orderSide") or item.get("direction") or "").lower(),
@@ -316,7 +335,7 @@ def parse_htx(payload: Dict[str, Any], *, market_type: str) -> List[ExecutionEve
                 price=as_float(item.get("tradePrice") or item.get("trade_price") or item.get("price")),
                 quantity=qty,
                 realized_pnl=as_float(item.get("real_profit")) if item.get("real_profit") not in (None, "") else None,
-                fee_status="actual" if fees else "actual_zero",
+                fee_status=("actual" if fees else "actual_zero") if fee_value not in (None, "") and fee_ccy else "pending",
                 occurred_at=as_millis_datetime(item.get("tradeTime") or item.get("created_at") or item.get("ts")),
                 fees=fees,
                 raw=item,
@@ -344,7 +363,7 @@ def parse_alpaca(payload: Dict[str, Any]) -> List[ExecutionEvent]:
     return [
         ExecutionEvent(
             exchange_id="alpaca",
-            market_type="usstock",
+            market_type="spot" if str(order.get("asset_class") or "") == "crypto" else "usstock",
             symbol=str(order.get("symbol") or ""),
             exchange_order_id=str(order.get("id") or ""),
             client_order_id=str(order.get("client_order_id") or ""),
@@ -354,6 +373,7 @@ def parse_alpaca(payload: Dict[str, Any]) -> List[ExecutionEvent]:
             price=as_float(data.get("price") or order.get("filled_avg_price")),
             quantity=qty,
             cumulative_quantity=cumulative,
+            cumulative_average_price=as_float(order.get("filled_avg_price")),
             is_cumulative=qty <= 0 and cumulative > 0,
             fee_status="pending",
             occurred_at=occurred_at,
@@ -381,6 +401,7 @@ def parse_ibkr_execution(execution: Any, contract: Any = None) -> ExecutionEvent
         price=as_float(getattr(execution, "price", 0)),
         quantity=abs(as_float(getattr(execution, "shares", 0))),
         cumulative_quantity=abs(as_float(getattr(execution, "cumQty", 0))),
+        cumulative_average_price=as_float(getattr(execution, "avgPrice", 0)),
         fee_status="pending",
         occurred_at=occurred,
         raw={

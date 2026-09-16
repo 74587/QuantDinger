@@ -81,41 +81,8 @@ class BitgetMixClient(BaseRestClient):
 
     @staticmethod
     def _parse_fee_detail(raw_fd: Any) -> Tuple[Decimal, str]:
-        """Parse Bitget feeDetail (list, dict, or JSON string) into (abs_fee, ccy).
-
-        Sums ALL entries when feeDetail is a list (futures may have multiple items).
-        """
-        if raw_fd is None:
-            return Decimal("0"), ""
-
-        # feeDetail may arrive as a JSON string from some API versions
-        if isinstance(raw_fd, str):
-            raw_fd = raw_fd.strip()
-            if not raw_fd or raw_fd in ("0", "null"):
-                return Decimal("0"), ""
-            try:
-                raw_fd = json.loads(raw_fd)
-            except (json.JSONDecodeError, ValueError):
-                return Decimal("0"), ""
-
-        entries: List[Dict[str, Any]] = []
-        if isinstance(raw_fd, list):
-            entries = [e for e in raw_fd if isinstance(e, dict)]
-        elif isinstance(raw_fd, dict):
-            entries = [raw_fd]
-
-        total_fee = Decimal("0")
-        ccy = ""
-        for entry in entries:
-            fv = entry.get("totalFee") or entry.get("totalDeductionFee") or entry.get("fee")
-            try:
-                fee = Decimal(str(fv))
-            except Exception:
-                fee = Decimal("0")
-            total_fee += abs(fee)
-            if not ccy:
-                ccy = str(entry.get("feeCoin") or entry.get("feeCcy") or "").strip()
-        return total_fee, ccy
+        from app.services.live_trading.bitget_fees import fee_storage
+        return fee_storage(raw_fd)
 
     @staticmethod
     def _dec_str(d: Decimal, max_decimals: int = 18, strict_precision: Optional[int] = None) -> str:
@@ -970,7 +937,19 @@ class BitgetMixClient(BaseRestClient):
             "productType": str(product_type or "USDT-FUTURES"),
             "symbol": to_bitget_um_symbol(symbol),
         }
-        return self._signed_request("GET", "/api/v2/mix/order/fills", params=params)
+        rows = []
+        for _ in range(10):
+            raw = self._signed_request("GET", "/api/v2/mix/order/fills", params={**params, "limit": 100})
+            data = raw.get('data') or {}
+            page = data.get('fillList') or []
+            rows.extend(page)
+            if len(page) < 100:
+                return {**raw, 'data': {**data, 'fillList': rows}}
+            cursor = str(data.get('endId') or page[-1].get('tradeId') or '')
+            if not cursor or cursor == params.get('idLessThan'):
+                break
+            params['idLessThan'] = cursor
+        raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
 
     def get_order(
         self,
@@ -990,7 +969,7 @@ class BitgetMixClient(BaseRestClient):
         row = raw.get("data") if isinstance(raw, dict) else None
         if not isinstance(row, dict):
             row = {}
-        filled = float(row.get("baseVolume") or row.get("filledQty") or row.get("fillSize") or 0)
+        filled = float(row.get("baseVolume") or row.get("filledQty") or 0)
         avg = float(row.get("priceAvg") or row.get("fillPrice") or 0)
         state = str(row.get("state") or row.get("status") or "").lower()
         return {
@@ -1033,14 +1012,6 @@ class BitgetMixClient(BaseRestClient):
         last_fills: Dict[str, Any] = {}
         state = ""
 
-        # For robust parsing: contractSize helps converting contracts->base if needed.
-        ct = Decimal("0")
-        try:
-            contract = self.get_contract(symbol=symbol, product_type=product_type) or {}
-            ct = self._to_dec(contract.get("contractSize") or contract.get("contractSz") or contract.get("ctVal") or "0")
-        except Exception:
-            ct = Decimal("0")
-
         def _fee_from_order_detail_row(drow: Dict[str, Any]) -> Tuple[Decimal, str]:
             """Best-effort fee on order detail (varies by Bitget API version)."""
             if not isinstance(drow, dict):
@@ -1058,10 +1029,10 @@ class BitgetMixClient(BaseRestClient):
             # Bitget V2: feeDetail nested structure (may be list, dict, or JSON string)
             if fv is None or str(fv).strip() in ("", "0", "0.0"):
                 fd_fee, fd_ccy = self._parse_fee_detail(drow.get("feeDetail"))
-                if fd_fee > 0:
+                if fd_ccy:
                     logger.debug("Bitget order detail fee via feeDetail: %.8f %s", fd_fee, fd_ccy)
                     return fd_fee, fd_ccy or ccy
-            fee = self._to_dec(fv or "0")
+            fee = -self._to_dec(fv or "0")
             return fee, ccy
 
         while True:
@@ -1083,48 +1054,25 @@ class BitgetMixClient(BaseRestClient):
                 if isinstance(fill_list, list):
                     for f in fill_list:
                         try:
-                            # Bitget fills may provide either baseVolume or size.
-                            # Our system standardizes on base-asset quantity.
                             sz_base = self._to_dec(f.get("baseVolume") or "0")
-                            if sz_base <= 0:
-                                sz_contracts = self._to_dec(f.get("size") or f.get("fillSize") or "0")
-                                if sz_contracts > 0 and ct > 0:
-                                    sz_base = sz_contracts * ct
                             px = self._to_dec(f.get("fillPrice") or f.get("price") or "0")
-
-                            fee_v = f.get("fee")
-                            if fee_v is None:
-                                fee_v = f.get("fillFee") or f.get("tradeFee") or f.get("deductFee")
-                            ccy = str(
-                                f.get("feeCoin") or f.get("feeCcy") or f.get("fillFeeCoin") or f.get("feeCurrency") or ""
-                            ).strip()
-                            # Bitget V2: fee is inside feeDetail (list/dict/JSON string)
-                            if fee_v is None or str(fee_v).strip() in ("", "0", "0.0"):
-                                fd_fee, fd_ccy = self._parse_fee_detail(f.get("feeDetail"))
-                                if fd_fee > 0:
-                                    fee = fd_fee
-                                    if not ccy and fd_ccy:
-                                        ccy = fd_ccy
-                                else:
-                                    fee = self._to_dec(fee_v or "0")
-                            else:
-                                fee = self._to_dec(fee_v or "0")
 
                             if sz_base > 0 and px > 0:
                                 total_base += sz_base
                                 total_quote += sz_base * px
-                            if fee != 0:
-                                # Fees may be negative; store absolute cost.
-                                abs_fee = abs(fee)
-                                total_fee += abs_fee
-                                if (not fee_ccy) and ccy:
-                                    fee_ccy = ccy
-                                fee_key = ccy.upper() if ccy else "UNKNOWN"
-                                fees_by_ccy[fee_key] = fees_by_ccy.get(fee_key, 0.0) + float(abs_fee)
+                            from app.services.live_trading.bitget_fees import fee_breakdown
+                            native = fee_breakdown(f.get("feeDetail"))
+                            if not native and f.get("fee") is not None:
+                                native = fee_breakdown({"fee": f["fee"], "feeCoin": f.get("feeCoin") or f.get("feeCcy")})
+                            for currency, amount in native.items():
+                                fees_by_ccy[currency] = fees_by_ccy.get(currency, 0.0) + amount
+                            total_fee = sum(fees_by_ccy.values()) if len(fees_by_ccy) == 1 else 0
+                            fee_ccy = next(iter(fees_by_ccy)) if len(fees_by_ccy) == 1 else "MIXED" if fees_by_ccy else ""
+
                         except Exception:
                             continue
                 if total_base > 0 and total_quote > 0:
-                    if total_fee <= 0 and not timed_out:
+                    if not fees_by_ccy and not timed_out:
                         time.sleep(float(poll_interval_sec or 0.5))
                         continue
                     logger.debug(
@@ -1159,7 +1107,11 @@ class BitgetMixClient(BaseRestClient):
                     avg = float(d.get("priceAvg") or d.get("fillPrice") or 0.0) if (d.get("priceAvg") or d.get("fillPrice")) else 0.0
                     filled = float(d.get("baseVolume") or d.get("filledQty") or 0.0) if (d.get("baseVolume") or d.get("filledQty")) else 0.0
                     dfee, dccy = _fee_from_order_detail_row(d)
-                    abs_fee = abs(dfee) if dfee != 0 else Decimal("0")
+                    from app.services.live_trading.bitget_fees import fee_breakdown
+                    detail_fees = fee_breakdown(d.get("feeDetail"))
+                    if not detail_fees and dccy and dccy != "MIXED":
+                        detail_fees = {str(dccy).upper(): float(dfee)}
+                    abs_fee = dfee
 
                     if filled > 0 and avg > 0:
                         if not timed_out and abs_fee == 0:
@@ -1174,7 +1126,7 @@ class BitgetMixClient(BaseRestClient):
                             "avg_price": avg,
                             "fee": float(abs_fee),
                             "fee_ccy": str(dccy or ""),
-                            "fees_by_ccy": ({str(dccy).upper(): float(abs_fee)} if abs_fee > 0 else {}),
+                            "fees_by_ccy": detail_fees,
                             "state": state,
                             "detail": last_detail,
                             "fills": last_fills,
@@ -1192,7 +1144,7 @@ class BitgetMixClient(BaseRestClient):
                             "avg_price": avg,
                             "fee": float(abs_fee),
                             "fee_ccy": str(dccy or ""),
-                            "fees_by_ccy": ({str(dccy).upper(): float(abs_fee)} if abs_fee > 0 else {}),
+                            "fees_by_ccy": detail_fees,
                             "state": state,
                             "detail": last_detail,
                             "fills": last_fills,
@@ -1210,7 +1162,7 @@ class BitgetMixClient(BaseRestClient):
                     return {
                         "filled": filled,
                         "avg_price": avg,
-                        "fee": float(abs(dfee)) if dfee != 0 else 0.0,
+                        "fee": float(dfee),
                         "fee_ccy": str(dccy or ""),
                         "state": st,
                         "detail": last_detail,

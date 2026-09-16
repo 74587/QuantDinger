@@ -72,10 +72,10 @@ class FillAccumulator:
 
     def apply_fee(self, fee: float, ccy: str = "") -> None:
         try:
-            fv = abs(float(fee or 0.0))
+            fv = float(fee or 0.0)
         except Exception:
             fv = 0.0
-        if fv > 0:
+        if fv != 0 or ccy:
             key = str(ccy or "").strip().upper() or "UNKNOWN"
             self.fees_by_ccy[key] = self.fees_by_ccy.get(key, 0.0) + fv
             if len(self.fees_by_ccy) == 1:

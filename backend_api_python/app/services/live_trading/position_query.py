@@ -168,12 +168,8 @@ def query_exchange_position_size(
             contract = str(p.get("contract") or "").strip()
             if contract != want_contract and not symbols_equivalent(contract.replace("_", "/"), sym):
                 continue
-            qm = 1.0
-            try:
-                meta = client.get_contract(contract=contract) or {}
-                qm = float(meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0) or 1.0
-            except Exception:
-                qm = 1.0
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            qm = contract_multiplier(client, 'gate', contract.replace('_', '/'))
             qty_base = position_base_qty_for_side(p, side, contracts_to_base=qm)
             if qty_base > 0:
                 return float(qty_base)
@@ -184,13 +180,8 @@ def query_exchange_position_size(
         data = (resp.get("data") or []) if isinstance(resp, dict) else []
         contract_size = 1.0
         if getattr(client, "market_type", "swap") != "spot":
-            try:
-                info = client.get_contract_info(symbol=sym) or {}
-                cs = float(info.get("contract_size") or info.get("contractSize") or 0.0)
-                if cs > 0:
-                    contract_size = cs
-            except Exception:
-                pass
+            from app.services.live_trading.fill_accounting import contract_multiplier
+            contract_size = contract_multiplier(client, 'htx', sym)
         for p in data:
             if not isinstance(p, dict):
                 continue

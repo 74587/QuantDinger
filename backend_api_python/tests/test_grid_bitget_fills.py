@@ -100,7 +100,7 @@ def test_query_grid_order_fill_bitget_spot_uses_fills_when_order_info_lags():
         market_type="spot",
         exchange_order_id="spot-oid-2",
     )
-    assert status == "filled"
+    assert status == "partial"
     assert filled == pytest.approx(0.3)
     assert avg == pytest.approx((0.1 * 10 + 0.2 * 11) / 0.3)
     client.get_fills.assert_called_once_with(symbol="ABC/USDT", order_id="spot-oid-2")
@@ -130,7 +130,7 @@ def test_query_grid_order_fill_bitget_mix_uses_fills_when_order_detail_lags():
         exchange_order_id="mix-oid-1",
         exchange_config={"product_type": "USDT-FUTURES"},
     )
-    assert status == "filled"
+    assert status == "partial"
     assert filled == 0.004
     assert avg == 70000.0
     client.get_order_fills.assert_called_once_with(

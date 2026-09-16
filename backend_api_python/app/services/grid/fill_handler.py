@@ -71,6 +71,7 @@ def apply_grid_fill_to_local_state(
     fee_source: str = "",
     exchange_fill_id: str = "",
     execution_event_id: int = 0,
+    fees_by_ccy: Dict[str, float] | None = None,
 ) -> None:
     sym = normalize_strategy_symbol(symbol)
     purpose = str(order.purpose or "")
@@ -82,6 +83,7 @@ def apply_grid_fill_to_local_state(
     if qty <= 0 or px <= 0:
         return
     tc = trading_config if isinstance(trading_config, dict) else {}
+    from app.services.pending_orders.fill_records import spot_position_fill_quantity
     grid_entry_price = _matched_grid_entry_price(int(strategy_id), sym, order)
     grid_profit = _grid_match_profit(purpose, grid_entry_price, px, qty)
 
@@ -95,7 +97,9 @@ def apply_grid_fill_to_local_state(
         strategy_id=int(strategy_id),
         symbol=sym,
         signal_type=signal_type,
-        filled=qty,
+        filled=spot_position_fill_quantity(
+            market_type=str(tc.get('market_type') or 'swap'), symbol=sym, signal_type=signal_type,
+            gross_quantity=qty, fees_by_ccy=fees_by_ccy or {}),
         avg_price=px,
         leg=leg,
     )
@@ -123,10 +127,20 @@ def apply_grid_fill_to_local_state(
         grid_order_id=int(order.id or 0),
         fee_status=str(fee_status or "pending"),
         fee_source=str(fee_source or ""),
+        fees_by_ccy=fees_by_ccy,
+        exchange_order_id=order.exchange_order_id,
     )
 
 
-def record_grid_market_fill(
+def record_grid_market_fill(*args, **kwargs):
+    from app.utils.db import get_db_transaction
+    from app.services.live_trading.fill_accounting import lock_strategy_fills
+    with get_db_transaction():
+        lock_strategy_fills(int(args[0] if args else kwargs['strategy_id']))
+        return _record_grid_market_fill(*args, **kwargs)
+
+
+def _record_grid_market_fill(
     strategy_id: int,
     symbol: str,
     signal_type: str,
@@ -144,6 +158,7 @@ def record_grid_market_fill(
     user_id: int = 0,
     fee_status: str = "pending",
     fee_source: str = "rest",
+    fees_by_ccy: Dict[str, float] | None = None,
 ) -> int:
     """Record a grid initial/risk market fill into L2/L3 ledgers."""
     sym = normalize_strategy_symbol(symbol)
@@ -161,11 +176,13 @@ def record_grid_market_fill(
         market_type=str(tc.get("market_type") or "swap"),
         fill_source="grid_market",
     )
+    from app.services.pending_orders.fill_records import spot_position_fill_quantity
+    fees_by_ccy = fees_by_ccy or ({commission_ccy: commission} if commission_ccy and commission_ccy != 'MIXED' else {})
     profit, _pos, matched_entry = apply_fill_to_local_position(
         strategy_id=int(strategy_id),
         symbol=sym,
         signal_type=sig,
-        filled=qty,
+        filled=spot_position_fill_quantity(market_type=leg.normalized_market_type(), symbol=sym, signal_type=sig, gross_quantity=qty, fees_by_ccy=fees_by_ccy),
         avg_price=px,
         leg=leg,
     )
@@ -184,6 +201,8 @@ def record_grid_market_fill(
         leg=leg,
         fee_status=str(fee_status or "pending"),
         fee_source=str(fee_source or "rest"),
+        fees_by_ccy=fees_by_ccy,
+        exchange_order_id=exchange_order_id,
     )
     if trade_id and (exchange_order_id or client_order_id):
         try:

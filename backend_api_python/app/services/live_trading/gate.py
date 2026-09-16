@@ -83,7 +83,7 @@ class _GateBase(BaseRestClient):
         return hmac.new(self.secret_key.encode("utf-8"), msg.encode("utf-8"), hashlib.sha512).hexdigest()
 
     def _headers(self, ts: str, sign: str) -> Dict[str, str]:
-        headers = {"KEY": self.api_key, "Timestamp": ts, "SIGN": sign, "Content-Type": "application/json"}
+        headers = {"KEY": self.api_key, "Timestamp": ts, "SIGN": sign, "Content-Type": "application/json", "X-Gate-Size-Decimal": "1"}
         if self.channel_id:
             headers["X-Gate-Channel-Id"] = self.channel_id[:19]
         return headers
@@ -160,6 +160,18 @@ class _GateBase(BaseRestClient):
         except Exception as e:
             logger.warning(f"Gate get_fee_rate({symbol}) failed: {e}")
         return None
+
+
+    def _order_trade_rows(self, path: str, params: Dict[str, Any]) -> list:
+        rows = []
+        for page in range(1, 11):
+            result = self._signed_request('GET', path, params={**params, 'limit': 100, 'page': page})
+            if not isinstance(result, list):
+                raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
+            rows.extend(result)
+            if len(result) < 100:
+                return rows
+        raise LiveTradingError('strategyRuntime.fillSnapshotNotReady')
 
 
 class GateSpotClient(_GateBase):
@@ -253,42 +265,22 @@ class GateSpotClient(_GateBase):
         return self._signed_request("GET", f"/api/v4/spot/orders/{str(order_id)}",
                                     params={"currency_pair": to_gate_currency_pair(symbol)})
 
-    def get_spot_trades_for_order(self, *, order_id: str, currency_pair: str) -> Tuple[float, str]:
-        """Aggregate the actual fee from Gate spot fill history for a given order.
-
-        Gate updates ``fee`` on the spot order object asynchronously after the
-        underlying fills are settled; the authoritative source is
-        ``GET /api/v4/spot/my_trades`` which we sum here. Returns ``(0.0, "")``
-        on any failure so callers can transparently fall back to the order-level
-        fee. Reference: https://www.gate.com/docs/developers/apiv4/#list-personal-trading-history
-        """
-        oid = str(order_id or "").strip()
-        pair = str(currency_pair or "").strip()
-        if not oid or not pair:
-            return 0.0, ""
+    def get_spot_trades_for_order(self, *, order_id: str, currency_pair: str, details=None) -> Tuple[float, str]:
         try:
-            resp = self._signed_request(
-                "GET", "/api/v4/spot/my_trades",
-                params={"currency_pair": pair, "order_id": oid, "limit": 100},
-            )
+            rows = self._order_trade_rows('/api/v4/spot/my_trades', {'currency_pair': currency_pair, 'order_id': str(order_id)})
         except Exception:
-            return 0.0, ""
-        if not isinstance(resp, list):
-            return 0.0, ""
-        total = 0.0
-        ccy = ""
-        for t in resp:
-            if not isinstance(t, dict):
-                continue
-            try:
-                v = abs(float(t.get("fee") or 0.0))
-            except Exception:
-                v = 0.0
-            if v > 0:
-                total += v
-                if not ccy:
-                    ccy = str(t.get("fee_currency") or "").strip()
-        return total, ccy
+            return 0.0, ''
+        fees = {}
+        for row in rows:
+            currency = str(row.get('fee_currency') or '').upper()
+            if currency and row.get('fee') not in (None, ''):
+                fees[currency] = fees.get(currency, 0.0) + float(row['fee'])
+        if details is not None:
+            details.update(fees)
+        if len(fees) == 1:
+            currency, amount = next(iter(fees.items()))
+            return amount, currency
+        return 0.0, 'MIXED' if fees else ''
 
     def wait_for_fill(self, *, order_id: str, symbol: str, max_wait_sec: float = 10.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
@@ -305,10 +297,11 @@ class GateSpotClient(_GateBase):
             avg_price = 0.0
             fee = 0.0
             fee_ccy = ""
+            fees_by_ccy = {}
             filled, avg_price = parse_gate_spot_fill(last)
             # Extract fee from Gate API
             try:
-                fee = abs(float(last.get("fee") or 0.0))
+                fee = float(last.get("fee") or 0.0)
             except Exception:
                 fee = 0.0
             fee_ccy = str(last.get("fee_currency") or "").strip()
@@ -318,31 +311,34 @@ class GateSpotClient(_GateBase):
             # fills endpoint and use its sum. This is the same shape Binance /
             # OKX use (post-fill trades endpoint), without it Gate fills get
             # persisted with ``commission=0`` and P&L drifts.
-            if filled > 0 and fee <= 0:
+            if filled > 0 and fee == 0:
                 try:
                     mt_fee, mt_ccy = self.get_spot_trades_for_order(
                         order_id=str(order_id),
-                        currency_pair=str(last.get("currency_pair") or ""),
+                        currency_pair=str(last.get("currency_pair") or to_gate_currency_pair(symbol)),
+                        details=fees_by_ccy,
                     )
                 except Exception:
                     mt_fee, mt_ccy = 0.0, ""
-                if mt_fee > 0:
+                if mt_ccy:
                     fee = mt_fee
                     if mt_ccy:
                         fee_ccy = mt_ccy
+            if not fees_by_ccy and fee_ccy and fee != 0:
+                fees_by_ccy = {fee_ccy: fee}
             # Fee may lag behind filled/avg on order object; keep polling until timeout (same idea as Bitget/OKX).
             if filled > 0 and avg_price > 0:
-                if fee <= 0 and not timed_out:
+                if not fees_by_ccy and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
             if status.lower() in ("closed", "cancelled", "canceled"):
-                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                if fee == 0 and filled > 0 and avg_price > 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
             if timed_out:
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": fees_by_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 
 
@@ -603,7 +599,7 @@ class GateStockClient(_GateBase):
         try:
             detail = self.get_symbol_details(symbol=symbol)
             fee = abs(float(detail.get("commission_rate") or 0.0))
-            if fee > 0:
+            if fee != 0:
                 return {"maker": fee, "taker": fee}
         except Exception as exc:
             logger.warning("Gate stock fee lookup failed for %s: %s", symbol, exc)
@@ -625,8 +621,11 @@ class GateStockClient(_GateBase):
             except Exception:
                 pass
             filled = float(last.get("fill_volume") or 0.0)
-            avg_price = float(last.get("avg_fill_price") or last.get("price") or 0.0)
-            fee = abs(float(last.get("commission") or 0.0))
+            avg_price = float(last.get("avg_fill_price") or 0.0)
+            fee = float(last.get("commission") or 0.0)
+            fee_currency = str(last.get("quote_currency") or self._seed_product_meta.get("quote_currency")
+                               or (symbol.rsplit("/", 1)[-1] if "/" in symbol else "")).upper()
+            fees = {fee_currency: fee} if fee_currency and last.get("commission") not in (None, "") else {}
             status = str(last.get("status_desc") or last.get("status") or "")
             terminal = status.lower() in {"filled", "cancelled", "canceled", "rejected", "failed"}
             if terminal or time.time() >= deadline:
@@ -634,11 +633,8 @@ class GateStockClient(_GateBase):
                     "filled": filled,
                     "avg_price": avg_price,
                     "fee": fee,
-                    "fee_ccy": str(
-                        last.get("quote_currency")
-                        or self._seed_product_meta.get("quote_currency")
-                        or "USD"
-                    ),
+                    "fee_ccy": fee_currency if fees else "",
+                    "fees_by_ccy": fees,
                     "status": status,
                     "order": last,
                 }
@@ -757,7 +753,7 @@ class GateUsdtFuturesClient(_GateBase):
 
         qm = self._to_dec(meta.get("quanto_multiplier") or meta.get("quantoMultiplier") or "0")
         if qm <= 0:
-            qm = Decimal("1")
+            raise LiveTradingError("strategyRuntime.fillContractMetadataUnavailable")
 
         contracts = req / qm
 
@@ -794,7 +790,7 @@ class GateUsdtFuturesClient(_GateBase):
             meta = {}
         qm = self._to_dec(meta.get("quanto_multiplier") or "0")
         if qm <= 0:
-            qm = Decimal("1")
+            raise LiveTradingError("strategyRuntime.fillContractMetadataUnavailable")
         return max(1, int(self._floor(self._to_dec(base_size) / qm)))
 
     def contracts_signed_to_base_qty(self, *, contract: str, contracts_signed: float) -> float:
@@ -818,7 +814,7 @@ class GateUsdtFuturesClient(_GateBase):
             or "0"
         )
         if qm <= 0:
-            qm = Decimal("1")
+            raise LiveTradingError("strategyRuntime.fillContractMetadataUnavailable")
         return float(Decimal(str(ct)) * qm)
 
     def get_accounts(self) -> Any:
@@ -1045,24 +1041,19 @@ class GateUsdtFuturesClient(_GateBase):
         if not oid or not c:
             return 0.0, ""
         try:
-            resp = self._signed_request(
-                "GET", "/api/v4/futures/usdt/my_trades",
-                params={"contract": c, "order": oid, "limit": 100},
-            )
+            resp = self._order_trade_rows('/api/v4/futures/usdt/my_trades', {'contract': c, 'order': oid})
         except Exception:
-            return 0.0, ""
-        if not isinstance(resp, list):
-            return 0.0, ""
+            return 0.0, ''
         total = 0.0
         for t in resp:
             if not isinstance(t, dict):
                 continue
             try:
-                v = abs(float(t.get("fee") or 0.0))
+                v = float(t.get("fee") or 0.0)
             except Exception:
                 v = 0.0
             total += v
-        if total > 0:
+        if resp:
             # Gate USDT-margined perpetuals settle fees in USDT.
             return total, "USDT"
         return 0.0, ""
@@ -1070,14 +1061,8 @@ class GateUsdtFuturesClient(_GateBase):
     def wait_for_fill(self, *, order_id: str, contract: str, max_wait_sec: float = 12.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
-        qm = Decimal("1")
-        try:
-            meta = self.get_contract(contract=str(contract)) or {}
-            qm = self._to_dec(meta.get("quanto_multiplier") or meta.get("contract_size") or "1")
-            if qm <= 0:
-                qm = Decimal("1")
-        except Exception:
-            qm = Decimal("1")
+        from app.services.live_trading.fill_accounting import contract_multiplier
+        qm = Decimal(str(contract_multiplier(self, 'gate', str(contract).replace('_', '/'))))
         while True:
             timed_out = time.time() >= end_ts
             try:
@@ -1102,23 +1087,23 @@ class GateUsdtFuturesClient(_GateBase):
             except Exception:
                 filled = 0.0
             try:
-                avg_price = float(last.get("fill_price") or last.get("fillPrice") or last.get("price") or 0.0)
+                avg_price = float(last.get("fill_price") or last.get("fillPrice") or 0.0)
             except Exception:
                 avg_price = 0.0
             # Extract fee from Gate Futures API
             try:
-                fee = abs(float(last.get("fee") or 0.0))
+                fee = float(last.get("fee") or 0.0)
             except Exception:
                 fee = 0.0
             # Gate USDT futures fees are in USDT
-            if fee > 0:
+            if fee != 0:
                 fee_ccy = "USDT"
             # Gate USDT futures order objects routinely report ``fee=0`` even
             # after the order is fully filled; the authoritative source is
             # /futures/usdt/my_trades (filtered by the ``order`` param). Pull
             # from there so commissions stop landing in ``qd_strategy_trades``
             # as zero and P&L stops drifting.
-            if filled > 0 and fee <= 0:
+            if filled > 0 and fee == 0:
                 try:
                     mt_fee, mt_ccy = self.get_futures_trades_for_order(
                         order_id=str(order_id),
@@ -1126,19 +1111,19 @@ class GateUsdtFuturesClient(_GateBase):
                     )
                 except Exception:
                     mt_fee, mt_ccy = 0.0, ""
-                if mt_fee > 0:
+                if mt_ccy:
                     fee = mt_fee
                     fee_ccy = mt_ccy or "USDT"
             if filled > 0 and avg_price > 0:
-                if fee <= 0 and not timed_out:
+                if not fee_ccy and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": {fee_ccy: fee} if fee_ccy else {}, "status": status, "order": last}
             if str(status).lower() in ("finished", "cancelled", "canceled"):
-                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                if not fee_ccy and filled > 0 and avg_price > 0 and not timed_out:
                     time.sleep(float(poll_interval_sec or 0.5))
                     continue
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": {fee_ccy: fee} if fee_ccy else {}, "status": status, "order": last}
             if timed_out:
-                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "fees_by_ccy": {fee_ccy: fee} if fee_ccy else {}, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))

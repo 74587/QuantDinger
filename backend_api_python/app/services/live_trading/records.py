@@ -14,6 +14,7 @@ Live ownership:
 from __future__ import annotations
 
 import time
+import json
 from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from app.utils.db import get_db_connection
@@ -501,6 +502,8 @@ def record_trade(
     exchange_fill_id: str = "",
     fee_status: str = "pending",
     fee_source: str = "",
+    fees_by_ccy: Optional[Dict[str, float]] = None,
+    exchange_order_id: str = "",
 ) -> int:
     value = float(amount or 0.0) * float(price or 0.0)
     if user_id is None:
@@ -533,9 +536,9 @@ def record_trade(
              matched_entry_price, grid_matched_profit,
              market_type, credential_id, inst_id, fill_source, pending_order_id, grid_order_id,
              strategy_run_id, order_intent_id, execution_event_id, exchange_fill_id,
-             fee_status, fee_source, created_at)
+             fee_status, fee_source, commission_breakdown, exchange_order_id, created_at)
             VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (execution_event_id) WHERE execution_event_id > 0 DO NOTHING
             RETURNING id
             """,
@@ -567,6 +570,8 @@ def record_trade(
                 str(exchange_fill_id or ""),
                 str(fee_status or "pending"),
                 str(fee_source or ""),
+                json.dumps(fees_by_ccy or ({commission_ccy: commission} if commission_ccy and commission_ccy != 'MIXED' else {})),
+                str(exchange_order_id or ''),
             ),
         )
         row = cur.fetchone()
