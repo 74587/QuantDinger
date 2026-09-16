@@ -72,7 +72,7 @@ def handle_data(context, data):
 
 def _intent():
     return resolve_strategy_generation_intent(
-        prompt="ETH 永续 Supertrend 多空双向，3% 止损和 6% 止盈"
+        prompt="ETH 永续 Supertrend 对冲模式双向持仓，3% 止损和 6% 止盈"
     )
 
 
