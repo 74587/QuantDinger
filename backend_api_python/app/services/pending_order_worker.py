@@ -1065,6 +1065,17 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
 
         fee_backfilled = 0
 
+        synced_fee_status = str(sync_raw.get("fee_status") or "").strip().lower()
+        if synced_fee_status not in {"actual", "actual_zero"}:
+            if cumulative_fees:
+                synced_fee_status = (
+                    "actual"
+                    if any(abs(float(value or 0.0)) > 1e-18 for value in cumulative_fees.values())
+                    else "actual_zero"
+                )
+            else:
+                synced_fee_status = "pending"
+
         requested_qty = max(
             0.0,
             float(payload.get("amount") or row.get("amount") or aggregate_filled or 0.0),
@@ -1107,6 +1118,8 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                 if queue_status == "filled" and not cumulative_fees and delta <= ALPACA_FILL_DELTA_EPSILON
                 else ""
             ),
+            fee_status=synced_fee_status,
+            fee_source="rest" if synced_fee_status in {"actual", "actual_zero"} else "",
         )
 
         if fee_backfilled:
@@ -1197,6 +1210,8 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
         avg_price: float,
         exchange_response_json: str,
         dispatch_note: str = "",
+        fee_status: str = "pending",
+        fee_source: str = "",
     ) -> None:
         exchange_response_json = _redact_exchange_json(exchange_response_json)
         with get_db_connection() as db:
@@ -1208,6 +1223,14 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                     dispatch_note = %s,
                     filled = %s,
                     avg_price = %s,
+                    fee_status = CASE
+                        WHEN %s IN ('actual', 'actual_zero') THEN %s
+                        ELSE fee_status
+                    END,
+                    fee_source = CASE
+                        WHEN %s IN ('actual', 'actual_zero') THEN %s
+                        ELSE fee_source
+                    END,
                     exchange_response_json = (COALESCE(NULLIF(exchange_response_json, ''), '{}')::jsonb || %s::jsonb)::text,
                     executed_at = CASE WHEN %s > 0 THEN COALESCE(executed_at, NOW()) ELSE executed_at END,
                     updated_at = NOW()
@@ -1218,6 +1241,10 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                     str(dispatch_note or f"live_fill_sync:{exchange_status or 'unknown'}"),
                     float(filled or 0.0),
                     float(avg_price or 0.0),
+                    str(fee_status or "pending"),
+                    str(fee_status or "pending"),
+                    str(fee_status or "pending"),
+                    str(fee_source or ""),
                     str(exchange_response_json or ""),
                     float(filled or 0.0),
                     int(order_id),

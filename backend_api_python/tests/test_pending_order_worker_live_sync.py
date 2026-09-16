@@ -166,6 +166,31 @@ def test_live_sent_sync_finalizes_after_restart_without_duplicate_fill(monkeypat
     assert snapshots[0]["exchange_status"] == "filled"
 
 
+def test_live_sent_sync_marks_pending_order_fee_as_actual(monkeypatch):
+    row = _row(filled=1.0, avg_price=101.0)
+    worker, snapshots, persisted = _worker(
+        monkeypatch,
+        row,
+        exchange_fill=(1.0, 101.0, "filled"),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "wait_live_order_fill",
+        lambda **kwargs: {
+            "filled": 1.0,
+            "avg_price": 101.0,
+            "fees_by_ccy": {"USDT": 0.05},
+            "fee_status": "actual",
+        },
+    )
+
+    worker._sync_one_live_sent_order(row)
+
+    assert len(persisted) == 1
+    assert snapshots[0]["fee_status"] == "actual"
+    assert snapshots[0]["fee_source"] == "rest"
+
+
 def test_stale_zero_sync_marker_cannot_hide_executor_fill_in_row():
     row = {
         "exchange_response_json": json.dumps(
