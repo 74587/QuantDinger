@@ -258,12 +258,15 @@ def get_spot_base_holding(
                     continue
                 if str(item.get("currency") or "").upper() != base_u:
                     continue
-                matched = True
-                if str(item.get("type") or "").strip().lower() == "frozen":
+                balance_type = str(item.get("type") or "").strip().lower()
+                if balance_type == "frozen":
+                    matched = True
                     frozen += _pick_free_from_row(item, "balance")
-                else:
+                elif balance_type == "trade":
+                    matched = True
                     tradable += _pick_free_from_row(item, "balance")
                     avail += _pick_free_from_row(item, "available", "balance")
+                # Other balance types are not part of this spot trading inventory.
             if matched:
                 return _spot_holding(tradable + frozen, avail)
     except Exception as e:
