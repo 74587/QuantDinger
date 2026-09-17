@@ -504,7 +504,10 @@ class USStockDataSource(BaseDataSource):
                 start_date = floor
             
             
-            klines = self._fetch_yahoo_chart(symbol, interval, start_date, end_date, effective_limit)
+            yahoo_limit = 0 if merge_factor > 1 else effective_limit
+            klines = self._fetch_yahoo_chart(symbol, interval, start_date, end_date, yahoo_limit)
+            if klines and merge_factor > 1:
+                klines = self._merge_complete_minute_buckets(klines, merge_factor)
             if not klines:
                 if timeframe in ('1m', '3m', '5m', '15m', '30m', '1H', '4H'):
                     # Nasdaq's intraday chart is a latest-session feed, not a
@@ -531,9 +534,10 @@ class USStockDataSource(BaseDataSource):
                             truncate=(after_time is None),
                         )
             elif not klines:
-                klines = self._convert_dataframe(df, effective_limit)
+                conversion_limit = 0 if merge_factor > 1 else effective_limit
+                klines = self._convert_dataframe(df, conversion_limit)
                 if merge_factor > 1:
-                    klines = self._merge_every_n_sorted_bars(klines, merge_factor)
+                    klines = self._merge_complete_minute_buckets(klines, merge_factor)
             
             klines = self.filter_and_limit(
                 klines,
@@ -872,6 +876,38 @@ class USStockDataSource(BaseDataSource):
             })
         return out
 
+    def _merge_complete_minute_buckets(
+        self,
+        bars: List[Dict[str, Any]],
+        minutes: int,
+    ) -> List[Dict[str, Any]]:
+        if minutes <= 1:
+            return sorted(bars, key=lambda item: item['time'])
+
+        bucket_seconds = minutes * 60
+        buckets: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        for bar in sorted(bars, key=lambda item: item['time']):
+            timestamp = int(bar['time'])
+            bucket_start = timestamp - (timestamp % bucket_seconds)
+            buckets.setdefault(bucket_start, {})[timestamp] = bar
+
+        merged = []
+        for bucket_start in sorted(buckets):
+            expected_times = [bucket_start + offset * 60 for offset in range(minutes)]
+            bucket = buckets[bucket_start]
+            if any(timestamp not in bucket for timestamp in expected_times):
+                continue
+            chunk = [bucket[timestamp] for timestamp in expected_times]
+            merged.append({
+                'time': bucket_start,
+                'open': chunk[0]['open'],
+                'high': max(bar['high'] for bar in chunk),
+                'low': min(bar['low'] for bar in chunk),
+                'close': chunk[-1]['close'],
+                'volume': round(sum(bar['volume'] for bar in chunk), 2),
+            })
+        return merged
+
     def _fetch_finnhub(
         self,
         symbol: str,
@@ -910,7 +946,9 @@ class USStockDataSource(BaseDataSource):
     def _convert_dataframe(self, df, limit: int) -> List[Dict[str, Any]]:
         """转换 DataFrame 为K线列表"""
         klines = []
-        df = df.tail(limit).reset_index()
+        if limit and limit > 0:
+            df = df.tail(limit)
+        df = df.reset_index()
         
         time_col = None
         if 'Datetime' in df.columns:
