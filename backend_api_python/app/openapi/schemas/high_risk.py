@@ -176,6 +176,10 @@ class QuickTradeCloseRequestSchema(Schema):
         return normalized
 
 
+class QuickTradeCancelRequestSchema(Schema):
+    trade_id = fields.Integer(required=True, validate=validate.Range(min=1))
+
+
 class UserInfoSchema(Schema):
     id = fields.Integer()
     username = fields.String()

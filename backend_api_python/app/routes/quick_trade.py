@@ -6,6 +6,7 @@ or indicator analysis pages, without creating a strategy first.
 
 Endpoints:
   POST /api/quick-trade/place-order      - Place a quick order
+  POST /api/quick-trade/cancel-order     - Cancel an active limit order
   POST /api/quick-trade/close-position   - Close an existing position
   GET  /api/quick-trade/balance          - Get available balance
   GET  /api/quick-trade/position         - Get current position for symbol
@@ -23,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from flask import g, jsonify, request
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app.openapi.schemas.high_risk import (
+    QuickTradeCancelRequestSchema,
     QuickTradeCloseRequestSchema,
     QuickTradeOrderRequestSchema,
 )
@@ -645,6 +647,7 @@ def place_order(body):
             "native_protection_error": protection_error,
             "protected_filled_qty": filled if protection_result else 0.0,
             "margin_mode": margin_mode,
+            "client_order_id": client_order_id,
         }
 
         # ---- record trade ----
@@ -1724,34 +1727,214 @@ def close_position(body):
         return jsonify(resp), 500
 
 
+@quick_trade_blp.route('/cancel-order', methods=['POST'])
+@login_required
+@quick_trade_blp.arguments(QuickTradeCancelRequestSchema, location="json")
+def cancel_order(body):
+    """Cancel an active Quick Trade limit order owned by the current user."""
+    user_id = int(g.user_id)
+    trade_id = int(body.get("trade_id") or 0)
+    active_statuses = {
+        "new", "open", "pending", "accepted", "submitted", "partial", "partially_filled",
+    }
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, credential_id, exchange_id, symbol, order_type,
+                       market_type, status, exchange_order_id, filled_amount,
+                       avg_fill_price, commission, commission_ccy, commission_quote,
+                       raw_result
+                FROM qd_quick_trades
+                WHERE id = %s AND user_id = %s
+                """,
+                (trade_id, user_id),
+            )
+            row = cur.fetchone()
+            cur.close()
+
+        if not row:
+            return jsonify({"code": 0, "msg": "quick_trade.order_not_found"}), 404
+
+        row = dict(row)
+        status = str(row.get("status") or "").strip().lower().replace("-", "_")
+        if str(row.get("order_type") or "").strip().lower() != "limit" or status not in active_statuses:
+            return jsonify({"code": 0, "msg": "quick_trade.order_not_cancellable"}), 409
+
+        order_id = str(row.get("exchange_order_id") or "").strip()
+        credential_id = int(row.get("credential_id") or 0)
+        if not order_id or credential_id <= 0:
+            return jsonify({"code": 0, "msg": "quick_trade.order_not_cancellable"}), 409
+
+        market_type = str(row.get("market_type") or "swap").strip().lower()
+        stored_raw = row.get("raw_result") or {}
+        if isinstance(stored_raw, str):
+            try:
+                stored_raw = json.loads(stored_raw) or {}
+            except Exception:
+                stored_raw = {}
+        if not isinstance(stored_raw, dict):
+            stored_raw = {"raw": stored_raw}
+        metadata = stored_raw.get("_quick_trade")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        margin_mode = str(metadata.get("margin_mode") or "cross").strip().lower()
+        exchange_config = build_exchange_config(
+            credential_id,
+            user_id,
+            {"market_type": market_type, "margin_mode": margin_mode, "td_mode": margin_mode},
+        )
+        client = create_exchange_client(exchange_config, market_type=market_type)
+
+        from app.services.pending_orders.live_order_phases import cancel_live_limit_order
+
+        outcome = cancel_live_limit_order(
+            client=client,
+            symbol=str(row.get("symbol") or ""),
+            order_id=order_id,
+            client_order_id=str(metadata.get("client_order_id") or ""),
+            market_type=market_type,
+            exchange_config=exchange_config,
+        )
+        if outcome is None:
+            return jsonify({"code": 0, "msg": "quick_trade.cancel_unsupported"}), 409
+
+        fill = enrich_fill(
+            client,
+            order_id=order_id,
+            symbol=str(row.get("symbol") or ""),
+            market_type=market_type,
+            max_wait_sec=0.5,
+        )
+        previous_filled = max(0.0, float(row.get("filled_amount") or 0.0))
+        observed_filled = max(0.0, float(fill.get("filled") or 0.0))
+        filled = max(previous_filled, observed_filled)
+        avg_price = max(0.0, float(fill.get("avg_price") or 0.0))
+        if avg_price <= 0:
+            avg_price = max(0.0, float(row.get("avg_fill_price") or 0.0))
+        requested_qty = max(0.0, float(metadata.get("requested_base_qty") or 0.0))
+        reconciled_status = quick_order_status(
+            requested_qty=requested_qty,
+            filled_qty=filled,
+            exchange_status=str(fill.get("status") or ""),
+        )
+        final_status = "filled" if reconciled_status == "filled" else "cancelled"
+        commission = max(float(row.get("commission") or 0.0), float(fill.get("fee") or 0.0))
+        commission_ccy = str(fill.get("fee_ccy") or row.get("commission_ccy") or "").strip().upper()
+        from app.services.live_trading.fee_quote import fee_to_quote
+
+        commission_quote = fee_to_quote(
+            client,
+            symbol=str(row.get("symbol") or ""),
+            fee=commission,
+            fee_ccy=commission_ccy,
+            fill_price=avg_price,
+        )
+        if commission_quote is None and row.get("commission_quote") is not None:
+            commission_quote = float(row.get("commission_quote") or 0.0)
+        metadata["cancelled_at"] = int(time.time())
+        metadata["cancel_outcome"] = outcome if isinstance(outcome, dict) else {"result": str(outcome)}
+        metadata["exchange_status"] = str(fill.get("status") or "")
+        stored_raw["_quick_trade"] = metadata
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                UPDATE qd_quick_trades
+                SET status = %s,
+                    filled_amount = %s,
+                    avg_fill_price = %s,
+                    commission = %s,
+                    commission_ccy = %s,
+                    commission_quote = %s,
+                    raw_result = %s
+                WHERE id = %s AND user_id = %s
+                  AND status IN ('new', 'open', 'pending', 'accepted', 'submitted', 'partial', 'partially_filled')
+                """,
+                (
+                    final_status,
+                    filled,
+                    avg_price,
+                    commission,
+                    commission_ccy,
+                    commission_quote,
+                    json.dumps(stored_raw, ensure_ascii=False),
+                    trade_id,
+                    user_id,
+                ),
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({
+            "code": 1,
+            "msg": "success",
+            "data": {
+                "trade_id": trade_id,
+                "exchange_order_id": order_id,
+                "status": final_status,
+                "filled_amount": filled,
+                "avg_fill_price": avg_price,
+            },
+        })
+    except Exception as exc:
+        logger.error("cancel_order failed trade_id=%s: %s", trade_id, exc)
+        hint = parse_trade_error_hint(str(exc))
+        response: Dict[str, Any] = {"code": 0, "msg": "quick_trade.cancel_failed"}
+        if hint:
+            response["error_hint"] = hint
+        return jsonify(response), 500
+
+
 @quick_trade_blp.route('/history', methods=['GET'])
 @login_required
 def get_history():
     """
     Get quick trade history for the current user.
 
-    Query: limit (int, default 50), offset (int, default 0)
+    Query: limit, offset, credential_id, symbol, market_type
     """
     try:
         user_id = g.user_id
         limit = min(int(request.args.get("limit") or 50), 200)
         offset = int(request.args.get("offset") or 0)
+        credential_id_raw = str(request.args.get("credential_id") or "").strip()
+        credential_id = int(credential_id_raw) if credential_id_raw else 0
+        symbol = str(request.args.get("symbol") or "").strip()
+        market_type = str(request.args.get("market_type") or "").strip().lower()
+        if market_type in ("future", "futures", "perp", "perpetual"):
+            market_type = "swap"
+
+        filters = ["user_id = %s"]
+        params: List[Any] = [user_id]
+        if credential_id > 0:
+            filters.append("credential_id = %s")
+            params.append(credential_id)
+        if symbol:
+            filters.append("UPPER(symbol) = UPPER(%s)")
+            params.append(symbol)
+        if market_type in ("spot", "swap"):
+            filters.append("market_type = %s")
+            params.append(market_type)
+        params.extend([limit, offset])
 
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                """
-                SELECT id, exchange_id, symbol, side, order_type, amount, price,
+                f"""
+                SELECT id, credential_id, exchange_id, symbol, side, order_type, amount, price,
                        leverage, market_type, tp_price, sl_price, status,
                        exchange_order_id, filled_amount, avg_fill_price,
-                       commission, commission_ccy,
+                       commission, commission_ccy, commission_quote,
                        error_msg, source, created_at
                 FROM qd_quick_trades
-                WHERE user_id = %s
+                WHERE {' AND '.join(filters)}
                 ORDER BY created_at DESC
                 LIMIT %s OFFSET %s
                 """,
-                (user_id, limit, offset),
+                tuple(params),
             )
             rows = cur.fetchall() or []
             cur.close()
@@ -1760,6 +1943,7 @@ def get_history():
         for r in rows:
             trades.append({
                 "id": r.get("id"),
+                "credential_id": r.get("credential_id"),
                 "exchange_id": r.get("exchange_id") or "",
                 "symbol": r.get("symbol") or "",
                 "side": r.get("side") or "",
@@ -1776,6 +1960,7 @@ def get_history():
                 "avg_fill_price": float(r.get("avg_fill_price") or 0),
                 "commission": float(r.get("commission") or 0),
                 "commission_ccy": r.get("commission_ccy") or "",
+                "commission_quote": float(r.get("commission_quote") or 0),
                 "error_msg": r.get("error_msg") or "",
                 "source": r.get("source") or "",
                 "created_at": str(r.get("created_at") or ""),
