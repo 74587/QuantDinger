@@ -595,6 +595,15 @@ components:
       - credential_id
       - symbol
       additionalProperties: false
+    QuickTradeCancelRequest:
+      type: object
+      properties:
+        trade_id:
+          type: integer
+          minimum: 1
+      required:
+      - trade_id
+      additionalProperties: false
   responses:
     DEFAULT_ERROR:
       description: Default error response
@@ -6218,6 +6227,26 @@ paths:
       - IBKR
       operationId: getApiIbkrQuote
       x-visibility: internal
+  /api/alpaca/accounts:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Alpaca
+      operationId: getApiAlpacaAccounts
+      summary: Get Api Alpaca Accounts
+      x-visibility: internal
   /api/alpaca/status:
     get:
       responses:
@@ -7868,6 +7897,34 @@ paths:
       - QuickTrade
       operationId: postApiQuickTradeClosePosition
       x-visibility: private
+  /api/quick-trade/cancel-order:
+    post:
+      responses:
+        '422':
+          $ref: '#/components/responses/UNPROCESSABLE_ENTITY'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuickTradeCancelRequest'
+      summary: Cancel an active Quick Trade limit order owned by the current user.
+      tags:
+      - QuickTrade
+      operationId: postApiQuickTradeCancelOrder
+      x-visibility: private
   /api/quick-trade/history:
     get:
       responses:
@@ -7884,7 +7941,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HumanSuccessEnvelope'
       summary: Get quick trade history for the current user.
-      description: 'Query: limit (int, default 50), offset (int, default 0)'
+      description: 'Query: limit, offset, credential_id, symbol, market_type'
       tags:
       - QuickTrade
       operationId: getApiQuickTradeHistory

@@ -4,7 +4,7 @@
     "app/services/pending_order_worker.py": 2968,
     "app/services/fast_analysis.py": 1848,
     "app/routes/strategy.py": 1247,
-    "app/routes/quick_trade.py": 1795
+    "app/routes/quick_trade.py": 1975
   },
   "max_function_lines": {
     "app/services/trading_executor.py::_run_strategy_loop": 1176,
