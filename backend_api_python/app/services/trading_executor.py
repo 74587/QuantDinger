@@ -1278,13 +1278,22 @@ class TradingExecutor:
                 )
             if request.client_order_id:
                 order_details.append(f"client_order_id={request.client_order_id}")
-            append_strategy_log(
-                strategy_id,
-                "trade",
-                f"Order queued: {request.action} {request.symbol} "
-                f"quantity={format_decimal(request.quantity)} "
-                + " ".join(order_details),
-            )
+            if request.execution_mode == "signal":
+                append_strategy_log(
+                    strategy_id,
+                    "signal",
+                    f"Signal notification queued: {request.action} {request.symbol} "
+                    f"quantity={format_decimal(request.quantity)} "
+                    + " ".join(order_details),
+                )
+            else:
+                append_strategy_log(
+                    strategy_id,
+                    "trade",
+                    f"Order queued: {request.action} {request.symbol} "
+                    f"quantity={format_decimal(request.quantity)} "
+                    + " ".join(order_details),
+                )
         return bool(pending_id)
 
     def _run_grid_resting_loop(

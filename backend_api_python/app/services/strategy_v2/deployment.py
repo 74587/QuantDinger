@@ -114,10 +114,6 @@ class StrategyV2DeploymentService:
         if execution_mode == "live" and manifest_market_type == "swap" and not direction_mode:
             raise StrategyV2ContractError("strategyV2.directionModeRequired")
         position_side = direction_mode_position_side(direction_mode)
-        account_risk = payload.get("accountRisk") or payload.get("account_risk") or {}
-        if not isinstance(account_risk, dict):
-            raise StrategyV2ContractError("strategyV2.accountRiskInvalid")
-
         notification_config = {
             "channels": list(payload.get("notificationChannels") or []),
             "targets": payload.get("notificationTargets") or {},
@@ -260,7 +256,6 @@ class StrategyV2DeploymentService:
             "exchange_id": exchange_id,
             "direction_mode": direction_mode,
             "position_side": position_side,
-            "account_risk": dict(account_risk),
             "instrument_products": instrument_products,
             "quote_currency": quote_currency,
         })

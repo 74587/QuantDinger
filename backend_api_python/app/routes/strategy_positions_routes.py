@@ -336,27 +336,6 @@ def get_positions():
         }
 
         exchange_snapshot = None
-        account_risk = None
-        if execution_mode == "live":
-            try:
-                from app.services.exchange_execution import resolve_exchange_config
-                from app.services.live_trading.account_risk import (
-                    account_risk_limits,
-                    account_risk_snapshot,
-                )
-                from app.services.live_trading.leg_context import credential_id_from_exchange_config
-
-                resolved_ex = resolve_exchange_config(exchange_config, user_id=int(user_id or 1))
-                cred_id = int(credential_id_from_exchange_config(resolved_ex) or 0)
-                account_risk = account_risk_snapshot(
-                    user_id=int(user_id),
-                    credential_id=cred_id,
-                    market_type=market_type,
-                    strategy_id=int(strategy_id),
-                    limits=account_risk_limits({"trading_config": trading_config}),
-                )
-            except Exception as e:
-                account_risk = {"allowed": False, "violations": [f"accountRisk.snapshotFailed:{e}"]}
         from app.services.strategy_runtime.bot_type import resolve_bot_type
 
         bot_type = resolve_bot_type(st, trading_config)
@@ -389,7 +368,6 @@ def get_positions():
                 'position_meta': position_meta,
                 'exchange_snapshot': exchange_snapshot,
                 'account_reconciliation': account_reconciliation,
-                'account_risk': account_risk,
             },
         })
     except Exception as e:

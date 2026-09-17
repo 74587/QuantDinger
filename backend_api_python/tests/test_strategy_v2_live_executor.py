@@ -555,6 +555,43 @@ def test_limit_queue_log_identifies_grid_level_order(monkeypatch):
     assert "client_order_id=grid-58-long-entry-1" in message
 
 
+def test_signal_mode_queue_log_is_not_presented_as_an_exchange_order(monkeypatch):
+    executor = TradingExecutor()
+    executor._load_strategy = lambda _strategy_id: {"user_id": 12, "trading_config": {}}
+    logs = []
+    monkeypatch.setattr(
+        trading_executor,
+        "append_strategy_log",
+        lambda *args: logs.append(args),
+    )
+
+    class Gateway:
+        @staticmethod
+        def submit(_request):
+            return 82
+
+    executor.order_gateway = Gateway()
+
+    result = executor._execute_signal(
+        strategy_id=7,
+        strategy_run_id=42,
+        symbol="BTC/USDT",
+        signal_type="open_long",
+        script_base_qty=0.01,
+        current_price=60_000.0,
+        market_type="swap",
+        execution_mode="signal",
+        leverage=1.0,
+        initial_capital=1_000.0,
+        signal_ts=5,
+    )
+
+    assert result is True
+    assert logs[-1][1] == "signal"
+    assert logs[-1][2].startswith("Signal notification queued:")
+    assert "Order queued:" not in logs[-1][2]
+
+
 def test_demo_account_price_overrides_public_market_price(monkeypatch):
     from app.services.live_trading import factory
 

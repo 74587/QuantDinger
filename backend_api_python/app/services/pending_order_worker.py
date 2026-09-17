@@ -1882,45 +1882,6 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
         if not reduce_only and ownership_enabled:
             phases["position_ownership"] = phases_ownership
 
-        if not reduce_only and market_type in {"spot", "swap"}:
-            try:
-                from app.services.live_trading.account_risk import (
-                    account_risk_limits,
-                    account_risk_snapshot,
-                )
-
-                credential_id = credential_id_from_exchange_config(exchange_config)
-                risk_snapshot = account_risk_snapshot(
-                    user_id=int(cfg.get("user_id") or 1),
-                    credential_id=int(credential_id or 0),
-                    market_type=str(market_type),
-                    strategy_id=int(strategy_id),
-                    proposed_symbol=str(symbol),
-                    proposed_side=str(pos_side),
-                    proposed_quantity=float(amount or 0.0),
-                    proposed_price=float(ref_price or 0.0),
-                    proposed_leverage=float(leverage or 1.0),
-                    limits=account_risk_limits(cfg),
-                )
-                phases["account_risk"] = risk_snapshot
-                if not risk_snapshot.get("allowed"):
-                    violations = list(risk_snapshot.get("violations") or [])
-                    error = str(violations[0] if violations else "accountRisk.rejected")
-                    self._mark_failed(order_id=order_id, error=error)
-                    _notify_live_best_effort(status="failed", error=error)
-                    append_strategy_log(
-                        strategy_id,
-                        "warning",
-                        f"Order rejected by account risk controls: {','.join(violations)}",
-                    )
-                    return
-            except Exception as e:
-                error = f"accountRisk.snapshotFailed:{e}"
-                self._mark_failed(order_id=order_id, error=error)
-                _notify_live_best_effort(status="failed", error=error)
-                append_strategy_log(strategy_id, "error", "Order rejected because account risk could not be verified")
-                return
-
         # Close/reduce: the strategy ledger is the ownership boundary.  The
         # exchange position/balance may only reduce the requested quantity.
         if reduce_only:
