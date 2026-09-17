@@ -804,6 +804,51 @@ def test_scheduler_honors_weekday_monthday_and_intraday_time():
     )
 
 
+def test_scheduler_catches_up_target_day_missed_at_period_boundary():
+    good_friday_weekly = ScheduleSpec("weekly", "rebalance", weekday=5)
+    month_end = ScheduleSpec("monthly", "rebalance", monthday=31)
+    weekend_weekly = ScheduleSpec("weekly", "rebalance", weekday=6)
+
+    # 2026-04-03 is Good Friday (no US session): the week must still run once.
+    assert StrategyV2BacktestRunner._schedule_due(
+        good_friday_weekly, pd.Timestamp("2026-04-06"), pd.Timestamp("2026-04-02"), "1d"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        good_friday_weekly, pd.Timestamp("2026-04-07"), pd.Timestamp("2026-04-06"), "1d"
+    )
+    # 2026-01-31 is a Saturday: the January month-end run happens on 2026-02-02.
+    assert StrategyV2BacktestRunner._schedule_due(
+        month_end, pd.Timestamp("2026-02-02"), pd.Timestamp("2026-01-30"), "1d"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        month_end, pd.Timestamp("2026-02-03"), pd.Timestamp("2026-02-02"), "1d"
+    )
+    # A Saturday target on a weekday-only market runs on the following Monday.
+    assert StrategyV2BacktestRunner._schedule_due(
+        weekend_weekly, pd.Timestamp("2026-01-12"), pd.Timestamp("2026-01-09"), "1d"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        weekend_weekly, pd.Timestamp("2026-01-13"), pd.Timestamp("2026-01-12"), "1d"
+    )
+    # Intraday: a Monday bar before the scheduled time does not re-run last week.
+    intraday = ScheduleSpec("weekly", "rebalance", weekday=1, time="09:35")
+    assert not StrategyV2BacktestRunner._schedule_due(
+        intraday, pd.Timestamp("2026-01-12 09:30"), pd.Timestamp("2026-01-09 16:00"), "5m"
+    )
+    assert not StrategyV2BacktestRunner._schedule_due(
+        good_friday_weekly, pd.Timestamp("2026-04-06"), None, "1d"
+    )
+    # Live clocks are zone-aware: stepping back a week must not cross into
+    # the week before when the gap spans a DST change (2026-03-08 in New York).
+    live = ScheduleSpec("weekly", "rebalance", weekday=6, time="09:35")
+    assert StrategyV2BacktestRunner._schedule_due(
+        live,
+        pd.Timestamp("2026-03-09 00:30", tz="America/New_York"),
+        pd.Timestamp("2026-03-06 16:00", tz="America/New_York"),
+        "1m",
+    )
+
+
 def test_rejected_and_deferred_orders_are_visible_in_audit_ledger():
     frame = _frame([100, 101, 102])
     frame["is_suspended"] = [False, True, False]

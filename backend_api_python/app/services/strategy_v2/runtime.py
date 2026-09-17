@@ -1910,27 +1910,39 @@ class StrategyV2BacktestRunner:
     ) -> bool:
         current = pd.Timestamp(current)
         previous = pd.Timestamp(previous) if previous is not None else None
-        scheduled_date = current.normalize()
-        if schedule.frequency == "weekly":
-            target_weekday = max(1, min(7, int(schedule.weekday or 1))) - 1
-            scheduled_date = current.normalize() + pd.Timedelta(days=target_weekday - current.weekday())
-        elif schedule.frequency == "monthly":
-            target_day = max(1, int(schedule.monthday or 1))
-            last_day = calendar.monthrange(current.year, current.month)[1]
-            scheduled_date = pd.Timestamp(
-                year=current.year,
-                month=current.month,
-                day=min(target_day, last_day),
-                tz=current.tz,
-            )
-        elif schedule.frequency != "daily":
+        if schedule.frequency not in {"daily", "weekly", "monthly"}:
             return False
 
-        scheduled_at = scheduled_date
-        if _is_intraday_frequency(bar_frequency) and schedule.time:
-            scheduled_at += _parse_schedule_time(schedule.time)
+        def occurrence(anchor: pd.Timestamp) -> pd.Timestamp:
+            scheduled_date = anchor.normalize()
+            if schedule.frequency == "weekly":
+                target_weekday = max(1, min(7, int(schedule.weekday or 1))) - 1
+                scheduled_date += pd.Timedelta(days=target_weekday - anchor.weekday())
+            elif schedule.frequency == "monthly":
+                target_day = max(1, int(schedule.monthday or 1))
+                last_day = calendar.monthrange(anchor.year, anchor.month)[1]
+                scheduled_date = pd.Timestamp(
+                    year=anchor.year,
+                    month=anchor.month,
+                    day=min(target_day, last_day),
+                    tz=anchor.tz,
+                )
+            if _is_intraday_frequency(bar_frequency) and schedule.time:
+                scheduled_date += _parse_schedule_time(schedule.time)
+            return scheduled_date
+
+        scheduled_at = occurrence(current)
         if current < scheduled_at:
-            return False
+            if previous is None or schedule.frequency == "daily":
+                return False
+            # The target day of the previous period may have had no bar
+            # (weekend, holiday).  Catch it up on the first bar after it, as
+            # already happens when the gap stays inside one period.
+            if schedule.frequency == "weekly":
+                scheduled_at = occurrence(current - pd.DateOffset(days=7))
+            else:
+                scheduled_at = occurrence(current.replace(day=1) - pd.DateOffset(days=1))
+            return previous < scheduled_at <= current
         if previous is None:
             return True
         if schedule.frequency == "daily" and not _is_intraday_frequency(bar_frequency):
