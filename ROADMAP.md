@@ -2,7 +2,9 @@
 
 QuantDinger's public roadmap connects product direction with scoped, reviewable
 contributions. The canonical roadmap index is
-[#257](https://github.com/OpenByteInc/QuantDinger/issues/257).
+[#257](https://github.com/OpenByteInc/QuantDinger/issues/257). Progress for the
+current theme is also visible in the
+[Portfolio Research and Execution milestone](https://github.com/OpenByteInc/QuantDinger/milestone/1).
 
 Roadmap items communicate direction rather than release-date promises. Proposed
 work may change after technical review, user feedback, security analysis, or
