@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Roadmap ideas and architecture discussions
+    url: https://github.com/OpenByteInc/QuantDinger/discussions
+    about: Discuss broad product directions before implementation.
+  - name: Public roadmap
+    url: https://github.com/OpenByteInc/QuantDinger/blob/main/ROADMAP.md
+    about: Review current priorities, planning stages, and contribution rules.
+  - name: Security reports
+    url: https://github.com/OpenByteInc/QuantDinger/security/policy
+    about: Report vulnerabilities privately instead of opening a public issue.

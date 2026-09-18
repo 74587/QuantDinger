@@ -2,6 +2,12 @@
 
 <!-- What does this PR do? -->
 
+## Related issue
+
+<!-- Use "Closes #123" for a complete scoped issue or "Part of #123" for an epic slice. -->
+
+-
+
 ## Changes
 
 - 
@@ -21,3 +27,9 @@
 ## Screenshots (if UI change)
 
 <!-- Paste before/after screenshots -->
+
+## Roadmap contribution (if applicable)
+
+- [ ] A maintainer confirmed the claimed scope before implementation
+- [ ] This PR implements one reviewable slice rather than an entire epic
+- [ ] User-facing behavior and compatibility notes are documented

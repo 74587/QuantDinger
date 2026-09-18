@@ -95,6 +95,34 @@ If you plan a large change, please open a discussion first.
 
 ---
 
+## 🗺️ Roadmap Contributions
+
+Public roadmap work is indexed in [ROADMAP.md](ROADMAP.md). Roadmap epics describe
+product direction and must be split into focused tasks before implementation.
+
+Only work marked **Ready** and **help wanted** is available for direct
+implementation. Items in **Proposed** or **RFC** need product or architecture
+agreement first.
+
+To claim a roadmap task:
+
+1. Comment on the issue with the exact task you want to own.
+2. Include a short plan, the modules you expect to change, and how you will test
+   the result.
+3. Wait for a maintainer to confirm the scope and assign the issue.
+4. Open a draft pull request or post a progress update within seven days.
+5. Link the pull request to the issue and keep the change reviewable.
+
+Claims are coordination tools, not permanent reservations. A maintainer may
+release an inactive claim after seven days without a draft pull request or
+progress update. If you need more time, leave a short update on the issue.
+
+Do not open a pull request that attempts to implement an entire roadmap epic.
+Execution-critical changes, public API changes, database migrations, and new
+runtime dependencies require an agreed RFC or scoped issue first.
+
+---
+
 ## 🛠️ Development Setup
 
 This repository contains:

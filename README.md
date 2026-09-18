@@ -547,6 +547,9 @@ before opening a pull request. Keep routes thin, preserve API compatibility,
 place long-running behavior in the correct process, and include focused tests
 for high-risk changes.
 
+The [public roadmap](ROADMAP.md) lists active product themes, planning stages,
+and the process for claiming scoped contributor work.
+
 ## Exchange partner links
 
 These are referral links. QuantDinger may receive a commission or trading-fee
@@ -620,6 +623,7 @@ arising from use or misuse of the software.
 
 - [Website](https://www.quantdinger.com)
 - [Contributing guide](CONTRIBUTING.md)
+- [Public roadmap](ROADMAP.md)
 - [Contributors](CONTRIBUTORS.md)
 - [Report bugs or request features](https://github.com/OpenByteInc/QuantDinger/issues)
 - Email: [support@quantdinger.com](mailto:support@quantdinger.com)

@@ -2,6 +2,10 @@ name: Feature Request
 description: Suggest a new feature or improvement
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Use [GitHub Discussions](https://github.com/OpenByteInc/QuantDinger/discussions) for broad product directions, new asset classes, or architecture proposals. Review the [public roadmap](https://github.com/OpenByteInc/QuantDinger/blob/main/ROADMAP.md) before submitting a duplicate request.
   - type: textarea
     id: problem
     attributes:
@@ -21,5 +25,15 @@ body:
     attributes:
       label: Alternatives considered
       description: Any other approaches you've thought about?
+    validations:
+      required: false
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What observable behavior would make this request complete?
+      placeholder: |
+        - [ ] A user can ...
+        - [ ] The system reports ...
     validations:
       required: false
