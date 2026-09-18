@@ -2,13 +2,45 @@ from uuid import UUID
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from app.services.alpaca_trading.client import AlpacaClient, AlpacaConfig, _as_str_id, _id_log_prefix
+from app.services.alpaca_trading.client import (
+    AlpacaClient,
+    AlpacaConfig,
+    _as_str_id,
+    _format_alpaca_error,
+    _id_log_prefix,
+    _normalize_equity_price,
+)
 
 
 def test_as_str_id_from_uuid():
     uid = UUID("12345678-1234-5678-1234-567812345678")
     assert _as_str_id(uid) == "12345678-1234-5678-1234-567812345678"
     assert _id_log_prefix(uid) == "12345678-123"
+
+
+def test_equity_prices_follow_alpaca_minimum_price_increment():
+    assert _normalize_equity_price("220.3169937133789") == 220.32
+    assert _normalize_equity_price("0.12345678") == 0.1235
+
+
+def test_sub_penny_rejection_is_not_reported_as_authentication_failure():
+    raw = (
+        '{"code":42210000,"message":"invalid take_profit.limit_price '
+        '218.53509811401366, sub-penny increment does not fulfill minimum pricing criteria"}'
+    )
+
+    message = _format_alpaca_error(RuntimeError(raw))
+
+    assert message == raw
+    assert "authentication failed" not in message.lower()
+
+
+def test_alpaca_authentication_error_is_still_classified():
+    raw = '{"code":40110000,"message":"request is not authorized"}'
+
+    message = _format_alpaca_error(RuntimeError(raw))
+
+    assert "authentication failed" in message.lower()
 
 
 @patch("app.services.alpaca_trading.client._ensure_alpaca")
@@ -111,6 +143,50 @@ def test_equity_market_sell_caps_quantity_to_available_fractional_position(mock_
         symbol="SPY", qty=12.654518329, side="sell", time_in_force="day"
     )
     assert result.raw["submitted_qty"] == 12.654518329
+
+
+@patch("app.services.alpaca_trading.client.time.sleep", return_value=None)
+@patch("app.services.alpaca_trading.client._ensure_alpaca")
+def test_equity_market_bracket_prices_are_normalized(mock_ensure, _mock_sleep):
+    market_request = MagicMock()
+    take_profit_request = MagicMock()
+    stop_loss_request = MagicMock()
+    modules = {
+        "MarketOrderRequest": market_request,
+        "TakeProfitRequest": take_profit_request,
+        "StopLossRequest": stop_loss_request,
+        "OrderSide": SimpleNamespace(BUY="buy", SELL="sell"),
+        "TimeInForce": SimpleNamespace(GTC="gtc", DAY="day"),
+        "OrderClass": SimpleNamespace(BRACKET="bracket", OTO="oto"),
+    }
+    mock_ensure.return_value = modules
+    trading = MagicMock()
+    order = SimpleNamespace(
+        id="order-3",
+        filled_qty="0",
+        filled_avg_price=None,
+        status=SimpleNamespace(value="accepted"),
+        submitted_at="now",
+    )
+    trading.submit_order.return_value = order
+    trading.get_order_by_id.return_value = order
+
+    client = AlpacaClient(AlpacaConfig(api_key="PKtest", secret_key="secret", paper=True))
+    client._trading_client = trading
+    client._account_id = "account-1"
+
+    result = client.place_market_order(
+        "NVDA",
+        "buy",
+        2.3,
+        "USStock",
+        take_profit_price=220.3169937133789,
+        stop_loss_price=209.123456789,
+    )
+
+    assert result.success is True
+    take_profit_request.assert_called_once_with(limit_price=220.32)
+    stop_loss_request.assert_called_once_with(stop_price=209.12)
 
 
 @patch("app.services.alpaca_trading.client._ensure_alpaca")

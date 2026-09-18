@@ -8,6 +8,8 @@ Supports US stocks, ETFs, and crypto on both paper and live accounts.
 import time
 import threading
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
+import re
 from typing import Optional, Dict, Any, List, Union
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -57,12 +59,33 @@ def _str_attr(obj: Any, name: str, default: str = "") -> str:
     return str(getattr(obj, name, default) or default)
 
 
+def _alpaca_error_status(message: str) -> Optional[int]:
+    code_match = re.search(r'["\']?code["\']?\s*[:=]\s*(\d+)', message, re.IGNORECASE)
+    if code_match:
+        return int(code_match.group(1)[:3])
+    status_match = re.search(
+        r'\b(?:http(?:\s+status)?|status(?:\s+code)?|code)\s*[:=]?\s*(400|401|403)\b',
+        message,
+        re.IGNORECASE,
+    )
+    return int(status_match.group(1)) if status_match else None
+
+
+def _normalize_equity_price(value: Any) -> float:
+    price = Decimal(str(value or 0))
+    if price <= 0:
+        return 0.0
+    increment = Decimal("0.01") if price >= Decimal("1") else Decimal("0.0001")
+    return float(price.quantize(increment, rounding=ROUND_HALF_UP))
+
+
 def _format_alpaca_error(err: Exception, *, context: str = "") -> str:
     """Turn Alpaca SDK/HTTP errors into actionable messages for operators."""
     msg = str(err or "").strip()
     low = msg.lower()
+    status = _alpaca_error_status(msg)
     prefix = f"{context}: " if context else ""
-    if "invalid syntax" in low or '"code":400' in low or "code 400" in low:
+    if "invalid syntax" in low or status == 400:
         return (
             prefix
             + "Alpaca 返回 400 invalid syntax。若使用行情 WebSocket，请确认："
@@ -71,9 +94,9 @@ def _format_alpaca_error(err: Exception, *, context: str = "") -> str:
             "{\"action\":\"subscribe\",\"trades\":[\"BTC/USD\"]}（加密，勿用 BTC/USDT）。"
             "本系统「测试连接」仅走 REST 交易接口，不经过该 WebSocket。"
         )
-    if "401" in low or "auth failed" in low or "not authenticated" in low or "unauthorized" in low:
+    if status == 401 or "auth failed" in low or "not authenticated" in low or "unauthorized" in low:
         return prefix + f"Alpaca authentication failed. Check API Key/Secret and paper(PK*)/live(AK*) mode. Raw error: {msg}"
-    if "403" in low:
+    if status == 403:
         return prefix + f"Alpaca rejected the request. Raw error: {msg}"
     return prefix + msg
 
@@ -297,6 +320,8 @@ class AlpacaClient:
             take_profit_price = float(take_profit_price or 0.0)
             stop_loss_price = float(stop_loss_price or 0.0)
             if asset_class == "us_equity" and (take_profit_price > 0 or stop_loss_price > 0):
+                take_profit_price = _normalize_equity_price(take_profit_price)
+                stop_loss_price = _normalize_equity_price(stop_loss_price)
                 request_kwargs["order_class"] = (
                     modules["OrderClass"].BRACKET
                     if take_profit_price > 0 and stop_loss_price > 0
@@ -380,9 +405,13 @@ class AlpacaClient:
                 "limit_price": price,
                 "extended_hours": extended_hours if asset_class == "us_equity" else False,
             }
+            if asset_class == "us_equity":
+                request_kwargs["limit_price"] = _normalize_equity_price(price)
             take_profit_price = float(take_profit_price or 0.0)
             stop_loss_price = float(stop_loss_price or 0.0)
             if asset_class == "us_equity" and (take_profit_price > 0 or stop_loss_price > 0):
+                take_profit_price = _normalize_equity_price(take_profit_price)
+                stop_loss_price = _normalize_equity_price(stop_loss_price)
                 request_kwargs["order_class"] = (
                     modules["OrderClass"].BRACKET
                     if take_profit_price > 0 and stop_loss_price > 0
