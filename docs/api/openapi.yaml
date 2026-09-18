@@ -131,7 +131,7 @@ components:
           example: QuantDinger Python API
         version:
           type: string
-          example: 5.2.2
+          example: 5.0.1
         status:
           type: string
           example: running
