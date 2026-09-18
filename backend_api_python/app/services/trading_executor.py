@@ -1506,7 +1506,12 @@ class TradingExecutor:
             if isinstance(runtime_config.get("bot_params"), dict)
             else {}
         )
-        if all(
+        try:
+            grid_template_version = int(namespace.get("GRID_TEMPLATE_VERSION") or 0)
+        except (TypeError, ValueError):
+            grid_template_version = 0
+        source_is_authoritative = grid_template_version >= 7
+        if not source_is_authoritative and all(
             float(existing.get(key) or 0.0) > 0
             for key in ("lowerPrice", "upperPrice", "gridCount")
         ):
@@ -1566,7 +1571,10 @@ class TradingExecutor:
             ("equity_trailing_activation_pct", "EQUITY_TRAILING_ACTIVATION"),
             ("equity_trailing_callback_pct", "EQUITY_TRAILING_CALLBACK"),
         ):
-            if runtime_key not in runtime_config and source_key in namespace:
+            if (
+                source_key in namespace
+                and (source_is_authoritative or runtime_key not in runtime_config)
+            ):
                 runtime_config[runtime_key] = namespace[source_key]
         return runtime_config
 

@@ -191,3 +191,38 @@ def test_generated_grid_constants_recover_missing_deployed_bot_params():
         "dynamicAnchor": True,
     }
     assert recovered["equity_take_profit_pct"] == pytest.approx(0.2)
+
+
+def test_v7_grid_source_overrides_stale_editor_runtime_params():
+    recovered = TradingExecutor._recover_generated_grid_config(
+        {
+            "bot_type": "grid",
+            "bot_params": {
+                "lowerPrice": 0.90,
+                "upperPrice": 1.10,
+                "gridCount": 120,
+                "gridCountUnit": "cells",
+                "gridMode": "arithmetic",
+                "dynamicAnchor": True,
+            },
+            "equity_take_profit_pct": 0.10,
+        },
+        {
+            "GRID_TEMPLATE_VERSION": 7,
+            "CELL_LOWER": [2 / 3, 0.80],
+            "CELL_UPPER": [0.80, 4 / 3],
+            "GRID_SIDE": "long",
+            "DYNAMIC_ANCHOR": True,
+            "INITIAL_POSITION_PCT": 0.60,
+            "MAX_OPEN_ENTRY_ORDERS": 2,
+            "EQUITY_TAKE_PROFIT": 0.30,
+        },
+    )
+
+    assert recovered["bot_params"]["lowerPrice"] == pytest.approx(2 / 3)
+    assert recovered["bot_params"]["upperPrice"] == pytest.approx(4 / 3)
+    assert recovered["bot_params"]["gridCount"] == 2
+    assert recovered["bot_params"]["gridMode"] == "geometric"
+    assert recovered["bot_params"]["initialPositionPct"] == pytest.approx(0.60)
+    assert recovered["bot_params"]["maxOpenOrders"] == 2
+    assert recovered["equity_take_profit_pct"] == pytest.approx(0.30)
