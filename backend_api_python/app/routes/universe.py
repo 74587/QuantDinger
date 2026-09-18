@@ -131,6 +131,18 @@ def get_universe(universe_id: int):
         return jsonify({"code": 0, "msg": "universe.getFailed", "data": None}), 500
 
 
+@universe_blp.route("/<int:universe_id>", methods=["DELETE"])
+@login_required
+def delete_universe(universe_id: int):
+    try:
+        return _success(get_universe_service().delete_manual(g.user_id, universe_id))
+    except UniverseError as exc:
+        return _failure(exc)
+    except Exception:
+        logger.exception("delete universe failed")
+        return jsonify({"code": 0, "msg": "universe.deleteFailed", "data": None}), 500
+
+
 @universe_blp.route("/<int:universe_id>/members", methods=["GET"])
 @login_required
 def get_universe_members(universe_id: int):
