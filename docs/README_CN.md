@@ -20,9 +20,11 @@ QuantDinger 是一套可自托管的 AI 量化交易平台，覆盖行情研究�
 
 | 你的目标 | 首先阅读 | 接下来阅读 |
 | --- | --- | --- |
-| 安装 QuantDinger | [云服务器部署](deployment/CLOUD_DEPLOYMENT_CN.md) | [安装故障排查](deployment/INSTALL_TROUBLESHOOTING_CN.md) |
+| 第一次使用 | [首次运行指南](getting-started/FIRST_RUN_CN.md) | [安装故障排查](deployment/INSTALL_TROUBLESHOOTING_CN.md) |
+| 使用 AI 投研 | [AI Research 指南](product/AI_RESEARCH_CN.md) | [策略工作流](product/STRATEGY_WORKFLOW_CN.md) |
+| 运行回测 | [回测中心指南](product/BACKTEST_CENTER_CN.md) | [Strategy API V2 策略指南](trading/STRATEGY_DEV_GUIDE_CN.md) |
+| 准备实盘 | [实盘安全指南](trading/LIVE_TRADING_SAFETY_CN.md) | [安全与漏洞报告](security/README_CN.md) |
 | 上生产环境 | [生产加固](deployment/PRODUCTION_HARDENING_CN.md) | [可观测性](deployment/OBSERVABILITY_CN.md) |
-| 开发交易策略 | [Strategy API V2 策略指南](trading/STRATEGY_DEV_GUIDE_CN.md) | [图表指标指南](trading/INDICATOR_DEV_GUIDE_CN.md) |
 | 接入 AI Agent | [MCP 接入](agent/MCP_SETUP_CN.md) | [Agent Gateway 快速开始](agent/AGENT_QUICKSTART_CN.md) |
 | 通过 HTTP 集成 | [Human API 与 OpenAPI](api/README_CN.md) | [API 约定（英文）](architecture/API_CONVENTIONS.md) |
 | 扩展后端能力 | [系统架构总览](architecture/README_CN.md) | [扩展指南（英文）](architecture/EXTENSION_GUIDE.md) |
@@ -74,6 +76,15 @@ Celery broker 与结果存储。修改进程归属或共享状态前，请先阅
 
 ## 完整文档导航
 
+### 开始使用与产品指南
+
+- [第一次运行 QuantDinger](getting-started/FIRST_RUN_CN.md)
+- [AI Research 使用指南](product/AI_RESEARCH_CN.md)
+- [从策略想法到运行](product/STRATEGY_WORKFLOW_CN.md)
+- [回测中心使用指南](product/BACKTEST_CENTER_CN.md)
+- [实盘交易安全指南](trading/LIVE_TRADING_SAFETY_CN.md)
+- [安全、版本与漏洞报告](security/README_CN.md)
+
 ### 部署与运维
 
 - [云服务器部署](deployment/CLOUD_DEPLOYMENT_CN.md)
@@ -94,6 +105,7 @@ Celery broker 与结果存储。修改进程归属或共享状态前，请先阅
 - [图表指标开发](trading/INDICATOR_DEV_GUIDE_CN.md)
 - [公开股票池与基本面数据](trading/PUBLIC_UNIVERSE_AND_FUNDAMENTALS_CN.md)
 - [Interactive Brokers](trading/IBKR_TRADING_GUIDE_CN.md)
+- [实盘交易安全指南](trading/LIVE_TRADING_SAFETY_CN.md)
 - 可运行示例位于 [`examples/`](examples/)
 
 ### API 与 Agent

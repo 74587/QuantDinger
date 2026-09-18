@@ -1,7 +1,7 @@
 """
 Agent Gateway v1 — versioned, scoped surface for AI agents.
 
-Mounted at `/api/agent/v1`. Read `docs/agent/AI_INTEGRATION_DESIGN.md` before
+Mounted at `/api/agent/v1`. Read `docs/agent/AGENT_QUICKSTART.md` before
 adding new endpoints.
 
 This package is intentionally separate from the human-facing routes so:

@@ -2529,7 +2529,7 @@ DROP TABLE IF EXISTS qd_polymarket_markets CASCADE;
 -- =============================================================================
 
 -- =============================================================================
--- These tables back the multi-agent runtime (see docs/agent/AI_INTEGRATION_DESIGN.md).
+-- These tables back the Agent Gateway runtime (see docs/agent/agent-openapi.json).
 -- They are tenant-scoped via user_id and stay isolated from human JWT sessions.
 
 CREATE TABLE IF NOT EXISTS qd_agent_tokens (

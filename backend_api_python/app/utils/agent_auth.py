@@ -6,7 +6,7 @@ Agent tokens authenticate machine clients (external AI agents, MCP servers,
 custom automations) against `/api/agent/v1/...` and are subject to
 capability-class scoping, per-token rate limits, and an append-only audit log.
 
-Design reference: docs/agent/AI_INTEGRATION_DESIGN.md
+Contract reference: docs/agent/agent-openapi.json
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 
 TOKEN_PREFIX = "qd_agent_"
 
-# Capability classes (see AI_INTEGRATION_DESIGN.md §3).
+# Capability classes are documented in docs/agent/README.md.
 SCOPE_R = "R"   # Read
 SCOPE_W = "W"   # Workspace write
 SCOPE_B = "B"   # Backtest / simulation

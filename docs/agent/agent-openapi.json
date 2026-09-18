@@ -3,7 +3,7 @@
   "info": {
     "title": "QuantDinger Agent Gateway",
     "version": "1.0.0",
-    "description": "Versioned, scoped surface for AI agents. Distinct from the human web API (/api/...). All routes (except /health) require a Bearer agent token. See docs/agent/AI_INTEGRATION_DESIGN.md."
+    "description": "Versioned, scoped surface for AI agents. Distinct from the human web API (/api/...). All routes except /health require a Bearer agent token. See docs/agent/AGENT_QUICKSTART.md and docs/agent/MCP_SETUP.md."
   },
   "servers": [
     { "url": "http://localhost:8888" }

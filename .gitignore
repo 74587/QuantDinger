@@ -83,6 +83,11 @@ _i18n_*.txt
 backend_api_python/logs/
 backend_api_python/dist/
 
+# Local engineering notes, acceptance evidence, and generated audit reports.
+# Product and contributor documentation belongs in the repository-level docs/ tree.
+backend_api_python/docs/
+backend_api_python/reports/
+
 # MCP server build artifacts (PyPI release output, never committed)
 mcp_server/dist/
 mcp_server/build/

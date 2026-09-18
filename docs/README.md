@@ -16,9 +16,11 @@ AI-agent access. This documentation describes the current v5 release.
 
 | Goal | Start here | Continue with |
 | --- | --- | --- |
-| Install QuantDinger | [Cloud deployment](deployment/CLOUD_DEPLOYMENT_EN.md) | [Installation troubleshooting](deployment/INSTALL_TROUBLESHOOTING.md) |
+| First use | [First-run guide](getting-started/FIRST_RUN.md) | [Installation troubleshooting](deployment/INSTALL_TROUBLESHOOTING.md) |
+| Use AI research | [AI Research guide](product/AI_RESEARCH.md) | [Strategy workflow](product/STRATEGY_WORKFLOW.md) |
+| Run a backtest | [Backtest Center guide](product/BACKTEST_CENTER.md) | [Strategy API V2 guide](trading/STRATEGY_DEV_GUIDE.md) |
+| Prepare live trading | [Live-trading safety](trading/LIVE_TRADING_SAFETY.md) | [Security and reporting](security/README.md) |
 | Prepare production | [Production hardening](deployment/PRODUCTION_HARDENING.md) | [Observability](deployment/OBSERVABILITY.md) |
-| Develop a strategy | [Strategy API V2 guide](trading/STRATEGY_DEV_GUIDE.md) | [Indicator guide](trading/INDICATOR_DEV_GUIDE.md) |
 | Connect an AI agent | [MCP setup](agent/MCP_SETUP.md) | [Agent Gateway quickstart](agent/AGENT_QUICKSTART.md) |
 | Integrate over HTTP | [Human OpenAPI](api/README.md) | [API conventions](architecture/API_CONVENTIONS.md) |
 | Extend the backend | [Architecture overview](architecture/README.md) | [Extension guide](architecture/EXTENSION_GUIDE.md) |
@@ -72,6 +74,15 @@ ownership or shared state.
 
 ## Documentation map
 
+### Getting started and product guides
+
+- [First run with QuantDinger](getting-started/FIRST_RUN.md)
+- [AI Research guide](product/AI_RESEARCH.md)
+- [From strategy idea to operation](product/STRATEGY_WORKFLOW.md)
+- [Backtest Center guide](product/BACKTEST_CENTER.md)
+- [Live-trading safety guide](trading/LIVE_TRADING_SAFETY.md)
+- [Security, versions, and vulnerability reporting](security/README.md)
+
 ### Deployment and operations
 
 - [Cloud deployment](deployment/CLOUD_DEPLOYMENT_EN.md)
@@ -90,6 +101,7 @@ ownership or shared state.
 - [Strategy API V2 development](trading/STRATEGY_DEV_GUIDE.md)
 - [Chart indicator development](trading/INDICATOR_DEV_GUIDE.md)
 - [Interactive Brokers](trading/IBKR_TRADING_GUIDE_EN.md)
+- [Live-trading safety](trading/LIVE_TRADING_SAFETY.md)
 - Runnable examples in [`examples/`](examples/)
 
 ### APIs and agents
