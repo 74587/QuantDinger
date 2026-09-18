@@ -11,7 +11,7 @@ QuantDinger MCP Server 将 Agent Gateway 封装为 Agent 可调用的工具；RE
 ## 安装与环境变量
 
 ```bash
-pip install "quantdinger-mcp==0.5.0"
+pip install "quantdinger-mcp==0.6.2"
 ```
 
 ```text
