@@ -320,6 +320,197 @@ def test_multi_symbol_research_fetches_every_requested_snapshot(monkeypatch):
     assert not research["data_gaps"]
 
 
+def test_shareholder_chart_question_loads_reported_ownership_without_market_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        ai_chat,
+        "_local_symbol_candidates",
+        lambda _message: [{
+            "market": "USStock",
+            "symbol": "TSLA",
+            "name": "Tesla",
+            "match": "tsla",
+            "source": "local_symbol_db",
+        }],
+    )
+    monkeypatch.setattr(
+        ai_chat,
+        "collect_us_ownership",
+        lambda symbol: {
+            "ownership": {
+                "top_institutional_holders": [
+                    {"name": "Fund A", "pct_held": 8.1, "report_date": "2026-06-30"},
+                    {"name": "Fund B", "pct_held": 5.2, "report_date": "2026-06-30"},
+                    {"name": "Fund C", "pct_held": 3.4, "report_date": "2026-06-30"},
+                ],
+                "scope": "latest_available_reported_institutional_holders_not_realtime_ownership",
+                "source": "yahoo_finance",
+                "as_of": "2026-06-30",
+            },
+            "_provider_status": {"available": ["ownership"]},
+        },
+    )
+
+    research = _build_research_context({
+        "user_message": "给我画个 tsla 十大股东的饼图",
+        "intent": "market_analysis",
+        "language": "zh-CN",
+    })
+
+    assert research["request"]["task_flags"]["needs_ownership"] is True
+    assert research["market_data"]["primary_snapshot"] == {}
+    ownership = research["fundamentals"]["ownership"]
+    assert ownership["status"] == "available"
+    assert ownership["symbol"] == "TSLA"
+    assert len(ownership["top_institutional_holders"]) == 3
+    ownership_calls = [item for item in research["tool_executions"] if item["tool"] == "company_ownership.lookup"]
+    assert ownership_calls[0]["status"] == "success"
+    assert not research["data_gaps"]
+
+
+def test_shareholder_followup_uses_selected_us_stock_context(monkeypatch):
+    monkeypatch.setattr(ai_chat, "_local_symbol_candidates", lambda _message: [])
+    monkeypatch.setattr(
+        ai_chat,
+        "collect_us_ownership",
+        lambda symbol: {
+            "ownership": {
+                "top_institutional_holders": [{"name": "Fund A", "pct_held": 8.1}],
+                "scope": "latest_available_reported_institutional_holders_not_realtime_ownership",
+                "source": "yahoo_finance",
+            }
+        },
+    )
+
+    research = _build_research_context({
+        "market": "USStock",
+        "symbol": "TSLA",
+        "user_message": "公司披露的实盘股东",
+        "intent": "market_analysis",
+        "language": "zh-CN",
+    })
+
+    assert research["entities"]["primary"]["symbol"] == "TSLA"
+    assert research["fundamentals"]["ownership"]["status"] == "available"
+
+
+def test_router_research_domains_drive_generic_company_lookup_without_price_snapshot(monkeypatch):
+    candidate = {"market": "USStock", "symbol": "TSLA", "name": "Tesla"}
+    monkeypatch.setattr(ai_chat, "_requested_symbol_candidates", lambda _message: [candidate])
+    monkeypatch.setattr(
+        ai_chat,
+        "_build_market_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected market snapshot")),
+    )
+    monkeypatch.setattr(
+        ai_chat,
+        "_search_intelligence",
+        lambda message, candidates, language, research_domains=None: {
+            "web_results": [{"title": "Tesla leadership", "snippet": "Official company profile", "link": "https://example.com"}],
+            "news_results": [],
+            "search_queries": [message],
+            "provider_status": [],
+            "language": language,
+        },
+    )
+
+    enriched = ai_chat._enrich_context({
+        "market": "USStock",
+        "symbol": "TSLA",
+        "user_message": "TSLA 的 CEO 是谁？",
+        "intent": "general",
+        "language": "zh-CN",
+        "agent_intent": {
+            "intent": "general",
+            "entities": {
+                "market": "USStock",
+                "symbol": "TSLA",
+                "research_domains": ["company_profile"],
+            },
+        },
+    })
+
+    assert "market_snapshot" not in enriched
+    research = enriched["research_context"]
+    assert research["request"]["task_flags"]["research_domains"] == ["company_profile"]
+    assert research["news"]["web_results"][0]["title"] == "Tesla leadership"
+
+
+def test_company_research_domains_use_structured_us_provider(monkeypatch):
+    monkeypatch.setattr(
+        ai_chat,
+        "_local_symbol_candidates",
+        lambda _message: [{"market": "USStock", "symbol": "TSLA", "name": "Tesla"}],
+    )
+    monkeypatch.setattr(
+        ai_chat,
+        "collect_us_research",
+        lambda symbol, timeout=10: {
+            "analyst_expectations": {"target_price_median_usd": 320, "as_of": "2026-09-18"},
+            "_provider_status": {"available": ["analyst_expectations"]},
+        },
+    )
+
+    research = _build_research_context({
+        "user_message": "TSLA 的分析师目标价是多少？",
+        "intent": "market_analysis",
+        "language": "zh-CN",
+        "agent_intent": {
+            "entities": {
+                "research_domains": ["analyst_expectations"],
+            }
+        },
+    })
+
+    company_research = research["fundamentals"]["company_research"]
+    assert company_research["status"] == "available"
+    assert company_research["evidence"]["analyst_expectations"]["target_price_median_usd"] == 320
+    assert research["market_data"]["primary_snapshot"] == {}
+
+
+def test_agent_intent_normalizes_research_domains_and_visualization_request():
+    plan = ai_chat._normalize_agent_intent(
+        {
+            "intent": "general",
+            "entities": {
+                "research_domains": ["company_profile", "ownership", "not_a_domain"],
+                "visualization_requested": True,
+            },
+        },
+        "画出公司的管理层持股",
+        False,
+        {"market": "USStock", "symbol": "TSLA"},
+        "zh-CN",
+    )
+
+    assert plan["entities"]["research_domains"] == ["company_profile", "ownership"]
+    assert plan["entities"]["visualization_requested"] is True
+
+
+def test_generic_web_research_uses_the_question_instead_of_market_news_suffix(monkeypatch):
+    calls = []
+
+    class FakeSearch:
+        def provider_status(self):
+            return [{"provider": "fake", "available": True}]
+
+        def search(self, query, num_results=5, days=7):
+            calls.append((query, num_results, days))
+            return [{"title": "Result", "snippet": "Evidence", "link": "https://example.com"}]
+
+    monkeypatch.setattr(ai_chat, "get_search_service", lambda: FakeSearch())
+
+    result = ai_chat._search_intelligence(
+        "TSLA 的 CEO 是谁？",
+        [{"market": "USStock", "symbol": "TSLA", "name": "Tesla"}],
+        "zh-CN",
+        ["company_profile"],
+    )
+
+    assert calls == [("Tesla TSLA 的 CEO 是谁？ official company profile", 5, 3650)]
+    assert "latest market news" not in calls[0][0]
+    assert result["web_results"][0]["title"] == "Result"
+
+
 def test_incomplete_comparison_is_explicit_and_blocks_ranking(monkeypatch):
     message = "比较 TSLA、MSFT、NVDA 最近 5 个交易日收益并排名"
     requested = _requested_symbol_candidates(message)

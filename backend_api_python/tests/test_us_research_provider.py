@@ -64,6 +64,10 @@ class FakeTicker:
         "dateShortInterest": 1_788_739_200,
     }
     options = ("2026-09-18",)
+    institutional_holders = pd.DataFrame([
+        {"Date Reported": pd.Timestamp("2026-06-30"), "Holder": "Fund A", "pctHeld": 0.081, "Shares": 81_000, "Value": 16_200_000},
+        {"Date Reported": pd.Timestamp("2026-06-30"), "Holder": "Fund B", "pctHeld": 0.052, "Shares": 52_000, "Value": 10_400_000},
+    ])
 
     def option_chain(self, expiry):
         assert expiry == "2026-09-18"
@@ -94,6 +98,34 @@ def test_yahoo_research_labels_consensus_options_and_short_interest_scope():
     assert result["options"]["scope"] == "nearest_expiry_snapshot"
     assert result["short_interest"]["short_percent_of_float_pct"] == 1.25
     assert result["short_interest"]["scope"] == "reported_short_interest_not_daily_short_volume"
+    assert [item["name"] for item in result["ownership"]["top_institutional_holders"]] == ["Fund A", "Fund B"]
+    assert result["ownership"]["top_institutional_holders"][0]["pct_held"] == 8.1
+    assert result["ownership"]["top_holders_reported_pct"] == 13.3
+    assert result["ownership"]["other_shareholders_pct"] == 86.7
+    assert result["ownership"]["scope"] == "latest_available_reported_institutional_holders_not_realtime_ownership"
+
+
+def test_yahoo_ownership_lookup_does_not_require_quote_or_options_data():
+    class OwnershipOnlyTicker:
+        institutional_holders = FakeTicker.institutional_holders
+
+        @property
+        def info(self):
+            raise AssertionError("ownership lookup must not load quote info")
+
+        @property
+        def options(self):
+            raise AssertionError("ownership lookup must not load option chains")
+
+    class OwnershipOnlyYahoo:
+        @staticmethod
+        def Ticker(symbol):
+            assert symbol == "AAPL"
+            return OwnershipOnlyTicker()
+
+    result = us_research.fetch_yahoo_us_ownership("AAPL", yf_client=OwnershipOnlyYahoo)
+
+    assert result["ownership"]["top_institutional_holders"][0]["name"] == "Fund A"
 
 
 def test_nearest_atm_iv_ignores_yahoo_placeholder_values():

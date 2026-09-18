@@ -210,6 +210,120 @@ def _nearest_atm_iv(calls: Any, puts: Any, spot: float | None) -> float | None:
     return sum(nearest) / len(nearest) * 100
 
 
+def _row_value(row: Any, *keys: str) -> Any:
+    for key in keys:
+        try:
+            value = row.get(key)
+        except AttributeError:
+            value = None
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _reported_percent(value: Any) -> float | None:
+    number = _number(value)
+    if number is None:
+        return None
+    if 0 <= number <= 1:
+        number *= 100
+    if not 0 <= number <= 100:
+        return None
+    return round(number, 6)
+
+
+def _normalize_institutional_holders(frame: Any, ticker_symbol: str) -> dict[str, Any]:
+    if frame is None or getattr(frame, "empty", True):
+        return {}
+    holders: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        name = str(_row_value(row, "Holder", "holder", "Organization") or "").strip()
+        if not name:
+            continue
+        report_date = _row_value(row, "Date Reported", "dateReported", "Report Date")
+        if hasattr(report_date, "isoformat"):
+            report_date = report_date.isoformat()
+        holder = _compact({
+            "name": name,
+            "shares": _number(_row_value(row, "Shares", "shares")),
+            "value_usd": _number(_row_value(row, "Value", "value")),
+            "pct_held": _reported_percent(_row_value(row, "pctHeld", "% Out", "Percent Out")),
+            "report_date": str(report_date) if report_date is not None else None,
+        }, keep={"name"})
+        holders.append(holder)
+    if not holders:
+        return {}
+    holders.sort(
+        key=lambda item: (
+            item.get("pct_held") is not None,
+            item.get("pct_held") or 0,
+            item.get("shares") or 0,
+        ),
+        reverse=True,
+    )
+    top_holders = holders[:10]
+    reported_pct = sum(item.get("pct_held") or 0 for item in top_holders)
+    report_dates = [item.get("report_date") for item in top_holders if item.get("report_date")]
+    return {
+        "top_institutional_holders": top_holders,
+        "top_holders_reported_pct": round(reported_pct, 6) if reported_pct else None,
+        "other_shareholders_pct": round(max(0.0, 100 - reported_pct), 6) if reported_pct else None,
+        "scope": "latest_available_reported_institutional_holders_not_realtime_ownership",
+        "source": "yahoo_finance",
+        "source_url": f"https://finance.yahoo.com/quote/{ticker_symbol}/holders",
+        "as_of": max(report_dates) if report_dates else _utc_now(),
+    }
+
+
+def _ticker_ownership(ticker: Any, ticker_symbol: str) -> dict[str, Any]:
+    try:
+        institutional_holders = getattr(ticker, "institutional_holders", None)
+    except Exception as exc:
+        logger.info("Yahoo institutional holders unavailable for %s: %s", ticker_symbol, exc)
+        return {}
+    return _normalize_institutional_holders(institutional_holders, ticker_symbol)
+
+
+def fetch_yahoo_us_ownership(symbol: str, *, yf_client: Any = None) -> dict[str, Any]:
+    """Fetch reported institutional holders without loading unrelated research endpoints."""
+    if yf_client is None:
+        import yfinance as yf_client
+    ticker_symbol = _symbol(symbol)
+    ownership = _ticker_ownership(yf_client.Ticker(ticker_symbol), ticker_symbol)
+    return {"ownership": ownership} if ownership else {}
+
+
+def collect_us_ownership(symbol: str, *, yf_client: Any = None) -> dict[str, Any]:
+    ticker = _symbol(symbol)
+    cache_key = f"us_ownership:{ticker}:v1"
+    cached = get_cached(cache_key, _CACHE_TTL_SECONDS)
+    if isinstance(cached, dict):
+        return cached
+    try:
+        result = fetch_yahoo_us_ownership(ticker, yf_client=yf_client)
+    except Exception as exc:
+        logger.info("US ownership source unavailable for %s: %s", ticker, exc)
+        return {
+            "_provider_status": {
+                "attempted": ["yahoo_ownership"],
+                "available": [],
+                "unavailable": ["ownership"],
+                "errors": {"yahoo_ownership": f"{type(exc).__name__}: {exc}"},
+                "collected_at": _utc_now(),
+            }
+        }
+    result["_provider_status"] = {
+        "attempted": ["yahoo_ownership"],
+        "available": ["ownership"] if result.get("ownership") else [],
+        "unavailable": [] if result.get("ownership") else ["ownership"],
+        "errors": {},
+        "collected_at": _utc_now(),
+    }
+    if result.get("ownership"):
+        set_cached(cache_key, result, _CACHE_TTL_SECONDS)
+    return result
+
+
 def fetch_yahoo_us_research(symbol: str, *, yf_client: Any = None) -> dict[str, Any]:
     """Fetch a compact analyst, options and short-interest snapshot."""
     if yf_client is None:
@@ -278,10 +392,13 @@ def fetch_yahoo_us_research(symbol: str, *, yf_client: Any = None) -> dict[str, 
             "as_of": as_of,
         }, keep={"scope", "source", "source_url", "as_of", "expiry"})
 
+    ownership = _ticker_ownership(ticker, ticker_symbol)
+
     return {
         "analyst_expectations": expectations if _has_measurement(expectations) else {},
         "options": options if _has_measurement(options) else {},
         "short_interest": short_interest if _has_measurement(short_interest) else {},
+        "ownership": ownership,
     }
 
 
@@ -304,7 +421,7 @@ def collect_us_research(
     ticker = _symbol(symbol)
     # Bump when normalized semantics change so an upgrade never serves an old
     # snapshot with values that the current contract would reject.
-    cache_key = f"us_research:{ticker}:v2"
+    cache_key = f"us_research:{ticker}:v3"
     cached = get_cached(cache_key, _CACHE_TTL_SECONDS)
     if isinstance(cached, dict):
         return cached
@@ -337,11 +454,12 @@ def collect_us_research(
                 future.cancel()
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
-    available = [key for key in ("sec_filings", "insider_activity", "analyst_expectations", "options", "short_interest") if result.get(key)]
+    supported = ("sec_filings", "insider_activity", "analyst_expectations", "options", "short_interest", "ownership")
+    available = [key for key in supported if result.get(key)]
     result["_provider_status"] = {
         "attempted": sorted(jobs),
         "available": available,
-        "unavailable": sorted(set(("sec_filings", "insider_activity", "analyst_expectations", "options", "short_interest")) - set(available)),
+        "unavailable": sorted(set(supported) - set(available)),
         "errors": errors,
         "collected_at": _utc_now(),
     }
@@ -350,4 +468,10 @@ def collect_us_research(
     return result
 
 
-__all__ = ["collect_us_research", "fetch_sec_research", "fetch_yahoo_us_research"]
+__all__ = [
+    "collect_us_ownership",
+    "collect_us_research",
+    "fetch_sec_research",
+    "fetch_yahoo_us_ownership",
+    "fetch_yahoo_us_research",
+]

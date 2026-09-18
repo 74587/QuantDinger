@@ -77,6 +77,7 @@ from app.config.data_sources import AkshareConfig, TradingEconomicsConfig
 from app.data.market_symbols_seed import search_symbols as seed_search_symbols
 from app.data_providers.macro_series import get_macro_series_provider
 from app.data_providers.news import get_economic_calendar_payload
+from app.data_providers.us_research import collect_us_ownership, collect_us_research
 from app.utils.auth import admin_required, login_required
 from app.utils.cache import CacheManager
 from app.utils.db import get_db_connection
@@ -92,6 +93,21 @@ MAX_IMAGE_DATA_URL_CHARS = 4 * 1024 * 1024
 ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
 COMPARISON_CACHE_TTL_SECONDS = 45
 COMPARISON_PARTIAL_CACHE_TTL_SECONDS = 10
+RESEARCH_DATA_DOMAINS = {
+    "price",
+    "technical",
+    "news",
+    "macro",
+    "fundamentals",
+    "ownership",
+    "filings",
+    "insider_activity",
+    "analyst_expectations",
+    "options",
+    "short_interest",
+    "company_profile",
+    "web_research",
+}
 _comparison_cache_instance: CacheManager | None = None
 COPILOT_EVENT_TYPES = {
     "prompt_shown",
@@ -266,6 +282,29 @@ def _detect_intent(message: str, has_image: bool) -> str:
     return "general"
 
 
+def _heuristic_research_domains(message: str, intent: str) -> list[str]:
+    text = (message or "").lower()
+    rules = (
+        ("price", ("price", "quote", "现价", "最新价", "股价", "多少钱")),
+        ("technical", ("trend", "rsi", "macd", "kline", "走势", "趋势", "均线", "支撑", "阻力", "k线")),
+        ("news", ("news", "headline", "event", "新闻", "消息", "事件")),
+        ("macro", ("macro", "cpi", "nfp", "fomc", "fed", "gdp", "宏观", "非农", "利率", "通胀")),
+        ("fundamentals", ("fundamental", "valuation", "revenue", "earnings", "基本面", "估值", "营收", "财报")),
+        ("ownership", ("shareholder", "stockholder", "ownership", "股东", "持股", "持有人", "机构持仓")),
+        ("filings", ("filing", "10-k", "10-q", "8-k", "披露", "公告", "年报", "季报")),
+        ("insider_activity", ("insider", "form 4", "内部人", "高管增持", "高管减持")),
+        ("analyst_expectations", ("analyst", "price target", "rating", "分析师", "目标价", "评级")),
+        ("options", ("option", "options", "call", "put", "期权", "隐含波动率")),
+        ("short_interest", ("short interest", "short ratio", "空头持仓", "做空比例", "融券")),
+        ("company_profile", ("ceo", "founder", "founded", "headquarters", "公司简介", "创始人", "总部", "主营")),
+    )
+    domains = [domain for domain, hints in rules if any(hint in text for hint in hints)]
+    factual_question = any(token in text for token in ("谁", "什么", "多少", "哪", "何时", "为什么", "who", "what", "when", "where", "which", "how many", "列出", "给我"))
+    if not domains and intent in {"general", "market_analysis"} and factual_question:
+        domains.append("web_research")
+    return domains
+
+
 def _fallback_agent_intent(
     message: str,
     has_image: bool,
@@ -343,6 +382,8 @@ def _fallback_agent_intent(
             "metrics": [],
             "analysis_timeframes": [],
             "needs_live_price": False,
+            "research_domains": _heuristic_research_domains(message, base_intent),
+            "visualization_requested": any(k in text for k in ("图", "chart", "plot", "graph", "visualize")),
         },
         "skills": [skill.to_public(language) for skill in match_skills(message, base_intent, limit=5)],
         "next_action": "ask_missing_fields" if required_missing else ("execute_workflow" if should_execute else "answer_chat"),
@@ -388,6 +429,16 @@ def _normalize_agent_intent(raw: dict, message: str, has_image: bool, context: d
         key=lambda item: _AGENT_STRATEGY_TIMEFRAME_SECONDS[item],
         default=str(entities.get("timeframe") or context.get("timeframe") or "").strip(),
     )
+    raw_research_domains = entities.get("research_domains")
+    if not isinstance(raw_research_domains, (list, tuple, set)):
+        raw_research_domains = []
+    normalized_research_domains = [
+        str(item).strip()
+        for item in raw_research_domains
+        if str(item).strip() in RESEARCH_DATA_DOMAINS
+    ][:8]
+    if not normalized_research_domains:
+        normalized_research_domains = _heuristic_research_domains(message, intent)
     entities = {
         "symbol": str(entities.get("symbol") or selected_symbol or "").strip(),
         "market": str(entities.get("market") or selected_market or "").strip(),
@@ -402,6 +453,8 @@ def _normalize_agent_intent(raw: dict, message: str, has_image: bool, context: d
         "metrics": [str(item) for item in entities.get("metrics") or [] if str(item) in MARKET_QUERY_ALLOWED_METRICS][:12],
         "analysis_timeframes": [str(item) for item in entities.get("analysis_timeframes") or [] if str(item).strip()][:6],
         "needs_live_price": bool(entities.get("needs_live_price")),
+        "research_domains": normalized_research_domains,
+        "visualization_requested": bool(entities.get("visualization_requested")),
     }
 
     missing = raw.get("required_missing") if isinstance(raw.get("required_missing"), list) else []
@@ -459,7 +512,12 @@ def _classify_agent_intent(message: str, attachments: list[dict], context: dict,
         " For market research, normalize paraphrases into entities.market_task, entities.metrics, "
         "entities.analysis_timeframes and entities.needs_live_price. For example, '站上前高了吗' is "
         "breakout_analysis with breakout/support_resistance/volume_ratio; '超卖了吗' requests rsi14. "
-        "Only use metric IDs present in the provided market metric list and never calculate values."
+        "Only use metric IDs present in the provided market metric list and never calculate values. "
+        "For every research or factual question, classify the required sources in entities.research_domains. "
+        "Use only the provided research-domain IDs. Choose price/technical only for market-series questions; "
+        "choose company_profile, fundamentals, ownership, filings, insider_activity, analyst_expectations, options, "
+        "short_interest, news, macro, or web_research according to the actual question. Do not route every company "
+        "question to price data. Set entities.visualization_requested when the user asks for a chart, plot, graph, or diagram."
     )
     schema = {
         "intent": fallback["intent"],
@@ -483,6 +541,8 @@ def _classify_agent_intent(message: str, attachments: list[dict], context: dict,
             "metrics": [],
             "analysis_timeframes": [],
             "needs_live_price": False,
+            "research_domains": [],
+            "visualization_requested": False,
         },
         "skills": [],
         "next_action": "answer_chat",
@@ -514,6 +574,7 @@ def _classify_agent_intent(message: str, attachments: list[dict], context: dict,
         "available_target_types": ["none", "indicator", "script", "monitor", "research"],
         "available_market_tasks": sorted(MARKET_QUERY_ALLOWED_TASKS),
         "available_market_metrics": sorted(MARKET_QUERY_ALLOWED_METRICS),
+        "available_research_domains": sorted(RESEARCH_DATA_DOMAINS),
     })
     try:
         raw = LLMService().safe_call_llm(system_prompt, user_prompt, schema.copy())
@@ -1258,26 +1319,44 @@ def _discover_symbol_candidates_from_search(search_context: dict, existing: list
     return candidates
 
 
-def _search_intelligence(message: str, candidates: list[dict], language: str) -> dict:
+def _search_intelligence(
+    message: str,
+    candidates: list[dict],
+    language: str,
+    research_domains: list[str] | None = None,
+) -> dict:
     query_base = (message or "").strip()
     if not query_base:
         return {"web_results": [], "news_results": [], "search_queries": [], "provider_status": []}
     entity = ""
     if candidates:
         entity = candidates[0].get("name") or candidates[0].get("symbol") or candidates[0].get("match") or ""
-    query = f"{entity} {query_base} latest market news".strip() if entity else f"{query_base} latest market news"
+    domains = {str(item).strip() for item in (research_domains or [])}
+    suffix = ""
+    if "news" in domains:
+        suffix = "latest news"
+    elif "filings" in domains:
+        suffix = "official filings investor relations SEC"
+    elif "ownership" in domains:
+        suffix = "reported institutional holders ownership"
+    elif "fundamentals" in domains:
+        suffix = "financial statements investor relations"
+    elif "company_profile" in domains:
+        suffix = "official company profile"
+    query = " ".join(part for part in (entity, query_base, suffix) if part).strip()
     queries = [query]
     ticker_query = f"{entity or query_base} stock ticker symbol exchange".strip()
-    if ticker_query not in queries:
+    if not candidates and ticker_query not in queries:
         queries.append(ticker_query)
 
     web_results: list[dict] = []
     provider_status: list[dict] = []
+    search_days = 14 if "news" in domains else (730 if "filings" in domains else 3650)
     try:
         service = get_search_service()
         provider_status = service.provider_status() if hasattr(service, "provider_status") else []
         for q in queries[:3]:
-            for item in service.search(q, num_results=5, days=14):
+            for item in service.search(q, num_results=5, days=search_days):
                 web_results.append({
                     "title": item.get("title") or "",
                     "snippet": item.get("snippet") or "",
@@ -2006,8 +2085,15 @@ def _comparison_snapshot_options(
     return snapshot_options_from_plan(query_plan)
 
 
-def _research_task_flags(message: str, intent: str, has_image: bool = False) -> dict:
+def _research_task_flags(
+    message: str,
+    intent: str,
+    has_image: bool = False,
+    research_domains: list[str] | None = None,
+    visualization_requested: bool = False,
+) -> dict:
     text = (message or "").lower()
+    domains = {str(item).strip() for item in (research_domains or []) if str(item).strip() in RESEARCH_DATA_DOMAINS}
     wants_trade_plan = any(k in text for k in ("交易计划", "trade plan", "trading plan", "entry trigger", "stop loss", "take profit", "position sizing"))
     wants_macro = any(k in text for k in ("nfp", "cpi", "fomc", "fed", "rates", "pce", "gdp", "inflation", "payroll", "非农", "利率", "通胀", "就业", "宏观"))
     wants_market_data = any(
@@ -2019,13 +2105,27 @@ def _research_task_flags(message: str, intent: str, has_image: bool = False) -> 
             "多少钱", "股价", "现价",
         )
     )
+    wants_ownership = "ownership" in domains or any(
+        k in text for k in (
+            "股东", "持股", "持有人", "机构持仓", "机构股东", "十大股东", "前十大股东",
+            "shareholder", "shareholders", "stockholder", "stockholders", "ownership",
+            "institutional holder", "institutional holders", "beneficial owner", "beneficial owners",
+        )
+    )
     return {
         "intent": intent,
-        "needs_market_data": wants_trade_plan or wants_market_data or (intent in {"market_analysis", "opportunity_radar"} and not wants_macro),
-        "needs_news": any(k in text for k in ("latest", "news", "headline", "event", "ipo", "spac", "spacex", "新闻", "消息", "事件", "上市", "影响")),
-        "needs_macro": wants_macro,
-        "needs_fundamentals": any(k in text for k in ("valuation", "market cap", "earnings", "revenue", "fundamental", "估值", "市值", "财报", "营收", "基本面")),
-        "needs_chart": has_image or any(k in text for k in ("chart", "screenshot", "kline", "k线图", "截图", "看图")),
+        "research_domains": sorted(domains),
+        "needs_market_data": "price" in domains or "technical" in domains or wants_trade_plan or wants_market_data or (
+            intent in {"market_analysis", "opportunity_radar"} and not wants_macro and not wants_ownership
+            and not domains.intersection({"fundamentals", "filings", "insider_activity", "analyst_expectations", "options", "short_interest", "company_profile", "web_research"})
+        ),
+        "needs_news": "news" in domains or any(k in text for k in ("latest", "news", "headline", "event", "ipo", "spac", "spacex", "新闻", "消息", "事件", "上市", "影响")),
+        "needs_macro": "macro" in domains or wants_macro,
+        "needs_fundamentals": "fundamentals" in domains or any(k in text for k in ("valuation", "market cap", "earnings", "revenue", "fundamental", "估值", "市值", "财报", "营收", "基本面")),
+        "needs_ownership": wants_ownership,
+        "needs_company_research": bool(domains.intersection({"filings", "insider_activity", "analyst_expectations", "options", "short_interest"})),
+        "needs_web_research": "web_research" in domains or "company_profile" in domains,
+        "needs_chart": has_image or visualization_requested or any(k in text for k in ("chart", "screenshot", "kline", "k线图", "截图", "看图", "画图", "饼图", "柱状图", "折线图")),
         "needs_strategy": intent == "strategy_build" or any(k in text for k in ("strategy", "bot", "策略", "机器人", "写代码", "生成代码")),
     }
 
@@ -2047,7 +2147,97 @@ def _research_skill_plan(message: str, intent: str, language: str) -> list[dict]
     ]
 
 
-def _company_fundamentals_context(candidates: list[dict], search_context: dict, flags: dict) -> dict:
+def _company_ownership_context(primary: dict, flags: dict) -> dict:
+    if not flags.get("needs_ownership"):
+        return {}
+    market = str(primary.get("market") or "")
+    symbol = str(primary.get("symbol") or "").strip().upper()
+    if market != "USStock" or not symbol:
+        return {
+            "status": "unsupported_market",
+            "market": market,
+            "symbol": symbol,
+            "note": "The built-in ownership adapter currently supports US equities only.",
+        }
+    try:
+        payload = collect_us_ownership(symbol)
+    except Exception as exc:
+        logger.info("US ownership lookup unavailable for %s: %s", symbol, exc)
+        return {
+            "status": "unavailable",
+            "market": market,
+            "symbol": symbol,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    ownership = payload.get("ownership") if isinstance(payload, dict) else None
+    if not isinstance(ownership, dict) or not ownership.get("top_institutional_holders"):
+        return {
+            "status": "unavailable",
+            "market": market,
+            "symbol": symbol,
+            "provider_status": payload.get("_provider_status") if isinstance(payload, dict) else {},
+        }
+    return {
+        "status": "available",
+        "market": market,
+        "symbol": symbol,
+        **ownership,
+    }
+
+
+def _company_research_context(primary: dict, flags: dict) -> dict:
+    if not flags.get("needs_company_research"):
+        return {}
+    market = str(primary.get("market") or "")
+    symbol = str(primary.get("symbol") or "").strip().upper()
+    requested_domains = set(flags.get("research_domains") or [])
+    field_by_domain = {
+        "filings": "sec_filings",
+        "insider_activity": "insider_activity",
+        "analyst_expectations": "analyst_expectations",
+        "options": "options",
+        "short_interest": "short_interest",
+    }
+    requested_fields = [field for domain, field in field_by_domain.items() if domain in requested_domains]
+    if market != "USStock" or not symbol:
+        return {
+            "status": "unsupported_market",
+            "market": market,
+            "symbol": symbol,
+            "requested_fields": requested_fields,
+        }
+    try:
+        payload = collect_us_research(symbol, timeout=10)
+    except Exception as exc:
+        logger.info("US company research lookup unavailable for %s: %s", symbol, exc)
+        return {
+            "status": "unavailable",
+            "market": market,
+            "symbol": symbol,
+            "requested_fields": requested_fields,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    evidence = {field: payload.get(field) for field in requested_fields if payload.get(field)}
+    missing_fields = [field for field in requested_fields if field not in evidence]
+    status = "available" if evidence and not missing_fields else ("partial" if evidence else "unavailable")
+    return {
+        "status": status,
+        "market": market,
+        "symbol": symbol,
+        "requested_fields": requested_fields,
+        "missing_fields": missing_fields,
+        "evidence": evidence,
+        "provider_status": payload.get("_provider_status") if isinstance(payload, dict) else {},
+    }
+
+
+def _company_fundamentals_context(
+    candidates: list[dict],
+    search_context: dict,
+    flags: dict,
+    ownership_context: dict | None = None,
+    company_research_context: dict | None = None,
+) -> dict:
     primary = candidates[0] if candidates else {}
     related = []
     for item in candidates:
@@ -2062,6 +2252,8 @@ def _company_fundamentals_context(candidates: list[dict], search_context: dict, 
     }
     evidence = []
     for item in (search_context.get("web_results") or [])[:5]:
+        if not isinstance(item, dict) or item.get("error"):
+            continue
         evidence.append({
             "title": item.get("title") or "",
             "source": item.get("source") or "",
@@ -2069,20 +2261,40 @@ def _company_fundamentals_context(candidates: list[dict], search_context: dict, 
             "link": item.get("link") or "",
             "published": item.get("published") or "",
         })
-    return {
+    result = {
         "profile": profile,
         "evidence": evidence,
         "status": "search_context_only" if flags.get("needs_fundamentals") else "light_profile",
         "note": "Use search evidence as context only. Do not invent financial statements or private-company valuation numbers.",
     }
+    if ownership_context:
+        result["ownership"] = ownership_context
+        result["status"] = "ownership_available" if ownership_context.get("status") == "available" else "ownership_unavailable"
+    if company_research_context:
+        result["company_research"] = company_research_context
+        if company_research_context.get("status") in {"available", "partial"}:
+            result["status"] = "company_research_available"
+    return result
 
 
 def _build_research_context(context: dict, has_image: bool = False) -> dict:
     message = str(context.get("user_message") or "")
     intent = str(context.get("intent") or "")
     language = str(context.get("language") or "zh-CN")
-    flags = _research_task_flags(message, intent, has_image=has_image)
-    if not _needs_intelligence_context(message, intent) and not any(flags.values()):
+    agent_entities = (
+        (context.get("agent_intent") or {}).get("entities") or {}
+        if isinstance(context.get("agent_intent"), dict)
+        else {}
+    )
+    flags = _research_task_flags(
+        message,
+        intent,
+        has_image=has_image,
+        research_domains=agent_entities.get("research_domains") if isinstance(agent_entities, dict) else None,
+        visualization_requested=bool(agent_entities.get("visualization_requested")) if isinstance(agent_entities, dict) else False,
+    )
+    active_flags = [value for key, value in flags.items() if key not in {"intent", "research_domains"}]
+    if not _needs_intelligence_context(message, intent) and not any(active_flags):
         return {}
 
     requested = _requested_symbol_candidates(message)
@@ -2098,7 +2310,17 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
         if len(candidates) >= 8:
             break
     needs_symbol_discovery = flags["needs_market_data"] and not candidates
-    search_context = _search_intelligence(message, candidates, language) if (flags["needs_news"] or flags["needs_fundamentals"] or needs_symbol_discovery) else {
+    search_context = _search_intelligence(
+        message,
+        candidates,
+        language,
+        flags.get("research_domains") or [],
+    ) if (
+        flags["needs_news"]
+        or flags["needs_fundamentals"]
+        or flags["needs_web_research"]
+        or needs_symbol_discovery
+    ) else {
         "web_results": [],
         "news_results": [],
         "search_queries": [],
@@ -2106,6 +2328,14 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
     }
     if not candidates and search_context.get("web_results"):
         candidates.extend(_discover_symbol_candidates_from_search(search_context, candidates))
+    if not candidates and flags.get("needs_ownership") and context.get("market") and context.get("symbol"):
+        candidates.append({
+            "market": context.get("market"),
+            "symbol": context.get("symbol"),
+            "name": context.get("name") or context.get("symbol"),
+            "match": context.get("symbol"),
+            "source": "selected_context",
+        })
     primary = candidates[0] if candidates else None
     plan_instruments = requested or ([primary] if primary and primary.get("market") and primary.get("symbol") else [])
     if not plan_instruments and context.get("market") and context.get("symbol"):
@@ -2169,6 +2399,46 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
         "input": {"message": message},
         "output": market_query_plan,
     })
+    if search_context.get("search_queries"):
+        usable_search_results = [
+            item for item in search_context.get("web_results") or []
+            if isinstance(item, dict) and not item.get("error")
+        ]
+        tool_executions.append({
+            "tool": "web_research.search",
+            "status": "success" if usable_search_results else "unavailable",
+            "input": {
+                "queries": search_context.get("search_queries") or [],
+                "domains": flags.get("research_domains") or [],
+            },
+            "output": {
+                "result_count": len(usable_search_results),
+                "provider_status": search_context.get("provider_status") or [],
+            },
+        })
+    ownership_context = _company_ownership_context(primary or {}, flags)
+    company_research_context = _company_research_context(primary or {}, flags)
+    if flags.get("needs_ownership"):
+        tool_executions.append({
+            "tool": "company_ownership.lookup",
+            "status": "success" if ownership_context.get("status") == "available" else "unavailable",
+            "input": {
+                "market": (primary or {}).get("market"),
+                "symbol": (primary or {}).get("symbol"),
+            },
+            "output": ownership_context,
+        })
+    if flags.get("needs_company_research"):
+        tool_executions.append({
+            "tool": "company_research.lookup",
+            "status": company_research_context.get("status") or "unavailable",
+            "input": {
+                "market": (primary or {}).get("market"),
+                "symbol": (primary or {}).get("symbol"),
+                "domains": flags.get("research_domains") or [],
+            },
+            "output": company_research_context,
+        })
     if market_query_plan.get("timeframes"):
         tool_executions.append({
             "tool": "technical_analysis.compute",
@@ -2196,8 +2466,14 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
         )
     elif flags["needs_market_data"] and not (selected_snapshot or primary_snapshot):
         data_gaps.append("No usable quote/K-line snapshot was available for the inferred entity. Resolve the symbol or configure the relevant data source.")
-    if flags["needs_news"] and not search_context.get("web_results"):
-        data_gaps.append("No web/news search result was available. Check search engine configuration or network access.")
+    usable_web_results = [
+        item for item in search_context.get("web_results") or []
+        if isinstance(item, dict) and not item.get("error")
+    ]
+    if (
+        flags["needs_news"] or flags["needs_fundamentals"] or flags["needs_web_research"]
+    ) and not usable_web_results:
+        data_gaps.append("No usable web research result was available. Check search engine configuration or network access.")
     macro_lookup = macro_context.get("release_lookup") or {}
     if not isinstance(macro_lookup, dict):
         macro_lookup = {}
@@ -2206,13 +2482,21 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
         data_gaps.append("No exact macro release value was available for this question. Check BLS/Trading Economics/search configuration.")
     if primary and primary.get("market") in {"private_company", "private_business_unit"}:
         data_gaps.append("The inferred entity is not directly exchange-traded; do not answer with a fake public stock price.")
+    if flags.get("needs_ownership") and ownership_context.get("status") != "available":
+        data_gaps.append(
+            "No reported ownership table was available for the inferred company. Do not invent holder names or percentages."
+        )
+    if flags.get("needs_company_research") and company_research_context.get("status") not in {"available", "partial"}:
+        data_gaps.append(
+            "No structured company-research result was available for the requested fields. Use search evidence when available and do not invent values."
+        )
 
     recommended_actions = []
     if comparison_status.get("complete"):
         recommended_actions.append({"type": "answer", "label": "Compare every requested symbol on the same timeframe fields and publish a complete ranking."})
     elif primary_snapshot:
         recommended_actions.append({"type": "answer", "label": "Use market snapshot for technical levels and risk plan."})
-    if search_context.get("web_results"):
+    if usable_web_results:
         recommended_actions.append({"type": "answer", "label": "Use recent search/news evidence and cite title/source briefly."})
     if macro_events:
         recommended_actions.append({"type": "answer", "label": "Use macro event context and distinguish released values from upcoming events."})
@@ -2256,7 +2540,13 @@ def _build_research_context(context: dict, has_image: bool = False) -> dict:
         },
         "news": search_context,
         "macro": macro_context,
-        "fundamentals": _company_fundamentals_context(candidates, search_context, flags),
+        "fundamentals": _company_fundamentals_context(
+            candidates,
+            search_context,
+            flags,
+            ownership_context,
+            company_research_context,
+        ),
         "quality": {
             "planner_confidence": market_query_plan.get("confidence"),
             "requirements_complete": market_query_status.get("complete"),
@@ -2364,6 +2654,7 @@ def _agent_usage_payload(agent_plan: dict | None, context: dict, language: str) 
     market_data = research.get("market_data") if isinstance(research.get("market_data"), dict) else {}
     news = research.get("news") if isinstance(research.get("news"), dict) else {}
     macro = research.get("macro") if isinstance(research.get("macro"), dict) else {}
+    fundamentals = research.get("fundamentals") if isinstance(research.get("fundamentals"), dict) else {}
     query_plan = ((research.get("request") or {}).get("market_query_plan") or {}) if isinstance(research.get("request"), dict) else {}
     if query_plan:
         tool_ids.append(("market_query.plan", "market_query_plan"))
@@ -2376,6 +2667,12 @@ def _agent_usage_payload(agent_plan: dict | None, context: dict, language: str) 
         tool_ids.append(("market_data.lookup", "market_snapshot"))
     if query_plan.get("timeframes"):
         tool_ids.append(("technical_analysis.compute", "technical_evidence"))
+    if fundamentals.get("ownership"):
+        tool_ids.append(("company_ownership.lookup", "ownership_snapshot"))
+    if fundamentals.get("company_research"):
+        tool_ids.append(("company_research.lookup", "company_research_snapshot"))
+    if news.get("search_queries"):
+        tool_ids.append(("web_research.search", "web_research_results"))
     if plan.get("intent") == "strategy_build":
         workflow_name = str(plan.get("workflow") or "")
         if workflow_name == "script_strategy":
@@ -2437,8 +2734,20 @@ def _enrich_context(context: dict, has_image: bool = False) -> dict:
     )
     query_plan = build_market_query_plan(message, enriched, plan_instruments, semantic_hints)
     enriched["market_query_plan"] = query_plan
-    flags = _research_task_flags(message, str(enriched.get("intent") or ""), has_image=has_image)
-    needs_market_snapshot = bool(flags.get("needs_market_data") or query_plan.get("confidence", 0) >= 90)
+    research_domains = semantic_hints.get("research_domains") if isinstance(semantic_hints, dict) else []
+    flags = _research_task_flags(
+        message,
+        str(enriched.get("intent") or ""),
+        has_image=has_image,
+        research_domains=research_domains,
+        visualization_requested=bool(semantic_hints.get("visualization_requested")) if isinstance(semantic_hints, dict) else False,
+    )
+    normalized_domains = set(flags.get("research_domains") or [])
+    query_plan_is_market_task = not normalized_domains or bool(normalized_domains.intersection({"price", "technical"}))
+    needs_market_snapshot = bool(
+        flags.get("needs_market_data")
+        or (query_plan_is_market_task and query_plan.get("confidence", 0) >= 90)
+    )
     # Multi-symbol requests are fetched together below. Fetching the selected UI
     # symbol first would serialize one network call ahead of the comparison batch.
     if "market_snapshot" not in enriched and len(requested) < 2 and needs_market_snapshot:
@@ -2600,6 +2909,8 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         "Avoid filler such as generic risk education, repeated disclaimers, long checklists, and process narration. Every useful answer should include a verdict, the key evidence, invalidation or next step, and only the missing data that truly blocks action. "
         "When information is missing, ask for at most two missing fields at a time and never re-ask for fields already present in the session memory. "
         "If research_context is provided, treat it as the structured research workspace. First resolve the entity, then choose skills, then use market snapshot, search/news, macro events, fundamentals context, and data gaps before answering. "
+        "For a named public-company ownership question, default to the latest available reported institutional holders in fundamentals.ownership. Do not ask the user to choose between 13F, proxy, or beneficial-owner definitions unless that distinction changes the requested result. State that reported holdings are periodic rather than real-time and do not represent every brokerage beneficial owner. "
+        "When the user explicitly asks to draw or chart data and at least three grounded values are available, append a fenced chart JSON block using only type, title, unit, categories, and series with name and data. Supported types are line, bar, area, pie, and scatter. Never put guessed values in a chart. "
         "If intelligence_context is provided, treat it as a legacy compatibility summary of research_context. "
         "For macro/current-data questions, inspect provided system context, market_snapshot, economic_calendar_context, tools and skills before saying data is unavailable. "
         "If the exact value is missing, explain the missing field and the needed data-source configuration, then provide the best actionable fallback. "
