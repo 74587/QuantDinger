@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
@@ -26,10 +27,15 @@ _CACHE_TTL_SECONDS = 10_800
 _SEC_TICKERS_TTL_SECONDS = 86_400
 _SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+_NASDAQ_OWNERSHIP_URL = "https://api.nasdaq.com/api/company/{symbol}/institutional-holdings"
 _SEC_USER_AGENT = os.getenv(
     "SEC_USER_AGENT",
     "QuantDinger/5.0 open-source-research support@quantdinger.com",
 ).strip()
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36"
+)
 
 
 def _utc_now() -> str:
@@ -44,7 +50,13 @@ def _number(value: Any) -> float | None:
     if value is None or value == "":
         return None
     try:
-        number = float(str(value).replace(",", "").replace("%", "").strip())
+        number = float(
+            str(value)
+            .replace(",", "")
+            .replace("%", "")
+            .replace("$", "")
+            .strip()
+        )
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
@@ -123,14 +135,13 @@ def fetch_sec_research(
     forms = list(recent.get("form") or [])
     filings: list[dict[str, Any]] = []
     form4_dates: list[str] = []
-    relevant_forms = {"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A", "20-F", "6-K"}
     for index, form in enumerate(forms):
         filing_date = _at(recent.get("filingDate"), index)
         accession = str(_at(recent.get("accessionNumber"), index) or "").strip()
         primary_document = str(_at(recent.get("primaryDocument"), index) or "").strip()
         if str(form).upper() in {"4", "4/A"} and filing_date:
             form4_dates.append(str(filing_date))
-        if str(form).upper() not in relevant_forms or len(filings) >= 12:
+        if not form or len(filings) >= 12:
             continue
         accession_path = accession.replace("-", "")
         filing_url = (
@@ -232,6 +243,129 @@ def _reported_percent(value: Any) -> float | None:
     return round(number, 6)
 
 
+def _iso_date(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return text
+
+
+def _configure_yfinance_cache(yf_client: Any) -> None:
+    cache_dir = os.getenv("YFINANCE_CACHE_DIR") or os.path.join(
+        tempfile.gettempdir(), "quantdinger-yfinance"
+    )
+    try:
+        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+        os.environ.setdefault("XDG_CACHE_HOME", cache_dir)
+        set_location = getattr(yf_client, "set_tz_cache_location", None)
+        if callable(set_location):
+            set_location(cache_dir)
+        try:
+            from yfinance import cache as yf_cache
+
+            set_cache_location = getattr(yf_cache, "set_cache_location", None)
+            if callable(set_cache_location):
+                set_cache_location(cache_dir)
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.debug("Unable to configure yfinance cache at %s: %s", cache_dir, exc)
+
+
+def _normalize_nasdaq_ownership(payload: Any, ticker_symbol: str) -> dict[str, Any]:
+    data = payload.get("data") if isinstance(payload, Mapping) else None
+    if not isinstance(data, Mapping):
+        return {}
+    transactions = data.get("holdingsTransactions")
+    table = transactions.get("table") if isinstance(transactions, Mapping) else None
+    rows = table.get("rows") if isinstance(table, Mapping) else None
+    if not isinstance(rows, list):
+        return {}
+
+    summary = data.get("ownershipSummary")
+    summary = summary if isinstance(summary, Mapping) else {}
+    outstanding_entry = summary.get("ShareoutstandingTotal")
+    outstanding_entry = outstanding_entry if isinstance(outstanding_entry, Mapping) else {}
+    shares_outstanding = _number(outstanding_entry.get("value"))
+    outstanding_label = str(outstanding_entry.get("label") or "").lower()
+    if shares_outstanding is not None and "million" in outstanding_label:
+        shares_outstanding *= 1_000_000
+
+    holders: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        name = str(row.get("ownerName") or "").strip()
+        shares = _number(row.get("sharesHeld"))
+        if not name or shares is None or shares <= 0:
+            continue
+        pct_held = (
+            round(shares / shares_outstanding * 100, 6)
+            if shares_outstanding and shares_outstanding > 0
+            else None
+        )
+        market_value = _number(row.get("marketValue"))
+        holders.append(_compact({
+            "name": name,
+            "shares": shares,
+            "value_usd": market_value * 1000 if market_value is not None else None,
+            "pct_held": pct_held,
+            "report_date": _iso_date(row.get("date")),
+        }, keep={"name"}))
+    if not holders:
+        return {}
+    holders.sort(key=lambda item: item.get("shares") or 0, reverse=True)
+    top_holders = holders[:10]
+    reported_pct = sum(item.get("pct_held") or 0 for item in top_holders)
+    report_dates = [item.get("report_date") for item in top_holders if item.get("report_date")]
+    institutional_entry = summary.get("SharesOutstandingPCT")
+    institutional_entry = institutional_entry if isinstance(institutional_entry, Mapping) else {}
+    return {
+        "top_institutional_holders": top_holders,
+        "top_holders_reported_pct": round(reported_pct, 6) if reported_pct else None,
+        "other_shareholders_pct": round(max(0.0, 100 - reported_pct), 6) if reported_pct else None,
+        "institutional_ownership_pct": _reported_percent(institutional_entry.get("value")),
+        "shares_outstanding": shares_outstanding,
+        "scope": "latest_available_reported_institutional_holders_not_realtime_ownership",
+        "source": "nasdaq",
+        "source_url": f"https://www.nasdaq.com/market-activity/stocks/{ticker_symbol.lower()}/institutional-holdings",
+        "as_of": max(report_dates) if report_dates else _utc_now(),
+    }
+
+
+def fetch_nasdaq_us_ownership(
+    symbol: str,
+    *,
+    http_get: Callable[..., Any] = requests.get,
+    timeout: float = 12.0,
+) -> dict[str, Any]:
+    ticker_symbol = _symbol(symbol)
+    response = http_get(
+        _NASDAQ_OWNERSHIP_URL.format(symbol=ticker_symbol),
+        params={
+            "limit": 10,
+            "type": "TOTAL",
+            "sortColumn": "marketValue",
+            "sortOrder": "DESC",
+        },
+        headers={
+            "User-Agent": _BROWSER_USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": f"https://www.nasdaq.com/market-activity/stocks/{ticker_symbol.lower()}/institutional-holdings",
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    ownership = _normalize_nasdaq_ownership(response.json(), ticker_symbol)
+    return {"ownership": ownership} if ownership else {}
+
+
 def _normalize_institutional_holders(frame: Any, ticker_symbol: str) -> dict[str, Any]:
     if frame is None or getattr(frame, "empty", True):
         return {}
@@ -288,35 +422,46 @@ def fetch_yahoo_us_ownership(symbol: str, *, yf_client: Any = None) -> dict[str,
     """Fetch reported institutional holders without loading unrelated research endpoints."""
     if yf_client is None:
         import yfinance as yf_client
+        _configure_yfinance_cache(yf_client)
     ticker_symbol = _symbol(symbol)
-    ownership = _ticker_ownership(yf_client.Ticker(ticker_symbol), ticker_symbol)
+    institutional_holders = getattr(yf_client.Ticker(ticker_symbol), "institutional_holders", None)
+    ownership = _normalize_institutional_holders(institutional_holders, ticker_symbol)
     return {"ownership": ownership} if ownership else {}
 
 
-def collect_us_ownership(symbol: str, *, yf_client: Any = None) -> dict[str, Any]:
+def collect_us_ownership(
+    symbol: str,
+    *,
+    http_get: Callable[..., Any] = requests.get,
+    yf_client: Any = None,
+    timeout: float = 12.0,
+) -> dict[str, Any]:
     ticker = _symbol(symbol)
-    cache_key = f"us_ownership:{ticker}:v1"
+    cache_key = f"us_ownership:{ticker}:v2"
     cached = get_cached(cache_key, _CACHE_TTL_SECONDS)
     if isinstance(cached, dict):
         return cached
-    try:
-        result = fetch_yahoo_us_ownership(ticker, yf_client=yf_client)
-    except Exception as exc:
-        logger.info("US ownership source unavailable for %s: %s", ticker, exc)
-        return {
-            "_provider_status": {
-                "attempted": ["yahoo_ownership"],
-                "available": [],
-                "unavailable": ["ownership"],
-                "errors": {"yahoo_ownership": f"{type(exc).__name__}: {exc}"},
-                "collected_at": _utc_now(),
-            }
-        }
+    attempted: list[str] = []
+    errors: dict[str, str] = {}
+    result: dict[str, Any] = {}
+    for provider, fetcher in (
+        ("nasdaq_ownership", lambda: fetch_nasdaq_us_ownership(ticker, http_get=http_get, timeout=timeout)),
+        ("yahoo_ownership", lambda: fetch_yahoo_us_ownership(ticker, yf_client=yf_client)),
+    ):
+        attempted.append(provider)
+        try:
+            result = fetcher()
+        except Exception as exc:
+            errors[provider] = f"{type(exc).__name__}: {exc}"
+            logger.info("US ownership source %s unavailable for %s: %s", provider, ticker, exc)
+            continue
+        if result.get("ownership"):
+            break
     result["_provider_status"] = {
-        "attempted": ["yahoo_ownership"],
+        "attempted": attempted,
         "available": ["ownership"] if result.get("ownership") else [],
         "unavailable": [] if result.get("ownership") else ["ownership"],
-        "errors": {},
+        "errors": errors,
         "collected_at": _utc_now(),
     }
     if result.get("ownership"):
@@ -328,6 +473,7 @@ def fetch_yahoo_us_research(symbol: str, *, yf_client: Any = None) -> dict[str, 
     """Fetch a compact analyst, options and short-interest snapshot."""
     if yf_client is None:
         import yfinance as yf_client
+        _configure_yfinance_cache(yf_client)
     ticker_symbol = _symbol(symbol)
     ticker = yf_client.Ticker(ticker_symbol)
     info = ticker.info or {}
@@ -471,6 +617,7 @@ def collect_us_research(
 __all__ = [
     "collect_us_ownership",
     "collect_us_research",
+    "fetch_nasdaq_us_ownership",
     "fetch_sec_research",
     "fetch_yahoo_us_ownership",
     "fetch_yahoo_us_research",

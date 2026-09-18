@@ -64,6 +64,7 @@ def stream_harness(monkeypatch):
     monkeypatch.setattr(ai_chat, "_agent_usage_action", lambda *args: None)
     monkeypatch.setattr(ai_chat, "_record_research_tool_calls", lambda *args: None)
     monkeypatch.setattr(ai_chat, "_load_recent_messages", lambda *args, **kwargs: [{"role": "user", "content": "question"}])
+    monkeypatch.setattr(ai_chat, "store_get_session_summary", lambda *args, **kwargs: {})
     monkeypatch.setattr(ai_chat, "_prepare_server_context", lambda *args, **kwargs: (kwargs["client_context"], {}))
     monkeypatch.setattr(ai_chat, "_build_llm_messages", lambda *args, **kwargs: ([{"role": "user", "content": "question"}], {}))
     monkeypatch.setattr(ai_chat, "store_insert_request_usage", lambda *args, **kwargs: 1)
@@ -84,6 +85,15 @@ def stream_harness(monkeypatch):
             finally:
                 response.close()
 
+    def sync():
+        with app.test_request_context("/api/ai/chat/message", method="POST", json={
+            "message": "Who is TSLA's CEO?", "language": "en-US",
+        }):
+            g.user_id = 7
+            return inspect.unwrap(ai_chat.chat_message)()
+
+    state["sync"] = sync
+
     return state, stream
 
 
@@ -103,13 +113,44 @@ def test_stream_accepts_before_slow_work_and_releases_database_during_io(stream_
     assert state["connections"] == 0
 
 
-def test_frontend_routing_result_does_not_trigger_another_llm_classification(stream_harness):
+def test_frontend_routing_result_cannot_override_server_conversation_routing(stream_harness):
     state, stream = stream_harness
     with stream({"market": "USStock", "symbol": "SPCX", "agent_intent": {
         "intent": "market_analysis", "confidence": 95, "should_execute": False,
     }}) as events:
         assert "event: done" in list(events)[-1]
+    assert state["classifications"] == 1
+
+
+def test_grounded_chart_correction_replaces_stream_instead_of_appending_broken_suffix(stream_harness, monkeypatch):
+    _, stream = stream_harness
+    monkeypatch.setattr(ai_chat, "_ensure_grounded_research_chart", lambda answer, context: "corrected chart")
+    with stream() as events:
+        result = list(events)
+    assert any('event: replace' in event and 'corrected chart' in event for event in result)
+    assert 'event: done' in result[-1]
+
+
+def test_sync_research_and_generation_release_database_connections(stream_harness, monkeypatch):
+    from types import SimpleNamespace
+    state, _ = stream_harness
+    def respond(*args, **kwargs):
+        assert state["connections"] == 0
+        return '{"answer":"Grounded answer"}'
+    monkeypatch.setattr(ai_chat, "LLMService", lambda: SimpleNamespace(call_llm_api=respond))
+    response = state["sync"]()
+    assert response.get_json()["data"]["reply"] == "Grounded answer"
+    assert state["classifications"] == 1
+    assert state["connections"] == 0
+
+
+def test_sync_billing_rejection_prevents_model_and_research_calls(stream_harness, monkeypatch):
+    state, _ = stream_harness
+    monkeypatch.setattr(ai_chat, "_charge", lambda *args: (False, "insufficient_credits", {}))
+    _, code = state["sync"]()
+    assert code == 402
     assert state["classifications"] == 0
+    assert "enrich" not in state["events"]
 
 
 def test_billing_rejection_stops_before_research_or_model_work(stream_harness, monkeypatch):

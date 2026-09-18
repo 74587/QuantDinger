@@ -888,12 +888,25 @@ def _strategy_v2_admin_metadata(
     config = _safe_json_loads(trading_config, {}) or {}
     source_meta = _safe_json_loads(source_metadata, {}) or {}
     manifest = config.get("strategy_manifest") or source_meta.get("strategy_manifest") or {}
+    manifest_metadata = _safe_json_loads(manifest.get("metadata"), {}) or {}
     api_version = int(config.get("api_version") or manifest.get("apiVersion") or 0)
     is_v2 = str(strategy_type or "").strip().lower() == "strategyv2" or api_version == 2
 
     template_key = str(source_template_key or "").strip()
     source_origin = str(source_meta.get("source") or "").strip().lower()
-    is_robot = template_key.startswith("robot_v2_") or source_origin == "robot_builder"
+    executor_type = str(
+        config.get("bot_type")
+        or config.get("executor_type")
+        or source_meta.get("executor_type")
+        or manifest_metadata.get("executor_type")
+        or manifest_metadata.get("bot_type")
+        or ""
+    ).strip().lower().replace("-", "_")
+    is_robot = (
+        template_key.startswith("robot_v2_")
+        or source_origin == "robot_builder"
+        or executor_type in {"grid", "dca", "martingale", "layered_martingale", "trend"}
+    )
     manifest_type = str(manifest.get("strategyType") or "").strip().lower()
     is_portfolio = (
         not is_robot
@@ -958,6 +971,7 @@ def _strategy_v2_admin_metadata(
         "source_asset_type": str(source_asset_type or "").strip(),
         "template_key": template_key,
         "strategy_class": strategy_class,
+        "bot_type": executor_type,
         "universe_kind": str(universe.get("kind") or ("reference" if universe_reference else "static")),
         "universe_reference": universe_reference,
         "instrument_count": instrument_count,

@@ -20,6 +20,15 @@ SERVER_OWNED_CONTEXT_KEYS = {
     "session_working_memory",
     "session_summary",
     "referenced_report",
+    "_routing_history",
+    "_routing_target",
+    "agent_intent",
+    "research_context",
+    "intelligence_context",
+    "market_snapshot",
+    "market_query_plan",
+    "resolved_symbol",
+    "resolved_market",
 }
 
 
@@ -136,6 +145,8 @@ def merge_session_summary(
     workflow = str(context.get("research_mode") or context.get("intent") or previous.get("active_workflow") or "chat")[:64]
     result = {
         "selected_target": target,
+        "research_target": ((context.get("research_context") or {}).get("entities") or {}).get("primary")
+        or previous.get("research_target") or {},
         "timeframe": timeframe,
         "active_workflow": workflow,
         "stable_constraints": constraints[-8:],

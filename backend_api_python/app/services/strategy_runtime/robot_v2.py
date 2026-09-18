@@ -202,7 +202,11 @@ def _build_grid_v2_source(
 def initialize(context):
     context.set_universe([INSTRUMENT])
     context.subscribe(frequency=TIMEFRAME)
-    context.set_metadata(direction_mode={direction_mode!r})
+    context.set_metadata(
+        direction_mode={direction_mode!r},
+        strategy_family="grid",
+        executor_type="grid",
+    )
     context.set_warmup(2)
 {leverage_line}    g.anchor_price = 0.0
     g.initial_ref = ""

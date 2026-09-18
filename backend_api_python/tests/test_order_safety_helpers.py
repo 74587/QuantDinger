@@ -100,6 +100,16 @@ def test_legacy_executor_type_routes_to_grid_engine():
     assert resolve_bot_type({"template_key": "robot_v2_layered_martingale"}) == "layered_martingale"
 
 
+def test_current_manifest_metadata_routes_to_grid_engine():
+    assert resolve_bot_type({
+        "trading_config": {
+            "strategy_manifest": {
+                "metadata": {"strategy_family": "grid", "executor_type": "grid"},
+            },
+        },
+    }) == "grid"
+
+
 def test_legacy_grid_bot_params_route_to_resting_grid_engine():
     assert resolve_bot_type({
         "trading_config": {

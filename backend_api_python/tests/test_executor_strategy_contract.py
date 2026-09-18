@@ -510,6 +510,8 @@ def test_martingale_generated_source_uses_confirmed_batched_incremental_orders()
         user_id=7,
     )
     assert "GRID_TEMPLATE_VERSION = 7" in grid["code"]
+    assert 'strategy_family="grid"' in grid["code"]
+    assert 'executor_type="grid"' in grid["code"]
     assert "g.cell_states" in grid["code"]
     assert 'reason=side + "_exit"' in grid["code"]
 

@@ -116,3 +116,28 @@ def test_strategy_v2_admin_metadata_classifies_robot_from_source():
 
     assert metadata['strategy_class'] == 'robot'
     assert metadata['universe_symbols'] == ['BTC/USDT']
+
+
+def test_strategy_v2_admin_metadata_exposes_declared_grid_executor():
+    metadata = _strategy_v2_admin_metadata(
+        strategy_type='StrategyV2',
+        trading_config={
+            'api_version': 2,
+            'script_source_id': 31,
+            'strategy_manifest': {
+                'apiVersion': 2,
+                'strategyType': 'cta',
+                'metadata': {
+                    'strategy_family': 'grid',
+                    'executor_type': 'grid',
+                },
+                'universe': {'kind': 'static', 'instruments': []},
+            },
+        },
+        source_id=31,
+        fallback_symbol='ETH/USDT',
+        fallback_market_type='spot',
+    )
+
+    assert metadata['strategy_class'] == 'robot'
+    assert metadata['bot_type'] == 'grid'

@@ -38,6 +38,7 @@ def resolve_bot_type(
     config = dict(trading_config or _object(row.get("trading_config")))
     metadata = _object(row.get("metadata"))
     manifest = _object(config.get("strategy_manifest"))
+    manifest_metadata = _object(manifest.get("metadata"))
 
     candidates = (
         row.get("bot_type"),
@@ -45,6 +46,8 @@ def resolve_bot_type(
         config.get("executor_type"),
         metadata.get("executor_type"),
         manifest.get("executor_type"),
+        manifest_metadata.get("executor_type"),
+        manifest_metadata.get("bot_type"),
     )
     for candidate in candidates:
         value = str(candidate or "").strip().lower().replace("-", "_")

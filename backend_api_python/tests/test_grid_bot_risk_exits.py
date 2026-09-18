@@ -7,8 +7,8 @@ correspond to anything meaningful for the user. Grid bots get
 
 * Treats ``stop_loss_pct`` / ``take_profit_pct`` as *equity drawdown* vs
   initial capital.
-* Adds an "out-of-grid" breakout protection driven by
-  ``grid_oob_buffer_pct`` (default 5%).
+* Applies the buffered out-of-grid close only when the configured boundary
+  action is ``stop_loss``. Pause and hold are handled by the grid engine.
 * Always closes BOTH legs in one call when triggered, returning a list of
   close_long + close_short signals.
 """
@@ -91,7 +91,11 @@ def test_grid_out_of_bounds_up_closes_both_legs(monkeypatch):
     ex = _make_executor()
     cfg = {
         "bot_type": "grid",
-        "bot_params": {"upperPrice": 100.0, "lowerPrice": 80.0},
+        "bot_params": {
+            "upperPrice": 100.0,
+            "lowerPrice": 80.0,
+            "boundaryAction": "stop_loss",
+        },
         "grid_oob_buffer_pct": 5,  # 5% above upper => trigger at 105
     }
     monkeypatch.setattr(ex, "_get_current_positions", lambda *a, **k: [
@@ -114,7 +118,11 @@ def test_grid_out_of_bounds_down_closes_both_legs(monkeypatch):
     ex = _make_executor()
     cfg = {
         "bot_type": "grid",
-        "bot_params": {"upperPrice": 100.0, "lowerPrice": 80.0},
+        "bot_params": {
+            "upperPrice": 100.0,
+            "lowerPrice": 80.0,
+            "boundaryAction": "stop_loss",
+        },
         "grid_oob_buffer_pct": 5,  # 5% below lower => trigger at 76
     }
     monkeypatch.setattr(ex, "_get_current_positions", lambda *a, **k: [
@@ -129,6 +137,37 @@ def test_grid_out_of_bounds_down_closes_both_legs(monkeypatch):
     assert len(exits) == 1
     assert exits[0]['type'] == 'close_long'
     assert exits[0]['reason'] == 'grid_out_of_bounds_down'
+
+
+@pytest.mark.parametrize("boundary_action", ["pause", "hold"])
+def test_grid_out_of_bounds_does_not_close_when_boundary_action_keeps_positions(
+    monkeypatch,
+    boundary_action,
+):
+    ex = _make_executor()
+    cfg = {
+        "bot_type": "grid",
+        "bot_params": {
+            "upperPrice": 100.0,
+            "lowerPrice": 80.0,
+            "boundaryAction": boundary_action,
+        },
+        "grid_oob_buffer_pct": 5,
+    }
+    monkeypatch.setattr(ex, "_get_current_positions", lambda *a, **k: [
+        {"side": "long", "entry_price": 90.0, "size": 1.0, "symbol": "BTC/USDT"},
+    ])
+
+    exits = ex._grid_bot_risk_exits(
+        strategy_id=1,
+        symbol="BTC/USDT",
+        current_price=75.0,
+        trading_config=cfg,
+        timeframe_seconds=60,
+        initial_capital=10000.0,
+    )
+
+    assert exits == []
 
 
 def test_grid_equity_drawdown_triggers_stop(monkeypatch):

@@ -1813,8 +1813,16 @@ class TradingExecutor:
         params = config.get("bot_params") if isinstance(config.get("bot_params"), dict) else {}
         upper = float(params.get("upperPrice") or params.get("upper_price") or 0)
         lower = float(params.get("lowerPrice") or params.get("lower_price") or 0)
+        boundary_action = str(
+            params.get("boundaryAction") or params.get("boundary_action") or "pause"
+        ).strip().lower()
         buffer_ratio = self._ratio(config.get("grid_oob_buffer_pct"), 0.05)
-        if upper > lower > 0 and current_price > 0 and buffer_ratio > 0:
+        if (
+            boundary_action == "stop_loss"
+            and upper > lower > 0
+            and current_price > 0
+            and buffer_ratio > 0
+        ):
             if current_price >= upper * (1 + buffer_ratio):
                 return close_all("grid_out_of_bounds_up", oob_threshold=upper * (1 + buffer_ratio))
             if current_price <= lower * (1 - buffer_ratio):

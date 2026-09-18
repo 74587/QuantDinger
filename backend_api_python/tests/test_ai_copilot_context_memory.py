@@ -50,6 +50,14 @@ class _MemoryTestCache:
         self.set_calls.append((key, ttl))
 
 
+def _research_fixture(domain, data, *, kind="structured"):
+    return {
+        "evidence": [{"id": "E1", "domain": domain, "kind": kind, "data": data}],
+        "coverage": [{"domain": domain, "status": "supported"}],
+        "tool_executions": [{"tool": "company.lookup", "status": "success"}],
+    }
+
+
 def test_browser_cannot_supply_server_owned_history_or_memory():
     clean = sanitize_client_context({
         "market": "USStock",
@@ -334,9 +342,8 @@ def test_shareholder_chart_question_loads_reported_ownership_without_market_snap
     )
     monkeypatch.setattr(
         ai_chat,
-        "collect_us_ownership",
-        lambda symbol: {
-            "ownership": {
+        "execute_research",
+        lambda *args, **kwargs: _research_fixture("ownership", {
                 "top_institutional_holders": [
                     {"name": "Fund A", "pct_held": 8.1, "report_date": "2026-06-30"},
                     {"name": "Fund B", "pct_held": 5.2, "report_date": "2026-06-30"},
@@ -345,9 +352,7 @@ def test_shareholder_chart_question_loads_reported_ownership_without_market_snap
                 "scope": "latest_available_reported_institutional_holders_not_realtime_ownership",
                 "source": "yahoo_finance",
                 "as_of": "2026-06-30",
-            },
-            "_provider_status": {"available": ["ownership"]},
-        },
+            }),
     )
 
     research = _build_research_context({
@@ -371,14 +376,12 @@ def test_shareholder_followup_uses_selected_us_stock_context(monkeypatch):
     monkeypatch.setattr(ai_chat, "_local_symbol_candidates", lambda _message: [])
     monkeypatch.setattr(
         ai_chat,
-        "collect_us_ownership",
-        lambda symbol: {
-            "ownership": {
+        "execute_research",
+        lambda *args, **kwargs: _research_fixture("ownership", {
                 "top_institutional_holders": [{"name": "Fund A", "pct_held": 8.1}],
                 "scope": "latest_available_reported_institutional_holders_not_realtime_ownership",
                 "source": "yahoo_finance",
-            }
-        },
+            }),
     )
 
     research = _build_research_context({
@@ -393,6 +396,57 @@ def test_shareholder_followup_uses_selected_us_stock_context(monkeypatch):
     assert research["fundamentals"]["ownership"]["status"] == "available"
 
 
+def test_retry_followup_inherits_ownership_domain_and_chart_request():
+    plan = ai_chat._normalize_agent_intent(
+        {"intent": "general", "entities": {}},
+        "重新查询",
+        False,
+        {
+            "market": "USStock",
+            "symbol": "TSLA",
+            "_routing_history": [
+                {"role": "user", "content": "查询10大股东并绘制饼图"},
+                {"role": "assistant", "content": "当前持有人数据暂不可用"},
+            ],
+        },
+        "zh-CN",
+    )
+
+    assert plan["entities"]["research_domains"] == ["ownership"]
+    assert plan["entities"]["visualization_requested"] is True
+
+
+def test_grounded_ownership_chart_is_appended_when_model_omits_it():
+    context = {
+        "research_context": {
+            "request": {"task_flags": {"needs_chart": True}},
+            "fundamentals": {
+                "ownership": {
+                    "status": "available",
+                    "symbol": "TSLA",
+                    "top_institutional_holders": [
+                        {"name": "Fund A", "shares": 300},
+                        {"name": "Fund B", "shares": 200},
+                        {"name": "Fund C", "shares": 100},
+                    ],
+                }
+            },
+        }
+    }
+
+    answer = ai_chat._ensure_grounded_research_chart("Grounded answer", context)
+
+    assert answer.startswith("Grounded answer\n\n```chart")
+    assert '"type":"pie"' in answer
+    assert '"title":"TSLA"' in answer
+    assert '"name":"Fund A"' in answer
+
+
+def test_grounded_chart_does_not_duplicate_model_chart():
+    answer = "```chart\n{\"type\":\"pie\",\"data\":[1,2,3]}\n```"
+    assert ai_chat._ensure_grounded_research_chart(answer, {}) == answer
+
+
 def test_router_research_domains_drive_generic_company_lookup_without_price_snapshot(monkeypatch):
     candidate = {"market": "USStock", "symbol": "TSLA", "name": "Tesla"}
     monkeypatch.setattr(ai_chat, "_requested_symbol_candidates", lambda _message: [candidate])
@@ -403,14 +457,10 @@ def test_router_research_domains_drive_generic_company_lookup_without_price_snap
     )
     monkeypatch.setattr(
         ai_chat,
-        "_search_intelligence",
-        lambda message, candidates, language, research_domains=None: {
-            "web_results": [{"title": "Tesla leadership", "snippet": "Official company profile", "link": "https://example.com"}],
-            "news_results": [],
-            "search_queries": [message],
-            "provider_status": [],
-            "language": language,
-        },
+        "execute_research",
+        lambda *args, **kwargs: _research_fixture("company_profile", {
+            "results": [{"title": "Tesla leadership", "snippet": "Official company profile", "link": "https://example.com"}],
+        }, kind="search"),
     )
 
     enriched = ai_chat._enrich_context({
@@ -443,11 +493,10 @@ def test_company_research_domains_use_structured_us_provider(monkeypatch):
     )
     monkeypatch.setattr(
         ai_chat,
-        "collect_us_research",
-        lambda symbol, timeout=10: {
-            "analyst_expectations": {"target_price_median_usd": 320, "as_of": "2026-09-18"},
-            "_provider_status": {"available": ["analyst_expectations"]},
-        },
+        "execute_research",
+        lambda *args, **kwargs: _research_fixture("analyst_expectations", {
+            "target_price_median_usd": 320, "as_of": "2026-09-18",
+        }),
     )
 
     research = _build_research_context({
