@@ -70,6 +70,13 @@ def _scope(row):
 
 
 def _identity(row):
+    reason = str(row.get("close_reason") or "").lower()
+    action = str(row.get("type") or "").lower()
+    if reason in {"grid_initial_long", "grid_initial_short"} and action in {
+        "open_long", "add_long", "open_short", "add_short",
+    }:
+        side = "long" if reason.endswith("long") else "short"
+        return side, "entry", [("initial", int(row.get("id") or 0))]
     if row.get("grid_order_id") and row.get("grid_order_purpose"):
         purpose = str(row["grid_order_purpose"])
         if purpose in {"long_entry", "short_entry", "long_exit", "short_exit"}:
@@ -98,13 +105,16 @@ def enrich_grid_order_pnl(trades):
     account-cost P&L remains in account_profit_gross for separate reconciliation.
     """
     groups = defaultdict(list)
+    initial_keys = defaultdict(list)
     identities = {}
-    for row in trades:
+    for row in sorted(trades, key=lambda item: int(item.get("id") or 0)):
         identity = _identity(row)
         identities[id(row)] = identity
         if identity and identity[1] == "entry":
             for key in identity[2]:
                 groups[(_scope(row), key)].append(row)
+                if key[0] == "initial" and key[1] > 0:
+                    initial_keys[(_scope(row), int(row.get("strategy_run_id") or 0), identity[0])].append(key)
     consumed = defaultdict(lambda: Decimal(0))
     exits = sorted(trades, key=lambda r: int(r.get("id") or 0))
     for row in exits:
@@ -112,6 +122,12 @@ def enrich_grid_order_pnl(trades):
         if not identity or identity[1] != "exit":
             continue
         side, _, keys = identity
+        purpose = str(row.get("grid_order_purpose") or "")
+        if not keys and row.get("grid_order_id") and purpose == f"{side}_exit":
+            keys = initial_keys.get(
+                (_scope(row), int(row.get("strategy_run_id") or 0), side),
+                [],
+            )
         row["account_profit_gross"] = row.get("profit_gross", row.get("profit"))
         row["pnl_source"] = "grid_exchange_order_pairs"
         row["pnl_status"] = "unmatched"

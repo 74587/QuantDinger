@@ -153,6 +153,45 @@ def test_grid_startup_places_limits_when_client_ok():
     assert place.called
 
 
+def test_grid_tick_stops_processing_after_boundary_trigger(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    class FakeEngine:
+        cfg = SimpleNamespace(initial_position_pct=0.0, grid_direction="long")
+        stop_requested = False
+
+        def set_runtime_params(self, _params):
+            calls.append("params")
+
+        def handle_boundary(self, _price):
+            calls.append("boundary")
+            return True
+
+        def sync_exit_coverage(self, _price):
+            calls.append("exits")
+
+        def sync_grid_orders(self, _price):
+            calls.append("entries")
+
+    monkeypatch.setattr(
+        "app.services.grid.runner.prepare_bot_market_guards",
+        lambda *args, **kwargs: None,
+    )
+    runner = GridRestingRunner.__new__(GridRestingRunner)
+    runner._started = True
+    runner._engine = FakeEngine()
+    runner._runtime_params = {}
+    runner._risk_exit_fn = None
+    runner._last_exit_sync_ts = 0.0
+    runner._last_sync_ts = 0.0
+
+    runner.tick(50.0)
+
+    assert calls == ["params", "boundary"]
+
+
 def test_grid_config_rejects_spacing_that_cannot_cover_round_trip_fees():
     cfg = GridBotConfig.from_trading_config(
         {

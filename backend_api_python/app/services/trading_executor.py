@@ -1543,6 +1543,17 @@ class TradingExecutor:
             <= abs(average_delta) * 1e-6
         )
         count = len(lowers)
+        raw_cell_budgets = namespace.get("CELL_BUDGET_PCTS")
+        cell_budget_pcts = []
+        if isinstance(raw_cell_budgets, (list, tuple)) and len(raw_cell_budgets) == count:
+            try:
+                cell_budget_pcts = [max(0.0, float(value)) for value in raw_cell_budgets]
+            except (TypeError, ValueError):
+                cell_budget_pcts = []
+        raw_cell_roles = namespace.get("CELL_ROLES")
+        cell_roles = []
+        if isinstance(raw_cell_roles, (list, tuple)) and len(raw_cell_roles) == count:
+            cell_roles = [str(value or "").strip().lower() for value in raw_cell_roles]
         existing.update({
             "lowerPrice": min(lowers),
             "upperPrice": max(uppers),
@@ -1560,6 +1571,12 @@ class TradingExecutor:
             ),
             "dynamicAnchor": bool(namespace.get("DYNAMIC_ANCHOR")),
         })
+        if cell_budget_pcts:
+            existing["cellBudgetPcts"] = cell_budget_pcts
+        if cell_roles:
+            existing["cellRoles"] = cell_roles
+        if source_is_authoritative:
+            existing["adaptiveBounds"] = False
         runtime_config["strategy_family"] = "robot"
         runtime_config["executor_type"] = "grid"
         runtime_config["bot_type"] = "grid"

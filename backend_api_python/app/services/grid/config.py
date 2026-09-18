@@ -57,6 +57,8 @@ class GridBotConfig:
     min_spread_between_orders: float = 0.0
     order_frequency: int = 0
     amount_per_grid_pct: float = 0.0
+    cell_budget_pcts: tuple[float, ...] = ()
+    cell_roles: tuple[str, ...] = ()
 
     @classmethod
     def from_trading_config(cls, trading_config: Dict[str, Any]) -> "GridBotConfig":
@@ -81,6 +83,18 @@ class GridBotConfig:
         ).strip().lower()
         if count_unit not in ("lines", "cells"):
             count_unit = "lines"
+        raw_cell_budgets = bp.get("cellBudgetPcts") or bp.get("cell_budget_pcts") or []
+        cell_budget_pcts = (
+            tuple(_pct(value, 0.0) for value in raw_cell_budgets)
+            if isinstance(raw_cell_budgets, (list, tuple))
+            else ()
+        )
+        raw_cell_roles = bp.get("cellRoles") or bp.get("cell_roles") or []
+        cell_roles = (
+            tuple(str(value or "").strip().lower() for value in raw_cell_roles)
+            if isinstance(raw_cell_roles, (list, tuple))
+            else ()
+        )
         return cls(
             upper_price=upper,
             lower_price=lower,
@@ -105,6 +119,8 @@ class GridBotConfig:
                 0.0,
             ),
             order_frequency=max(0, _int(bp.get("orderFrequency") or bp.get("order_frequency"), 0)),
+            cell_budget_pcts=cell_budget_pcts,
+            cell_roles=cell_roles,
         )
 
     @property

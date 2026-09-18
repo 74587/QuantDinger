@@ -92,6 +92,35 @@ def test_seed_inventory_without_explicit_pairing_is_not_assigned_an_unrelated_bu
     assert project([opening,trade(2,"close_long",101)])[-1]["profit"] is None
 
 
+def test_seed_exits_pair_only_with_the_explicit_grid_initial_inventory():
+    unrelated = trade(1, "open_long", 90, quantity=.5, fee=.045)
+    initial = trade(2, "open_long", 100, quantity=1, fee=.1)
+    initial.update(close_reason="grid_initial_long", grid_client_reference="grid-initial-long")
+    first_exit = trade(3, "close_long", 110, quantity=.4, fee=.044)
+    second_exit = trade(4, "close_long", 120, quantity=.6, fee=.072)
+    overflow = trade(5, "close_long", 130, quantity=.1, fee=.013)
+    for index, row in enumerate((first_exit, second_exit, overflow), start=11):
+        row.update(grid_order_id=index, grid_order_purpose="long_exit", grid_order_extra={})
+
+    result = project([unrelated, initial, first_exit, second_exit, overflow])
+
+    assert result[2]["matched_entry_price"] == 100
+    assert result[2]["profit"] == pytest.approx(3.916)
+    assert result[3]["matched_entry_price"] == 100
+    assert result[3]["profit"] == pytest.approx(11.868)
+    assert result[4]["pnl_status"] == "unmatched"
+    assert result[2]["matched_orders"][0]["entry_order_ids"] == ["exchange-2"]
+
+
+def test_seed_pairing_does_not_cross_strategy_runs():
+    initial = trade(1, "open_long", 100)
+    initial.update(close_reason="grid_initial_long", grid_client_reference="grid-initial-long")
+    closing = trade(2, "close_long", 110)
+    closing.update(strategy_run_id=2, grid_order_id=11, grid_order_purpose="long_exit", grid_order_extra={})
+
+    assert project([initial, closing])[-1]["pnl_status"] == "unmatched"
+
+
 def test_spot_base_fee_quantity_and_cost_allocation_use_actual_received_inventory():
     opening = trade(1,"open_long",100,quantity=1,fee=1)
     opening.update(market_type="spot",commission_ccy="BTC",commission=.01,commission_breakdown={"BTC":.01})

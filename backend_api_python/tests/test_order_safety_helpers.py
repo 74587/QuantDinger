@@ -215,6 +215,8 @@ def test_v7_grid_source_overrides_stale_editor_runtime_params():
             "DYNAMIC_ANCHOR": True,
             "INITIAL_POSITION_PCT": 0.60,
             "MAX_OPEN_ENTRY_ORDERS": 2,
+            "CELL_BUDGET_PCTS": [0.4, 0.6],
+            "CELL_ROLES": ["long_entry", "long_seed"],
             "EQUITY_TAKE_PROFIT": 0.30,
         },
     )
@@ -225,4 +227,7 @@ def test_v7_grid_source_overrides_stale_editor_runtime_params():
     assert recovered["bot_params"]["gridMode"] == "geometric"
     assert recovered["bot_params"]["initialPositionPct"] == pytest.approx(0.60)
     assert recovered["bot_params"]["maxOpenOrders"] == 2
+    assert recovered["bot_params"]["cellBudgetPcts"] == pytest.approx([0.4, 0.6])
+    assert recovered["bot_params"]["cellRoles"] == ["long_entry", "long_seed"]
+    assert recovered["bot_params"]["adaptiveBounds"] is False
     assert recovered["equity_take_profit_pct"] == pytest.approx(0.30)

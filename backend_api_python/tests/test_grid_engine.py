@@ -80,6 +80,38 @@ def test_config_from_trading_config_initial_pct():
     assert cfg.grid_direction == "long"
 
 
+def test_grid_engine_uses_source_cell_budget_percentages():
+    from app.services.grid.engine import GridEngine
+
+    trading_config = {
+        "initial_capital": 1000,
+        "market_type": "spot",
+        "bot_params": {
+            "upperPrice": 110,
+            "lowerPrice": 90,
+            "gridCount": 2,
+            "gridCountUnit": "cells",
+            "amountPerGridPct": 0.5,
+            "cellBudgetPcts": [0.4, 0.6],
+            "cellRoles": ["long_entry", "long_seed"],
+            "gridDirection": "long",
+        },
+    }
+    engine = GridEngine(
+        8,
+        "ETH/USDT",
+        trading_config,
+        {},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *args, **kwargs: False,
+    )
+
+    assert engine.cfg.cell_budget_pcts == pytest.approx((0.4, 0.6))
+    assert engine.cfg.cell_roles == ("long_entry", "long_seed")
+    assert engine._grid_budget_usdt(0) == pytest.approx(400.0)
+    assert engine._grid_budget_usdt(1) == pytest.approx(600.0)
+
+
 def test_grid_drift_cancels_same_side_entries_and_unsafe_exits(monkeypatch):
     from app.services.grid.engine import GridEngine
 
@@ -672,7 +704,7 @@ def test_sync_exit_coverage_places_long_exit_for_uncovered_position(monkeypatch)
     )
     monkeypatch.setattr(
         "app.services.grid.engine.GridEngine._grid_base_qty",
-        lambda self, px: 0.059111,
+        lambda self, px, cell_index=None: 0.059111,
     )
     monkeypatch.setattr(
         "app.services.grid.engine.GridEngine._levels_and_cells",
@@ -753,7 +785,10 @@ def test_sync_exit_coverage_distributes_initial_inventory_across_distinct_future
         "app.services.grid.engine.GridEngine._strategy_leg_position_qty",
         lambda self, side: 3.0,
     )
-    monkeypatch.setattr("app.services.grid.engine.GridEngine._grid_base_qty", lambda self, px: 1.0)
+    monkeypatch.setattr(
+        "app.services.grid.engine.GridEngine._grid_base_qty",
+        lambda self, px, cell_index=None: 1.0,
+    )
     monkeypatch.setattr("app.services.grid.engine.GridEngine._dedupe_open_exit_orders", lambda self, p: None)
     monkeypatch.setattr("app.services.grid.engine.GridEngine.sync_held_cell_exits", lambda self, px: 0)
     monkeypatch.setattr(
@@ -1056,7 +1091,7 @@ def test_sync_exit_coverage_uses_a_distinct_cell_when_one_exit_is_already_open(m
     )
     monkeypatch.setattr(
         "app.services.grid.engine.GridEngine._grid_base_qty",
-        lambda self, px: 0.059111,
+        lambda self, px, cell_index=None: 0.059111,
     )
     monkeypatch.setattr(
         "app.services.grid.engine.GridEngine._persist_initial_seeded_cells",
@@ -1122,7 +1157,7 @@ def test_sync_exit_coverage_skips_when_position_below_one_grid(monkeypatch):
     monkeypatch.setattr("app.services.grid.engine.GridEngine.sync_held_cell_exits", lambda self, px: 0)
     monkeypatch.setattr(
         "app.services.grid.engine.GridEngine._grid_base_qty",
-        lambda self, px: 0.059111,
+        lambda self, px, cell_index=None: 0.059111,
     )
     monkeypatch.setattr(
         "app.services.grid.engine.GridEngine._levels_and_cells",

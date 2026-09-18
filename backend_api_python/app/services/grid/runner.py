@@ -345,7 +345,8 @@ class GridRestingRunner:
             except Exception as e:
                 logger.debug("grid risk exit: %s", e)
 
-        self._engine.handle_boundary(current_price)
+        if self._engine.handle_boundary(current_price):
+            return
 
         if (
             self._engine.cfg.initial_position_pct > 0

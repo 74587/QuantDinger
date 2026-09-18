@@ -127,6 +127,27 @@ def test_spot_and_missing_credentials_do_not_manufacture_realized_pnl(monkeypatc
     assert all(r["exchange_pnl"]["status"] == "unavailable" for r in result)
 
 
+@pytest.mark.parametrize("exchange", ["binance", "okx", "bybit", "bitget", "gate", "htx"])
+def test_crypto_spot_never_claims_venue_reported_position_pnl(monkeypatch, exchange):
+    rows = [dict(row(), exchange_id=exchange, market_type="spot")]
+    monkeypatch.setattr(reconciliation, "_load", lambda keys: pytest.fail("Spot rows are not eligible"))
+
+    result = reconciliation.enrich_reported_order_pnl(rows, user_id=1, trading_config={})
+
+    assert result[0]["exchange_pnl"] == {"status": "unavailable"}
+
+
+@pytest.mark.parametrize("exchange", ["binance", "okx", "bybit", "bitget", "gate", "htx"])
+def test_supported_derivatives_keep_venue_pnl_pending_until_evidence_is_complete(monkeypatch, exchange):
+    rows = [dict(row(), exchange_id=exchange)]
+    monkeypatch.setattr(reconciliation, "_load", lambda keys: ({}, {}))
+    monkeypatch.setattr(reconciliation, "_claim", lambda *args: False)
+
+    result = reconciliation.enrich_reported_order_pnl(rows, user_id=1, trading_config={})
+
+    assert result[0]["exchange_pnl"] == {"status": "pending"}
+
+
 def test_rest_budget_and_failures_leave_reports_pending(monkeypatch):
     rows = [dict(row(i), exchange_order_id=str(i)) for i in range(1, 6)]
     monkeypatch.setattr(reconciliation, "_load", lambda keys: ({}, {}))

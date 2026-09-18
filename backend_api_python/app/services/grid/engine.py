@@ -151,8 +151,13 @@ class GridEngine:
             init_cap = cell_budget if self.cfg.grid_count_unit == "cells" else cell_budget * 2
         return init_cap
 
-    def _grid_budget_usdt(self) -> float:
-        pct = max(0.0, float(self.cfg.amount_per_grid_pct or 0.0))
+    def _grid_budget_usdt(self, cell_index: Optional[int] = None) -> float:
+        if cell_index is not None and 0 <= int(cell_index) < len(self.cfg.cell_budget_pcts):
+            pct = max(0.0, float(self.cfg.cell_budget_pcts[int(cell_index)] or 0.0))
+            if pct <= 0:
+                return 0.0
+        else:
+            pct = max(0.0, float(self.cfg.amount_per_grid_pct or 0.0))
         if pct > 0:
             capital = float(
                 self.trading_config.get("initial_capital")
@@ -1307,9 +1312,12 @@ class GridEngine:
                     f"(kept largest exit, cancelled oid={extra.exchange_order_id or extra.client_order_id})",
                 )
 
-    def _grid_base_qty(self, price: float) -> float:
+    def _grid_base_qty(self, price: float, cell_index: Optional[int] = None) -> float:
         """One grid line's base quantity (amountPerGrid × leverage / price), exchange-normalized."""
-        raw = self._qty_from_usdt(self._grid_budget_usdt(), float(price or 0))
+        raw = self._qty_from_usdt(
+            self._grid_budget_usdt(cell_index),
+            float(price or 0),
+        )
         return self._normalize_grid_base_qty(raw, price)
 
     def sync_held_cell_exits(self, current_price: float) -> int:
@@ -1441,7 +1449,7 @@ class GridEngine:
                 (target_cell.upper_price if direction == "long" else target_cell.lower_price)
                 or 0
             )
-            grid_qty = self._grid_base_qty(px)
+            grid_qty = self._grid_base_qty(px, idx)
             if grid_qty <= 0 or uncovered_qty + 1e-8 < grid_qty:
                 continue
             if not self._place_limit(
@@ -1497,7 +1505,7 @@ class GridEngine:
             return False
         if reduce_only and time.time() - float(self._last_reduce_only_conflict_ts or 0.0) < 5.0:
             return False
-        usdt = self._grid_budget_usdt()
+        usdt = self._grid_budget_usdt(cell.index)
         qty = float(quantity) if quantity is not None else self._qty_from_usdt(usdt, px)
         qty = self._normalize_grid_base_qty(qty, px)
         if qty <= 0:
