@@ -45,6 +45,11 @@
     <a href="https://github.com/OpenByteInc/QuantDinger/releases/latest"><img src="docs/badges/latest-release.svg" alt="Latest release"></a>
   </p>
 
+  <p>
+    <a href="https://github.com/orgs/OpenByteInc/projects/1"><img src="https://img.shields.io/github/issues/OpenByteInc/QuantDinger/roadmap?style=flat-square&label=Roadmap%20items&color=5319E7" alt="Open roadmap items"></a>
+    <a href="https://github.com/orgs/OpenByteInc/projects/1/views/4"><img src="https://img.shields.io/github/issues/OpenByteInc/QuantDinger/ready%20for%20contributors?style=flat-square&label=Ready%20tasks&color=0E8A16" alt="Tasks ready for contributors"></a>
+  </p>
+
   <p><sub>SUPPORTED BY</sub></p>
   <p>
     <a href="https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger" title="Atlas Cloud — AI inference sponsor">
@@ -62,6 +67,10 @@
     </a>
   </p>
 </div>
+
+> **Want to contribute?** Explore the
+> [public roadmap](https://github.com/orgs/OpenByteInc/projects/1) or claim a
+> scoped task from [Ready for contributors](https://github.com/orgs/OpenByteInc/projects/1/views/4).
 
 > QuantDinger can submit real orders when live trading is explicitly enabled.
 > Start with paper trading, use restricted API keys, and review the risk and

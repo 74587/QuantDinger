@@ -5,7 +5,9 @@ QuantDinger 是一套可自托管的 AI 量化交易平台，覆盖行情研究�
 版本的中文文档入口。
 
 [English](README.md) · [官方网站](https://quantdinger.com) ·
-[在线应用](https://ai.quantdinger.com) · [GitHub](https://github.com/OpenByteInc/QuantDinger)
+[在线应用](https://ai.quantdinger.com) · [GitHub](https://github.com/OpenByteInc/QuantDinger) ·
+[公开路线图](https://github.com/orgs/OpenByteInc/projects/1) ·
+[可认领任务](https://github.com/orgs/OpenByteInc/projects/1/views/4)
 
 > 启用实盘后，系统可以提交真实订单。请先使用模拟盘，为交易凭据设置最小权限，
 > 并确认所在地区的法律、合规与运营要求。QuantDinger 不提供投资建议。
