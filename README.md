@@ -12,7 +12,7 @@
   <p>
     <a href="README.md"><strong>English</strong></a>
     ·
-    <a href="docs/README_CN.md"><strong>简体中文</strong></a>
+    <a href="README_CN.md"><strong>简体中文</strong></a>
     ·
     <a href="docs/api/README.md"><strong>API</strong></a>
     ·

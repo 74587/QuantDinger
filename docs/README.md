@@ -4,7 +4,7 @@ QuantDinger is a self-hosted AI trading platform that connects market research,
 Strategy API V2 development, backtesting, paper/live execution, operations, and
 AI-agent access. This documentation describes the current v5 release.
 
-[中文文档](README_CN.md) · [Official website](https://quantdinger.com) ·
+[中文文档](../README_CN.md) · [Official website](https://quantdinger.com) ·
 [Web app](https://ai.quantdinger.com) · [GitHub](https://github.com/OpenByteInc/QuantDinger)
 
 > Live trading can submit real orders. Start in paper mode, grant exchange keys
