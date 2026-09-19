@@ -21,6 +21,87 @@ logger = get_logger(__name__)
 ENTRY_ACTIONS = {"open_long", "open_short", "add_long", "add_short", "buy", "sell"}
 EXCLUDED_STRATEGY_TYPES = {"grid", "dca", "martingale", "layered_martingale"}
 
+JEV_QUESTIONS = {
+    "data_quality": {
+        "type": "choice",
+        "instructions": "Assess whether the supplied point-in-time evidence is sufficient for a pre-trade decision.",
+        "criteria": {
+            "sufficient": "Market, signal, portfolio, and execution evidence are current and usable.",
+            "partial": "Some evidence is missing or stale, but concrete risk checks remain possible.",
+            "insufficient": "The state lacks enough current evidence for a directional or risk judgement.",
+        },
+    },
+    "signal_alignment": {
+        "type": "choice",
+        "instructions": (
+            "Compare the requested action and signal reason with every available timeframe in "
+            "context.market_evidence. Treat missing evidence as insufficient rather than conflict."
+        ),
+        "criteria": {
+            "aligned": "Price trend, momentum, and volatility evidence support the requested direction.",
+            "mixed": "Evidence is usable but timeframes or indicators disagree without a strong contradiction.",
+            "conflict": "Current evidence materially contradicts the requested direction or signal reason.",
+            "insufficient": "There is not enough current market evidence to judge alignment.",
+        },
+    },
+    "market_regime": {
+        "type": "choice",
+        "instructions": "Judge whether the current multi-timeframe market regime is suitable for this requested entry.",
+        "criteria": {
+            "favorable": "Trend, momentum, volatility, and volume are reasonably supportive of this entry.",
+            "neutral": "The regime is mixed or range-bound but does not materially oppose the entry.",
+            "adverse": "The regime materially opposes the entry or shows unstable conditions for it.",
+            "insufficient": "The supplied market evidence is unavailable or too stale to judge the regime.",
+        },
+    },
+    "risk_check": {
+        "type": "choice",
+        "instructions": (
+            "Assess position sizing, leverage, existing exposure, drawdown, recent realized performance, "
+            "protection, and the deterministic order budget."
+        ),
+        "criteria": {
+            "clear": "The new exposure is proportionate and no material account or portfolio risk is visible.",
+            "caution": "Risk is elevated but remains within the supplied limits and does not require blocking.",
+            "block": "A concrete sizing, leverage, concentration, drawdown, loss-streak, or protection risk requires blocking.",
+            "insufficient": "Account evidence is incomplete and no concrete blocking risk can be established.",
+        },
+    },
+    "execution_quality": {
+        "type": "choice",
+        "instructions": (
+            "Assess price freshness, reference-price deviation, order type, market type, protection, "
+            "and any supplied execution constraints."
+        ),
+        "criteria": {
+            "clear": "The order can be submitted with current data and no material execution concern.",
+            "caution": "Execution conditions are imperfect but do not justify blocking.",
+            "block": "Stale or contradictory pricing, invalid protection, or another concrete execution issue requires blocking.",
+            "insufficient": "Execution evidence is incomplete and no concrete blocking issue can be established.",
+        },
+    },
+    "entry_decision": {
+        "type": "choice",
+        "instructions": (
+            "Make the final pre-trade decision using the full supplied state. Reject only for concrete evidence of "
+            "a directional contradiction, material portfolio risk, or unsafe execution. Missing evidence alone must not reject."
+        ),
+        "criteria": {
+            "pass": "The entry is supported or mixed, stays within risk limits, and has no concrete blocking condition.",
+            "reject": "Concrete supplied evidence makes this new exposure directionally contradictory, materially risky, or unsafe.",
+        },
+    },
+}
+
+JEV_CHECK_OPTIONS = {
+    "data_quality": {"sufficient", "partial", "insufficient"},
+    "signal_alignment": {"aligned", "mixed", "conflict", "insufficient"},
+    "market_regime": {"favorable", "neutral", "adverse", "insufficient"},
+    "risk_check": {"clear", "caution", "block", "insufficient"},
+    "execution_quality": {"clear", "caution", "block", "insufficient"},
+    "entry_decision": {"pass", "reject"},
+}
+
 
 @dataclass(frozen=True)
 class AIDecisionRequest:
@@ -132,70 +213,65 @@ class AIDecisionFilter:
             json={
                 "model": model,
                 "state": self._state_payload(request),
-                "questions": {
-                    "entry_decision": {
-                        "type": "choice",
-                        "instructions": (
-                            "Decide whether this new trading exposure should be allowed. "
-                            "Reject only when the supplied state shows a concrete risk, invalid execution, "
-                            "or a conflict with the strategy intent. Uncertainty alone is not a rejection."
-                        ),
-                        "criteria": {
-                            "pass": "The order is consistent and has no concrete blocking risk.",
-                            "reject": "A concrete risk or contradiction makes the new exposure unsuitable.",
-                        },
-                    },
-                    "risk_check": {
-                        "type": "choice",
-                        "instructions": "Classify the strongest execution or exposure concern in the supplied state.",
-                        "criteria": {
-                            "clear": "No material concern is visible.",
-                            "caution": "A concern exists but does not justify blocking the order.",
-                            "block": "A material concern justifies blocking the order.",
-                        },
-                    },
-                },
+                "questions": JEV_QUESTIONS,
             },
             timeout=timeout,
         )
         response.raise_for_status()
         payload = response.json()
         answers = payload.get("answers") or payload.get("result") or payload.get("data") or {}
-        decision_answer = self._answer(answers, "entry_decision")
-        risk_answer = self._answer(answers, "risk_check")
-        choice, probabilities = self._validate_choice_answer(
-            decision_answer,
-            question="entry_decision",
-            options={"pass", "reject"},
+        results: dict[str, tuple[str, dict[str, float], float | None]] = {}
+        checks: list[dict[str, Any]] = []
+        for name, options in JEV_CHECK_OPTIONS.items():
+            answer = self._answer(answers, name)
+            choice, probabilities = self._validate_choice_answer(
+                answer,
+                question=name,
+                options=options,
+            )
+            confidence = self._confidence(answer, probabilities, choice)
+            results[name] = (choice, probabilities, confidence)
+            checks.append({
+                "name": name,
+                "result": choice,
+                "confidence": confidence,
+                "probabilities": probabilities,
+            })
+
+        min_confidence = max(0.0, min(float(config.get("min_confidence") or 0.65), 1.0))
+        for name in ("entry_decision", "risk_check", "execution_quality"):
+            confidence = results[name][2]
+            if confidence is None or confidence < min_confidence:
+                raise ValueError(f"Jev confidence below threshold for {name}")
+
+        entry_choice, probabilities, confidence = results["entry_decision"]
+        risk_choice = results["risk_check"][0]
+        execution_choice = results["execution_quality"][0]
+        signal_choice, _, signal_confidence = results["signal_alignment"]
+        regime_choice, _, regime_confidence = results["market_regime"]
+        directional_block = (
+            signal_choice == "conflict"
+            and regime_choice == "adverse"
+            and float(signal_confidence or 0) >= min_confidence
+            and float(regime_confidence or 0) >= min_confidence
         )
-        confidence = self._confidence(decision_answer, probabilities, choice)
-        risk_choice, risk_probabilities = self._validate_choice_answer(
-            risk_answer,
-            question="risk_check",
-            options={"clear", "caution", "block"},
+        allowed = (
+            entry_choice == "pass"
+            and risk_choice != "block"
+            and execution_choice != "block"
+            and not directional_block
         )
-        allowed = choice == "pass" and risk_choice != "block"
         final_choice = "pass" if allowed else "reject"
         if allowed:
             reason = "jev_entry_approved"
         elif risk_choice == "block":
             reason = "jev_entry_rejected:risk_block"
+        elif execution_choice == "block":
+            reason = "jev_entry_rejected:execution_block"
+        elif directional_block:
+            reason = "jev_entry_rejected:signal_conflict"
         else:
             reason = "jev_entry_rejected:entry_reject"
-        checks = [
-            {
-                "name": "entry_decision",
-                "result": choice,
-                "confidence": confidence,
-                "probabilities": probabilities,
-            },
-            {
-                "name": "risk_check",
-                "result": risk_choice,
-                "confidence": self._confidence(risk_answer, risk_probabilities, risk_choice),
-                "probabilities": risk_probabilities,
-            },
-        ]
         return self._result(
             allowed,
             final_choice,
@@ -223,9 +299,12 @@ class AIDecisionFilter:
                 {
                     "role": "system",
                     "content": (
-                        "You are a conservative pre-trade entry filter. Evaluate only the supplied order and state. "
-                        "Reject only for a concrete, stated risk or contradiction. Return strict JSON with keys "
-                        "decision (pass or reject), confidence (0 to 1), reason, and checks (array)."
+                        "You are a conservative evidence-based pre-trade entry filter. Inspect the supplied "
+                        "multi-timeframe market evidence, strategy signal, portfolio risk, recent performance, "
+                        "protection, and execution conditions. Missing data alone is not a rejection. Reject only "
+                        "for a concrete contradiction or material risk. Return strict JSON with keys decision "
+                        "(pass or reject), confidence (0 to 1), reason, and checks (array). Each check must include "
+                        "name, result, and concise evidence from the supplied state."
                     ),
                 },
                 {"role": "user", "content": self._state_text(request)},
@@ -380,6 +459,7 @@ class AIDecisionFilter:
             "base_url": setting("JEV_BASE_URL", "https://api.typesafe.ai/v1"),
             "model": setting("JEV_MODEL", "jev-latest"),
             "timeout_seconds": setting("JEV_TIMEOUT_SECONDS", "8"),
+            "min_confidence": setting("JEV_MIN_CONFIDENCE", "0.65"),
         }
 
     @staticmethod

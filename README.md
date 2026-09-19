@@ -103,34 +103,6 @@ The project combines:
 It is not a black-box signal service. Strategy code, risk settings, credentials,
 and deployment remain under the operator's control.
 
-## JEV-powered pre-trade decisions
-
-QuantDinger can place a structured AI decision gate directly in front of live
-entry orders. Enable **AI Decision Filter** when creating a regular live
-strategy, or turn it on in Quick Trade. Before an entry reaches the exchange,
-QuantDinger sends the order, strategy context, exposure, positions, and budget
-state to [TypeSafe Jev](https://docs.typesafe.ai/introduction). Jev returns typed
-Choice results, probabilities, and confidence instead of prose that must be
-parsed. The app shows the provider, checks, result, confidence, latency, and
-reason in an auditable decision timeline.
-
-| Previous LLM-only gate | JEV decision gate |
-| --- | --- |
-| Generate prose or JSON and recover a decision through parsing | Receive a typed Choice with the selected outcome, full probabilities, and confidence |
-| One opaque answer is difficult to inspect after execution | Independent entry and risk checks are stored with the order context and latency |
-| Provider failure can accidentally block position management | Provider failure is audited and fails open, while every exit bypasses AI |
-
-The execution policy stays in QuantDinger code: rejected entries never reach
-the exchange; exits, stop-loss, take-profit, and emergency actions bypass the
-filter. Grid, DCA, and martingale runtimes are excluded from this first version.
-When Jev is not configured, QuantDinger tries the configured LLM. If no AI
-provider is available, the order is allowed and the fail-open result is logged,
-so an AI outage cannot trap an existing position.
-
-Configure `JEV_API_KEY`, `JEV_BASE_URL`, `JEV_MODEL`, and
-`JEV_TIMEOUT_SECONDS` in **System Settings → AI / LLM**. TypeSafe documents the
-HTTP contract at [`POST /v1/systemone`](https://docs.typesafe.ai/introduction/quickstart).
-
 ## What changed in v5
 
 The v5 backend is organized around explicit runtime and operational boundaries:
@@ -418,6 +390,92 @@ not include credentials, account data, or exploitable details in public issues.
 Start with the [Indicator guide](docs/trading/INDICATOR_DEV_GUIDE.md),
 [Strategy guide](docs/trading/STRATEGY_DEV_GUIDE.md), and
 [Extension guide](docs/architecture/EXTENSION_GUIDE.md).
+
+## JEV-powered pre-trade decisions
+
+QuantDinger can place a structured AI decision gate directly in front of live
+entry orders. Enable **AI Decision Filter** when creating a regular live
+strategy, or turn it on in Quick Trade. Before an entry reaches the exchange,
+QuantDinger sends the order, strategy context, exposure, positions, and budget
+state to [TypeSafe Jev](https://docs.typesafe.ai/introduction). Jev returns typed
+Choice results, probabilities, and confidence instead of prose that must be
+parsed. The app shows the provider, checks, result, confidence, latency, and
+reason in an auditable decision timeline.
+
+| Previous LLM-only gate | JEV decision gate |
+| --- | --- |
+| Generate prose or JSON and recover a decision through parsing | Receive a typed Choice with the selected outcome, full probabilities, and confidence |
+| One opaque answer is difficult to inspect after execution | Independent entry and risk checks are stored with the order context and latency |
+| Provider failure can accidentally block position management | Provider failure is audited and fails open, while every exit bypasses AI |
+
+The execution policy stays in QuantDinger code: rejected entries never reach
+the exchange; exits, stop-loss, take-profit, and emergency actions bypass the
+filter. Grid, DCA, and martingale runtimes are excluded from this first version.
+When Jev is not configured, QuantDinger tries the configured LLM. If no AI
+provider is available, the order is allowed and the fail-open result is logged,
+so an AI outage cannot trap an existing position.
+
+### Decision flow
+
+```mermaid
+flowchart TD
+    A["Strategy signal / Quick Trade instruction"] --> B["Deterministic risk and order budget checks"]
+    B -->|"Basic checks fail"| R["Reject order"]
+    B -->|"Basic checks pass"| C["Build Decision Context V2"]
+
+    C --> C1["Strategy parameters and signal rationale"]
+    C --> C2["Multi-timeframe market data and indicators"]
+    C --> C3["Positions, exposure, equity, and drawdown"]
+    C --> C4["Recent PnL and consecutive losses"]
+    C --> C5["Take-profit, stop-loss, and execution conditions"]
+
+    C1 --> D
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    C5 --> D
+
+    D{"JEV configured?"}
+
+    D -->|"Yes"| E["JEV System One"]
+    E --> E1["Evidence quality"]
+    E --> E2["Signal consistency"]
+    E --> E3["Market regime"]
+    E --> E4["Account risk"]
+    E --> E5["Execution quality"]
+    E --> E6["Entry decision: pass/reject"]
+
+    E1 --> F["Validate schema, probabilities, and confidence"]
+    E2 --> F
+    E3 --> F
+    E4 --> F
+    E5 --> F
+    E6 --> F
+
+    F -->|"Valid result and confidence threshold met"| G["Deterministic decision converger"]
+    F -->|"Timeout, error, invalid format, or low confidence"| H
+
+    D -->|"No"| H{"LLM configured?"}
+    H -->|"Yes"| I["LLM reads the same context"]
+    I --> J["Require strict JSON output"]
+    J --> K{"decision"}
+
+    H -->|"No"| O["Fail open and log the reason"]
+
+    G -->|"PASS"| P["Enter pending order queue"]
+    G -->|"REJECT"| R
+    K -->|"pass"| P
+    K -->|"reject"| R
+    K -->|"Invalid output or provider failure"| O
+
+    P --> Q["Submit to exchange asynchronously"]
+    R --> S["Record ai_rejected and the decision trace"]
+    O --> T["Place order normally and record provider unavailable"]
+```
+
+Configure `JEV_API_KEY`, `JEV_BASE_URL`, `JEV_MODEL`, and
+`JEV_TIMEOUT_SECONDS` in **System Settings → AI / LLM**. TypeSafe documents the
+HTTP contract at [`POST /v1/systemone`](https://docs.typesafe.ai/introduction/quickstart).
 
 ## AI agents and MCP
 

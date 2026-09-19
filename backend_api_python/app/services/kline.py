@@ -55,8 +55,14 @@ class KlineService:
         if not before_time:
             native_key = (instrument_id or "").strip()
             cache_key = f"kline:{normalized_market}:{ex_key}:{mt_key}:{native_key}:{symbol}:{timeframe}:{limit}"
+            latest_key = (
+                f"kline:latest:{normalized_market}:{ex_key}:{mt_key}:{native_key}:"
+                f"{symbol}:{timeframe}"
+            )
             cached = self.cache.get(cache_key)
             if cached:
+                ttl = self.cache_ttl.get(timeframe, 300)
+                self.cache.set(latest_key, cached[-120:], ttl)
                 return cached
         
         klines = None
@@ -133,6 +139,7 @@ class KlineService:
         if klines and not before_time:
             ttl = self.cache_ttl.get(timeframe, 300)
             self.cache.set(cache_key, klines, ttl)
+            self.cache.set(latest_key, klines[-120:], ttl)
         
         return klines
     

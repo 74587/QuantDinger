@@ -46,7 +46,7 @@ ADVANCED_KEYS = {
     'GDELT_BASE_URL', 'GDELT_TIMEOUT', 'GDELT_MAX_RESULTS',
     'ALPHA_VANTAGE_API_KEY', 'ALPHA_VANTAGE_BASE_URL', 'ALPHA_VANTAGE_TIMEOUT', 'ALPHA_VANTAGE_NEWS_LIMIT',
     'AI_CODE_GEN_MODEL', 'LLM_PROXY_URL', 'LLM_USE_SYSTEM_PROXY',
-    'JEV_BASE_URL', 'JEV_MODEL', 'JEV_TIMEOUT_SECONDS', 'AI_DECISION_TIMEOUT_SECONDS',
+    'JEV_BASE_URL', 'JEV_MODEL', 'JEV_TIMEOUT_SECONDS', 'JEV_MIN_CONFIDENCE', 'AI_DECISION_TIMEOUT_SECONDS',
     'OPENAI_BASE_URL', 'DEEPSEEK_BASE_URL', 'GROK_BASE_URL', 'ATLASCLOUD_BASE_URL', 'MINIMAX_BASE_URL',
     # Trading internals
     'ORDER_MODE', 'MAKER_WAIT_SEC',
@@ -342,6 +342,13 @@ CONFIG_SCHEMA = {
                 'type': 'number',
                 'default': 8,
                 'description': 'settings.desc.JEV_TIMEOUT_SECONDS'
+            },
+            {
+                'key': 'JEV_MIN_CONFIDENCE',
+                'label': 'settings.field.JEV_MIN_CONFIDENCE',
+                'type': 'number',
+                'default': 0.65,
+                'description': 'settings.desc.JEV_MIN_CONFIDENCE'
             },
             {
                 'key': 'LLM_PROVIDER',

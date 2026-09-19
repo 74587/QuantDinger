@@ -7,6 +7,7 @@ from typing import Any
 
 from flask import jsonify
 
+from app.services.ai_decision_context import build_quick_trade_decision_context
 from app.services.ai_decision_filter import AIDecisionFilter, AIDecisionRequest
 
 
@@ -57,6 +58,7 @@ def maybe_reject_quick_trade(
                 "take_profit_price": tp_price,
                 "stop_loss_price": sl_price,
                 "margin_mode": margin_mode,
+                **build_quick_trade_decision_context(context),
             },
         ),
         enabled=True,

@@ -83,6 +83,7 @@ def test_kline_service_prefers_native_gate_spot_and_caches(monkeypatch):
     assert first == second == rows
     assert native_calls == [("BTC/USDT", "1D", 120)]
     assert fallback_calls == []
+    assert service.cache.data["kline:latest:Crypto:gate:spot::BTC/USDT:1D"] == rows
 
 
 def test_kline_cache_separates_native_instrument_identity(monkeypatch):
@@ -107,6 +108,25 @@ def test_kline_cache_separates_native_instrument_identity(monkeypatch):
 
     assert first != second
     assert len(calls) == 2
+
+
+def test_existing_exact_cache_backfills_latest_snapshot(monkeypatch):
+    service = kline_module.KlineService()
+    service.cache = _Cache()
+    rows = [{"time": index, "close": index} for index in range(600)]
+    exact_key = "kline:Crypto:gate:spot::ETH/USDT:1m:600"
+    latest_key = "kline:latest:Crypto:gate:spot::ETH/USDT:1m"
+    service.cache.data[exact_key] = rows
+    monkeypatch.setattr(
+        kline_module.DataSourceFactory,
+        "get_kline",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("cache miss")),
+    )
+
+    assert service.get_kline(
+        "Crypto", "ETH/USDT", "1m", 600, exchange_id="gate", market_type="spot"
+    ) == rows
+    assert service.cache.data[latest_key] == rows[-120:]
 
 
 def test_kline_service_uses_native_path_when_default_exchange_is_gate(monkeypatch):

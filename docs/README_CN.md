@@ -12,28 +12,6 @@ QuantDinger 是一套可自托管的 AI 量化交易平台，覆盖行情研究�
 > 启用实盘后，系统可以提交真实订单。请先使用模拟盘，为交易凭据设置最小权限，
 > 并确认所在地区的法律、合规与运营要求。QuantDinger 不提供投资建议。
 
-## JEV 交易前决策过滤
-
-QuantDinger 可以在普通策略和闪电交易的实盘开仓指令到达交易所前，增加一层结构化
-AI 决策。开启 **AI 决策过滤** 后，系统会把订单、策略上下文、资金敞口、当前持仓和
-订单预算交给 [TypeSafe Jev](https://docs.typesafe.ai/introduction)，并记录 Choice 判断、
-概率、置信度、耗时和最终结果。被拒绝的开仓不会提交到交易所，用户可以在实盘详情的
-AI 决策时间线中查看每次判断。
-
-| 传统 LLM 决策过滤 | JEV 结构化决策过滤 |
-| --- | --- |
-| 生成自然语言或 JSON，再由业务代码解析结论 | 直接返回 Choice、完整概率分布和置信度 |
-| 单一结论难以在交易后复核 | 开仓判断与风险检查分别记录，并保留订单上下文和耗时 |
-| 服务异常可能误伤仓位管理 | 服务异常时记录并故障放行，所有退出指令始终绕过 AI |
-
-执行规则仍由 QuantDinger 控制：平仓、止损、止盈和紧急退出始终绕过过滤；首个版本
-暂不处理网格、DCA 和马丁策略。未配置 JEV 时会自动尝试系统已配置的大模型；两者均
-不可用时按故障放行并记录审计结果，避免 AI 服务异常导致已有仓位无法退出。
-
-管理员可以在 **系统设置 → AI / LLM** 中配置 `JEV_API_KEY`、`JEV_BASE_URL`、
-`JEV_MODEL` 和 `JEV_TIMEOUT_SECONDS`。JEV 使用官方
-[`POST /v1/systemone`](https://docs.typesafe.ai/introduction/quickstart) 接口。
-
 ## 观看 QuantDinger 宣传视频
 
 <p align="center">
@@ -97,6 +75,86 @@ v5 将长期运行的职责与 HTTP 请求处理分开：
 PostgreSQL 是系统记录来源；`redis` 是可淘汰缓存，`redis-jobs` 是持久化的
 Celery broker 与结果存储。修改进程归属或共享状态前，请先阅读
 [系统架构总览](architecture/README_CN.md)。
+
+## JEV 交易前决策过滤
+
+QuantDinger 可以在普通策略和闪电交易的实盘开仓指令到达交易所前，增加一层结构化
+AI 决策。开启 **AI 决策过滤** 后，系统会把订单、策略上下文、资金敞口、当前持仓和
+订单预算交给 [TypeSafe Jev](https://docs.typesafe.ai/introduction)，并记录 Choice 判断、
+概率、置信度、耗时和最终结果。被拒绝的开仓不会提交到交易所，用户可以在实盘详情的
+AI 决策时间线中查看每次判断。
+
+| 传统 LLM 决策过滤 | JEV 结构化决策过滤 |
+| --- | --- |
+| 生成自然语言或 JSON，再由业务代码解析结论 | 直接返回 Choice、完整概率分布和置信度 |
+| 单一结论难以在交易后复核 | 开仓判断与风险检查分别记录，并保留订单上下文和耗时 |
+| 服务异常可能误伤仓位管理 | 服务异常时记录并故障放行，所有退出指令始终绕过 AI |
+
+执行规则仍由 QuantDinger 控制：平仓、止损、止盈和紧急退出始终绕过过滤；首个版本
+暂不处理网格、DCA 和马丁策略。未配置 JEV 时会自动尝试系统已配置的大模型；两者均
+不可用时按故障放行并记录审计结果，避免 AI 服务异常导致已有仓位无法退出。
+
+### 决策流程
+
+```mermaid
+flowchart TD
+    A[策略信号 / 闪电交易指令] --> B[确定性风控与订单预算检查]
+    B -->|基础检查不通过| R[拒绝下单]
+    B -->|基础检查通过| C[构造 Decision Context V2]
+
+    C --> C1[策略参数与信号原因]
+    C --> C2[多周期行情与指标]
+    C --> C3[持仓 敞口 净值 回撤]
+    C --> C4[最近盈亏与连续亏损]
+    C --> C5[止盈止损与执行条件]
+
+    C1 --> D
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    C5 --> D
+
+    D{已配置 JEV?}
+
+    D -->|是| E[JEV System One]
+    E --> E1[证据质量]
+    E --> E2[信号一致性]
+    E --> E3[市场状态]
+    E --> E4[账户风险]
+    E --> E5[执行质量]
+    E --> E6[开仓判断 pass/reject]
+
+    E1 --> F[校验结构 概率 置信度]
+    E2 --> F
+    E3 --> F
+    E4 --> F
+    E5 --> F
+    E6 --> F
+
+    F -->|结果有效且置信度达标| G[确定性决策收敛器]
+    F -->|超时 异常 格式错误 低置信度| H
+
+    D -->|否| H{已配置 LLM?}
+    H -->|是| I[LLM读取同一份上下文]
+    I --> J[强制输出严格JSON]
+    J --> K{decision}
+
+    H -->|否| O[故障放行并记录原因]
+
+    G -->|PASS| P[进入待处理订单队列]
+    G -->|REJECT| R
+    K -->|pass| P
+    K -->|reject| R
+    K -->|非法输出或调用失败| O
+
+    P --> Q[异步提交交易所]
+    R --> S[记录 ai_rejected 与判断过程]
+    O --> T[正常下单并记录 provider unavailable]
+```
+
+管理员可以在 **系统设置 → AI / LLM** 中配置 `JEV_API_KEY`、`JEV_BASE_URL`、
+`JEV_MODEL` 和 `JEV_TIMEOUT_SECONDS`。JEV 使用官方
+[`POST /v1/systemone`](https://docs.typesafe.ai/introduction/quickstart) 接口。
 
 ## 完整文档导航
 

@@ -17,6 +17,7 @@ from app.data_sources.errors import (
     classify_market_data_failure,
 )
 from app.services.script_source import get_script_source_service
+from app.services.ai_decision_context import build_strategy_decision_context
 from app.services.strategy_runtime.health import record_runtime_heartbeat
 from app.services.strategy_runtime.identity import ensure_strategy_run, finish_strategy_run
 from app.services.strategy_runtime.order_intents import OrderIntentService
@@ -679,6 +680,7 @@ class TradingExecutor:
                             strategy_name=strategy_name,
                             intent=intent,
                             frames=frames,
+                            frequency_frames=frequency_frames,
                             candidates=candidates,
                             initial_capital=initial_capital,
                             strategy_equity=current_equity,
@@ -738,6 +740,7 @@ class TradingExecutor:
                             strategy_name=strategy_name,
                             intent=intent,
                             frames=frames,
+                            frequency_frames=frequency_frames,
                             candidates=candidates,
                             initial_capital=initial_capital,
                             strategy_equity=current_equity,
@@ -803,6 +806,7 @@ class TradingExecutor:
                                 strategy_name=strategy_name,
                                 intent=intent,
                                 frames=frames,
+                                frequency_frames=frequency_frames,
                                 candidates=candidates,
                                 initial_capital=initial_capital,
                                 strategy_equity=current_equity,
@@ -891,6 +895,7 @@ class TradingExecutor:
                                         strategy_name=strategy_name,
                                         intent=intent,
                                         frames=frames,
+                                        frequency_frames=frequency_frames,
                                         candidates=candidates,
                                         initial_capital=initial_capital,
                                         strategy_equity=current_equity,
@@ -1039,6 +1044,7 @@ class TradingExecutor:
         strategy_name: str,
         intent: OrderIntent,
         frames: Dict[str, pd.DataFrame],
+        frequency_frames: Dict[str, Dict[str, pd.DataFrame]] | None = None,
         candidates: List[Dict[str, Any]],
         initial_capital: float,
         leverage: float,
@@ -1151,6 +1157,13 @@ class TradingExecutor:
                 signal_ts=signal_ts,
                 strategy_run_id=strategy_run_id,
                 price_exchange_id=str(member.get("exchange_id") or ""),
+                price_instrument_id=str(member.get("instrument_id") or ""),
+                market_frame=frame,
+                market_frames={
+                    frequency: bundle.get(str(intent.symbol))
+                    for frequency, bundle in (frequency_frames or {}).items()
+                    if bundle.get(str(intent.symbol)) is not None
+                },
             )) or submitted
         return submitted
 
@@ -1222,6 +1235,8 @@ class TradingExecutor:
             float(values.get("strategy_equity") if values.get("strategy_equity") is not None else initial_capital),
         )
         leverage = float(values.get("leverage") or 1)
+        trading_config = _json_object(values.get("trading_config"))
+        ai_decision_filter = bool(trading_config.get("ai_decision_filter"))
         nominal_capacity = strategy_equity * max(1.0, leverage)
         entry_pct = ((quantity * reference_price) / nominal_capacity * 100.0) if nominal_capacity > 0 else 0.0
         from app.services.pending_orders.order_budget import strategy_order_budget_snapshot
@@ -1235,7 +1250,7 @@ class TradingExecutor:
             market_type=str(values.get("market_type") or "spot"),
             current_positions=values.get("current_positions") or (),
             buffer_ratio=float(
-                (_json_object(values.get("trading_config"))).get("order_budget_buffer_ratio")
+                trading_config.get("order_budget_buffer_ratio")
                 or 0.02
             ),
         )
@@ -1272,34 +1287,19 @@ class TradingExecutor:
             maker_offset_bps=float(values.get("maker_offset_bps") or 0.0),
             protection=dict(values.get("protection") or {}),
             client_order_id=str(values.get("client_order_id") or ""),
-            ai_decision_filter=bool((_json_object(values.get("trading_config"))).get("ai_decision_filter")),
-            strategy_type=str((_json_object(values.get("trading_config"))).get("bot_type") or ""),
-            decision_context={
-                "strategy_name": str(strategy.get("strategy_name") or ""),
-                "timeframe": str(strategy.get("timeframe") or ""),
-                "direction_mode": str((_json_object(values.get("trading_config"))).get("direction_mode") or ""),
-                "protection": dict(values.get("protection") or {}),
-                "strategy_equity": strategy_equity,
-                "initial_capital": initial_capital,
-                "entry_percent": entry_pct,
-                "order_budget": dict(budget),
-                "current_positions": [
-                    {
-                        key: position.get(key)
-                        for key in (
-                            "symbol",
-                            "side",
-                            "size",
-                            "entry_price",
-                            "current_price",
-                            "highest_price",
-                            "lowest_price",
-                        )
-                    }
-                    for position in (values.get("current_positions") or ())
-                    if isinstance(position, dict)
-                ],
-            },
+            ai_decision_filter=ai_decision_filter,
+            strategy_type=str(trading_config.get("bot_type") or ""),
+            decision_context=(
+                build_strategy_decision_context(
+                    values={**values, "trading_config": trading_config},
+                    strategy=strategy,
+                    order_budget=budget,
+                    strategy_equity=strategy_equity,
+                    initial_capital=initial_capital,
+                    entry_percent=entry_pct,
+                )
+                if ai_decision_filter else None
+            ),
             sizing={
                 "initial_capital": initial_capital,
                 "entry_pct": entry_pct,

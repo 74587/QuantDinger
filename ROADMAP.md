@@ -40,7 +40,8 @@ auditable analytics.
 | Pairs and spread trading foundation | P0 | Now | [#253](https://github.com/OpenByteInc/QuantDinger/issues/253) |
 | Multi-leg order coordination and recovery | P0 | Next | [#254](https://github.com/OpenByteInc/QuantDinger/issues/254) |
 | Pair-level positions, PnL, and analytics | P1 | Next | [#255](https://github.com/OpenByteInc/QuantDinger/issues/255) |
-| External signals and auditable AI entry filters | P1 | Next | [#256](https://github.com/OpenByteInc/QuantDinger/issues/256) |
+| Auditable AI entry filters | P1 | Done | [#256](https://github.com/OpenByteInc/QuantDinger/issues/256) |
+| External signal integrations | P1 | Next | [#256](https://github.com/OpenByteInc/QuantDinger/issues/256) |
 
 ## How to contribute
 
