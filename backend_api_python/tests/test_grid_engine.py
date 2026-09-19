@@ -1018,6 +1018,52 @@ def test_binance_reduce_only_conflict_does_not_auto_stop_grid(monkeypatch):
     assert engine._last_reduce_only_conflict_ts > 0
 
 
+def test_repeated_grid_order_errors_stop_locally_before_cleanup(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    engine = GridEngine(
+        575,
+        "ETH/USDT",
+        {"initial_capital": 1000, "market_type": "spot"},
+        {"exchange_id": "bybit", "credential_id": 7},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *a, **k: False,
+    )
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "app.services.strategy_lifecycle.auto_stop_live_strategy",
+        lambda *a, **k: pytest.fail("Grid error classification must not trigger global cleanup inline"),
+    )
+
+    for _ in range(5):
+        engine._record_order_error("long_exit", RuntimeError("Bybit error 170130"))
+
+    assert engine.stop_requested is True
+    assert engine.stop_reason == "exchange error while placing grid resting order"
+
+
+def test_grid_error_shutdown_preserves_existing_exit_orders(monkeypatch):
+    from app.services.grid.engine import GridEngine
+
+    engine = GridEngine(
+        576,
+        "ETH/USDT",
+        {"initial_capital": 1000, "market_type": "spot"},
+        {"exchange_id": "bybit", "credential_id": 7},
+        create_client_fn=lambda: object(),
+        enqueue_market=lambda *a, **k: False,
+    )
+    calls = []
+    monkeypatch.setattr("app.services.grid.engine.append_strategy_log", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "cancel_entry_orders_on_exchange", lambda: calls.append("entries"))
+    monkeypatch.setattr(engine, "cancel_all_orders_on_exchange", lambda: calls.append("all"))
+    monkeypatch.setattr(engine._cells, "release_cancelled_working_orders", lambda *a: 0)
+
+    engine.shutdown(preserve_exit_orders=True)
+
+    assert calls == ["entries"]
+
+
 def test_sync_exit_coverage_uses_a_distinct_cell_when_one_exit_is_already_open(monkeypatch):
     from app.services.grid.engine import GridEngine
     from app.services.grid.levels import generate_cells, generate_levels

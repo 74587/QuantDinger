@@ -93,6 +93,7 @@ def test_gate_stock_testnet_rejected_before_deployment_is_saved(monkeypatch):
 
     monkeypatch.setattr(deployment, "get_script_source_service", lambda: SimpleNamespace(
         get_source=lambda *a, **kw: {"name": "Gate NVDA", "code": CODE},
+        get_latest_version=lambda *a, **kw: {"id": 11, "code": CODE},
     ))
     monkeypatch.setattr(deployment.StrategyV2DeploymentService, "_credential_exchange", lambda *a: "gate")
     monkeypatch.setattr(deployment, "get_catalog_product", lambda **kw: {

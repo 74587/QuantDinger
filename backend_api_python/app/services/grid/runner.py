@@ -227,7 +227,10 @@ class GridRestingRunner:
             and not startup_snapshot.get("healthy")
         )
         if self._engine.stop_requested or startup_coverage_failed:
-            self._engine.cancel_all_orders_on_exchange()
+            if has_new_initial_fills or startup_coverage_failed:
+                self._engine.cancel_all_orders_on_exchange()
+            else:
+                self._engine.cancel_entry_orders_on_exchange()
             rollback_ok = (
                 self._engine.rollback_startup_initial_fills(current_price)
                 if has_new_initial_fills
@@ -269,7 +272,11 @@ class GridRestingRunner:
 
     def shutdown(self) -> None:
         try:
-            self._engine.shutdown()
+            preserve_exits = bool(
+                self._engine.stop_requested
+                and self._engine.stop_reason == "exchange error while placing grid resting order"
+            )
+            self._engine.shutdown(preserve_exit_orders=preserve_exits)
         finally:
             unregister_runner(self.strategy_id)
             self._started = False

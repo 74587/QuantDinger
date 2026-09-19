@@ -617,14 +617,17 @@ def _parse_binance(_market_type: str, raw: Mapping[str, Any]) -> dict[str, Decim
     return values
 
 
-def _parse_bybit(_market_type: str, raw: Mapping[str, Any]) -> dict[str, Decimal]:
+def _parse_bybit(market_type: str, raw: Mapping[str, Any]) -> dict[str, Decimal]:
     values = _empty_values()
     lot = raw.get("lotSizeFilter") or {}
     price = raw.get("priceFilter") or {}
     values.update({
-        "amount_step": _positive(lot.get("qtyStep")),
+        "amount_step": _first_positive(lot.get("qtyStep"), lot.get("basePrecision")),
         "min_amount": _first_positive(lot.get("minOrderQty"), lot.get("minTradingQty")),
-        "min_notional": _positive(lot.get("minNotionalValue")),
+        "min_notional": _first_positive(
+            lot.get("minNotionalValue"),
+            lot.get("minOrderAmt") if market_type == "spot" else None,
+        ),
         "price_tick": _positive(price.get("tickSize")),
     })
     return values

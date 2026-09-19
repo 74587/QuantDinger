@@ -523,7 +523,7 @@ class BybitClient(BaseRestClient):
         except Exception:
             info = {}
         lot = (info.get("lotSizeFilter") if isinstance(info, dict) else None) or {}
-        step = self._to_dec((lot or {}).get("qtyStep") or "0")
+        step = self._to_dec((lot or {}).get("qtyStep") or (lot or {}).get("basePrecision") or "0")
         mn = self._to_dec((lot or {}).get("minOrderQty") or "0")
         if step > 0:
             q = self._floor_to_step(q, step)
@@ -545,6 +545,27 @@ class BybitClient(BaseRestClient):
             # Avoid sending unrounded base qty when instrument metadata is missing.
             qty_precision = 4
         return (q, qty_precision)
+
+    def _validate_spot_limit_order(self, *, symbol: str, qty: Decimal, price: Decimal) -> None:
+        if self.category != "spot":
+            return
+        try:
+            info = self.get_instrument_info(category=self.category, symbol=to_bybit_symbol(symbol)) or {}
+        except Exception:
+            return
+        lot = (info.get("lotSizeFilter") if isinstance(info, dict) else None) or {}
+        min_order_amount = self._to_dec(lot.get("minOrderAmt") or lot.get("minNotionalValue") or "0")
+        max_limit_qty = self._to_dec(lot.get("maxLimitOrderQty") or lot.get("maxOrderQty") or "0")
+        if min_order_amount > 0 and qty * price < min_order_amount:
+            raise LiveTradingError(
+                "Invalid spot limit notional (below minOrderAmt): "
+                f"notional={self._dec_str(qty * price)} min={self._dec_str(min_order_amount)}"
+            )
+        if max_limit_qty > 0 and qty > max_limit_qty:
+            raise LiveTradingError(
+                "Invalid spot limit qty (above maxLimitOrderQty): "
+                f"qty={self._dec_str(qty)} max={self._dec_str(max_limit_qty)}"
+            )
 
     def _normalize_quantity(
         self,
@@ -707,6 +728,7 @@ class BybitClient(BaseRestClient):
             raise LiveTradingError(
                 f"Invalid price (below tick/min): requested={format_decimal(px_req)}"
             )
+        self._validate_spot_limit_order(symbol=symbol, qty=q_dec, price=px_dec)
         body: Dict[str, Any] = {
             "category": self.category,
             "symbol": sym,

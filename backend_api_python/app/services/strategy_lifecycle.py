@@ -97,6 +97,7 @@ def maybe_auto_stop_on_exchange_error(
     source: str = "exchange",
     consecutive_failures: int = 0,
     consecutive_threshold: int = 5,
+    perform_stop: bool = True,
 ) -> bool:
     """
     Stop a live strategy after a fatal exchange/auth error or repeated failures.
@@ -109,18 +110,20 @@ def maybe_auto_stop_on_exchange_error(
     if not reason:
         return False
     if is_fatal_exchange_error(reason):
-        auto_stop_live_strategy(sid, reason, source=source)
+        if perform_stop:
+            auto_stop_live_strategy(sid, reason, source=source)
         return True
     if is_recoverable_position_error(reason):
         # Reject the individual entry/undersized order while keeping position
         # monitoring and reduce-only protection alive.
         return False
     if consecutive_failures >= max(1, int(consecutive_threshold or 5)):
-        auto_stop_live_strategy(
-            sid,
-            f"Repeated exchange errors ({consecutive_failures}): {reason}",
-            source=source,
-        )
+        if perform_stop:
+            auto_stop_live_strategy(
+                sid,
+                f"Repeated exchange errors ({consecutive_failures}): {reason}",
+                source=source,
+            )
         return True
     return False
 

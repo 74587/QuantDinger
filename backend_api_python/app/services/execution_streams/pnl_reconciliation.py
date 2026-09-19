@@ -95,7 +95,10 @@ def enrich_reported_order_pnl(rows, *, user_id, trading_config):
     for key, members in groups.items():
         if any(is_exit_trade_type(str(r.get("type") or "")) for r in members):
             for row in members:
-                row["exchange_pnl"] = {"status": "pending" if key in eligible else "unavailable"}
+                if key[2] == "spot" and key[1] in _SUPPORTED - {"ibkr"}:
+                    row["exchange_pnl"] = {"status": "not_applicable_spot"}
+                else:
+                    row["exchange_pnl"] = {"status": "pending" if key in eligible else "unavailable"}
     if not eligible:
         return rows
     reports, events = _load(eligible)

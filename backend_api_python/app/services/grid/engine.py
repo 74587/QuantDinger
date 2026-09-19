@@ -136,6 +136,7 @@ class GridEngine:
                 source="grid_order",
                 consecutive_failures=self._consecutive_order_errors,
                 consecutive_threshold=threshold,
+                perform_stop=False,
             ):
                 self._stop_requested = True
                 self._paused_entries = True
@@ -1038,7 +1039,7 @@ class GridEngine:
         return False
 
     def sync_grid_orders(self, current_price: float) -> int:
-        if not self._bootstrapped or self._paused_entries or current_price <= 0:
+        if self._stop_requested or not self._bootstrapped or self._paused_entries or current_price <= 0:
             return 0
         if self._runtime_params.get("waterfall_pause"):
             return 0
@@ -1122,6 +1123,8 @@ class GridEngine:
             next_index = {"long_entry": 0, "short_entry": 0}
 
             while placed < remaining_slots:
+                if self._stop_requested:
+                    break
                 purposes = sorted(
                     ("long_entry", "short_entry"),
                     key=lambda purpose: (
@@ -1131,6 +1134,8 @@ class GridEngine:
                 )
                 placed_one = False
                 for purpose in purposes:
+                    if self._stop_requested:
+                        break
                     side = "buy" if purpose == "long_entry" else "sell"
                     pos_side = "long" if purpose == "long_entry" else "short"
                     if not allowed_sides.get(pos_side, True):
@@ -1167,7 +1172,7 @@ class GridEngine:
             return placed
 
         for cell in cells:
-            if placed >= remaining_slots:
+            if self._stop_requested or placed >= remaining_slots:
                 break
             if (
                 direction in ("long", "neutral")
@@ -1455,7 +1460,7 @@ class GridEngine:
 
     def sync_held_cell_exits(self, current_price: float) -> int:
         """Re-hang grid-sized exits for cells that hold inventory but lost their working exit order."""
-        if not self._bootstrapped or current_price <= 0:
+        if self._stop_requested or not self._bootstrapped or current_price <= 0:
             return 0
         direction = self.cfg.grid_direction
         if direction not in ("long", "short", "neutral"):
@@ -1463,6 +1468,8 @@ class GridEngine:
         placed = 0
         rows = self._cells.list_cells(self.strategy_id, self.symbol)
         for cell in rows or []:
+            if self._stop_requested:
+                break
             st = cell.state
             cell_idx = int(cell.cell_index)
             _, cells = self._levels_and_cells()
@@ -1521,7 +1528,7 @@ class GridEngine:
         Initial market inventory is NOT sold in one block — only ``amountPerGrid`` worth
         is offered at the next grid line, same as a normal filled entry cell.
         """
-        if not self._bootstrapped or current_price <= 0:
+        if self._stop_requested or not self._bootstrapped or current_price <= 0:
             return 0
         direction = self.cfg.grid_direction
         if direction not in ("long", "short"):
@@ -1565,6 +1572,8 @@ class GridEngine:
         covered_qty = max(self._held_cell_qty(direction), self._open_exit_qty(purpose))
         uncovered_qty = max(0.0, float(pos_qty or 0.0) - float(covered_qty or 0.0))
         for target_cell in candidates:
+            if self._stop_requested:
+                break
             idx = int(target_cell.index)
             if idx in self._initial_seeded_cells:
                 continue
@@ -1633,6 +1642,8 @@ class GridEngine:
         pos_side: str,
         quantity: Optional[float] = None,
     ) -> bool:
+        if self._stop_requested:
+            return False
         px = float(price or 0)
         if px <= 0:
             return False
@@ -1790,7 +1801,11 @@ class GridEngine:
             self._consecutive_order_errors = 0
             return True
         except Exception as e:
-            self._record_order_error(purpose, e)
+            context = (
+                f"{e} [cell={cell.index} side={side} price={px:.12g} "
+                f"qty={qty:.12g} client_order_id={coid}]"
+            )
+            self._record_order_error(purpose, RuntimeError(context))
         return False
 
     def on_order_filled(
@@ -2064,8 +2079,16 @@ class GridEngine:
         for o in open_orders:
             self._cancel_confirmed_order(client, o)
 
-    def shutdown(self) -> None:
-        self.cancel_all_orders_on_exchange()
+    def shutdown(self, *, preserve_exit_orders: bool = False) -> None:
+        if preserve_exit_orders:
+            self.cancel_entry_orders_on_exchange()
+            append_strategy_log(
+                self.strategy_id,
+                "warning",
+                "strategyRuntime.gridOrderErrorExitsPreserved",
+            )
+        else:
+            self.cancel_all_orders_on_exchange()
         released = self._cells.release_cancelled_working_orders(self.strategy_id, self.symbol)
         if released:
             append_strategy_log(self.strategy_id, "info", f"Grid released {released} local cell working state(s)")

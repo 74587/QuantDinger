@@ -38,6 +38,18 @@ from app.services.instrument_rules import (
             (0.001, 0.002, 5.0, 0.1, 1.0),
         ),
         (
+            "bybit",
+            "spot",
+            {
+                "lotSizeFilter": {
+                    "basePrecision": "0.000001",
+                    "minOrderAmt": "5",
+                },
+                "priceFilter": {"tickSize": "0.01"},
+            },
+            (0.000001, 0.0, 5.0, 0.01, 1.0),
+        ),
+        (
             "okx",
             "swap",
             {"lotSz": "1", "minSz": "2", "tickSz": "0.1", "ctVal": "0.01"},

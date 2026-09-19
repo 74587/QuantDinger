@@ -124,7 +124,8 @@ def test_spot_and_missing_credentials_do_not_manufacture_realized_pnl(monkeypatc
     rows[1]["credential_id"] = 0
     monkeypatch.setattr(reconciliation, "_load", lambda keys: pytest.fail("No eligible reports"))
     result = reconciliation.enrich_reported_order_pnl(rows, user_id=1, trading_config={})
-    assert all(r["exchange_pnl"]["status"] == "unavailable" for r in result)
+    assert result[0]["exchange_pnl"] == {"status": "not_applicable_spot"}
+    assert result[1]["exchange_pnl"] == {"status": "unavailable"}
 
 
 @pytest.mark.parametrize("exchange", ["binance", "okx", "bybit", "bitget", "gate", "htx"])
@@ -134,7 +135,7 @@ def test_crypto_spot_never_claims_venue_reported_position_pnl(monkeypatch, excha
 
     result = reconciliation.enrich_reported_order_pnl(rows, user_id=1, trading_config={})
 
-    assert result[0]["exchange_pnl"] == {"status": "unavailable"}
+    assert result[0]["exchange_pnl"] == {"status": "not_applicable_spot"}
 
 
 @pytest.mark.parametrize("exchange", ["binance", "okx", "bybit", "bitget", "gate", "htx"])

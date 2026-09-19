@@ -24,6 +24,54 @@ def test_bybit_normalize_quantity_floors_to_qty_step(mock_info):
 
 
 @patch.object(BybitClient, "get_instrument_info")
+def test_bybit_spot_normalize_quantity_uses_base_precision(mock_info):
+    mock_info.return_value = {
+        "lotSizeFilter": {"basePrecision": "0.000001", "minOrderAmt": "5"},
+    }
+    client = BybitClient(api_key="k", secret_key="s", category="spot")
+    dec, prec = client._normalize_quantity(symbol="ETH/USDT", quantity=0.004364876)
+    assert dec == Decimal("0.004364")
+    assert prec == 6
+
+
+@patch.object(BybitClient, "get_instrument_info")
+def test_bybit_spot_limit_validates_minimum_notional_before_submission(mock_info):
+    mock_info.return_value = {
+        "lotSizeFilter": {"basePrecision": "0.000001", "minOrderAmt": "5"},
+        "priceFilter": {"tickSize": "0.01"},
+    }
+    client = BybitClient(api_key="k", secret_key="s", category="spot")
+    with patch.object(client, "_signed_request") as request:
+        try:
+            client.place_limit_order(symbol="ETH/USDT", side="buy", qty=0.001, price=2500)
+        except Exception as exc:
+            assert "minOrderAmt" in str(exc)
+        else:
+            raise AssertionError("Below-minimum order must be rejected locally")
+    request.assert_not_called()
+
+
+@patch.object(BybitClient, "get_instrument_info")
+def test_bybit_spot_limit_body_uses_exchange_precision(mock_info):
+    mock_info.return_value = {
+        "lotSizeFilter": {
+            "basePrecision": "0.000001",
+            "minOrderAmt": "5",
+            "maxLimitOrderQty": "100",
+        },
+        "priceFilter": {"tickSize": "0.01"},
+    }
+    client = BybitClient(api_key="k", secret_key="s", category="spot")
+    with patch.object(client, "_signed_request", return_value={"result": {"orderId": "1"}}) as request:
+        client.place_limit_order(symbol="ETH/USDT", side="sell", qty=0.004364876, price=2750.129)
+
+    body = request.call_args.kwargs["json_body"]
+    assert body["qty"] == "0.004364"
+    assert body["price"] == "2750.12"
+    assert "reduceOnly" not in body
+
+
+@patch.object(BybitClient, "get_instrument_info")
 def test_bybit_place_market_order_qty_string_respects_step(mock_info):
     mock_info.return_value = {
         "lotSizeFilter": {"qtyStep": "0.001", "minOrderQty": "0.001"},
