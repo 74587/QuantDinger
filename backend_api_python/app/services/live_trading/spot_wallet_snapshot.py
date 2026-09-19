@@ -101,7 +101,7 @@ def _from_bybit_spot_holdings(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     for item in lst if isinstance(lst, list) else []:
         if not isinstance(item, dict):
             continue
-        sym = str(item.get("symbol") or "")
+        sym = normalize_strategy_symbol(str(item.get("symbol") or ""))
         ccy = sym.split("/")[0].split(":")[0].strip().upper() if sym else ""
         if not ccy:
             continue
