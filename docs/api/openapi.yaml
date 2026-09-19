@@ -535,6 +535,9 @@ components:
           type: string
           default: ''
           maxLength: 16
+        ai_decision_filter:
+          type: boolean
+          default: false
       required:
       - amount
       - credential_id
@@ -2521,6 +2524,31 @@ paths:
       schema:
         type: integer
         minimum: 0
+    delete:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Universe
+      operationId: deleteApiUniversesUniverseId
+      summary: Delete Api Universes Universe Id
+      parameters:
+      - name: universe_id
+        in: path
+        required: true
+        schema:
+          type: integer
+      x-visibility: internal
   /api/universes/{universe_id}/members:
     get:
       responses:
@@ -4375,6 +4403,26 @@ paths:
       tags:
       - Account
       operationId: getApiAccountPositions
+      x-visibility: internal
+  /api/strategies/ai-decisions:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      tags:
+      - Strategy
+      operationId: getApiStrategiesAiDecisions
+      summary: Get Api Strategies Ai Decisions
       x-visibility: internal
   /api/strategy-assets:
     get:
