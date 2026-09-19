@@ -58,6 +58,7 @@ class GridFillPoller:
         self._max_req_per_cred_per_min = max(10, _env_int("GRID_FILL_MAX_REQ_PER_CREDENTIAL_PER_MIN", 120))
         self._last_poll_by_order: Dict[int, float] = {}
         self._credential_req_ts: Dict[str, List[float]] = defaultdict(list)
+        self._last_audit_by_strategy: Dict[int, Dict[str, object]] = {}
         self._lock = threading.Lock()
 
     def start(self) -> None:
@@ -186,7 +187,7 @@ class GridFillPoller:
             self._last_poll_by_order[oid] = time.time()
             self._poll_order(runner, client, order, cfg.market_type)
 
-    def _poll_order(self, runner, client, order, market_type: str) -> None:
+    def _poll_order(self, runner, client, order, market_type: str) -> str:
         from app.services.execution_streams.processor import ExecutionEventProcessor
         from app.services.pending_orders.fee_reconciliation import fee_breakdown_snapshot
         from app.services.live_trading.fill_accounting import lock_strategy_fills
@@ -202,9 +203,9 @@ class GridFillPoller:
             exchange_config=runner.exchange_config,
         )
         if status == "unknown" or not order.id:
-            return
+            return "unknown"
         if status == "filled" and (filled <= 0 or avg <= 0):
-            return
+            return status
         details = {}
         fee_qty, fee_avg = filled, avg
         if filled > 0:
@@ -251,10 +252,23 @@ class GridFillPoller:
                     run_after_commit(runner.engine.sync_held_cell_exits, avg)
         except Exception:
             logger.exception("Grid REST posting failed sid=%s oid=%s; retry required", order.strategy_id, order.id)
+        return status
+
+    def last_strategy_audit(self, strategy_id: int) -> Dict[str, object]:
+        return dict(self._last_audit_by_strategy.get(int(strategy_id)) or {})
 
     def sync_strategy(self, strategy_id: int) -> int:
         """Poll every open order for one strategy immediately (UI refresh)."""
         sid = int(strategy_id)
+        audit: Dict[str, object] = {
+            "completed": False,
+            "attempted": 0,
+            "active": 0,
+            "terminal": 0,
+            "unknown": 0,
+            "error": "",
+        }
+        self._last_audit_by_strategy[sid] = audit
         open_orders = self._repo.list_open(sid)
         unprocessed = self._repo.list_unprocessed(sid)
         merged: Dict[int, GridRestingOrder] = {}
@@ -264,9 +278,11 @@ class GridFillPoller:
                 merged[oid] = order
         open_orders = list(merged.values())
         if not open_orders:
+            audit["completed"] = True
             return 0
         runner = get_runner(sid)
         if not runner:
+            audit["error"] = "grid_runner_not_available"
             return 0
         cfg = runner.engine.cfg
         cred_key = self._credential_key(runner)
@@ -288,14 +304,27 @@ class GridFillPoller:
             client = create_client(ex_cfg, market_type=cfg.market_type)
         except Exception as e:
             logger.debug("grid sync_strategy client sid=%s: %s", sid, e)
+            audit["error"] = "grid_exchange_client_unavailable"
             return 0
         n = 0
         for order in open_orders:
             if not self._allow_credential_request(cred_key):
                 break
             self._last_poll_by_order[int(order.id or 0)] = time.time()
-            self._poll_order(runner, client, order, cfg.market_type)
+            status = self._poll_order(runner, client, order, cfg.market_type)
             n += 1
+            audit["attempted"] = n
+            if status in {"open", "partial"}:
+                audit["active"] = int(audit["active"] or 0) + 1
+            elif status in {"filled", "cancelled"}:
+                audit["terminal"] = int(audit["terminal"] or 0) + 1
+            else:
+                audit["unknown"] = int(audit["unknown"] or 0) + 1
+        audit["completed"] = n == len(open_orders)
+        if not audit["completed"]:
+            audit["error"] = "grid_exchange_audit_rate_limited"
+        elif int(audit["unknown"] or 0) > 0:
+            audit["error"] = "grid_exchange_orders_unverified"
         return n
 
 

@@ -153,6 +153,67 @@ def test_grid_startup_places_limits_when_client_ok():
     assert place.called
 
 
+def test_grid_startup_rolls_back_new_seed_without_resting_coverage(monkeypatch):
+    runner = GridRestingRunner(
+        3,
+        "ETH/USDT",
+        {
+            "market_type": "spot",
+            "initial_capital": 1000,
+            "bot_params": {
+                "upperPrice": 3000,
+                "lowerPrice": 2000,
+                "gridCount": 20,
+                "amountPerGrid": 10,
+                "gridDirection": "long",
+                "initialPositionPct": 20,
+                "maxOpenOrders": 10,
+            },
+        },
+        {"exchange_id": "bybit", "credential_id": 9},
+        user_id=1,
+        initial_capital=1000,
+        enqueue_market_fn=lambda *_args, **_kwargs: True,
+        create_client_fn=lambda: object(),
+    )
+    engine = runner.engine
+    monkeypatch.setattr(engine, "bootstrap", lambda _price: (True, ""))
+    monkeypatch.setattr(engine, "handle_boundary", lambda _price: False)
+
+    def seed(_price):
+        engine._initial_done = True
+        engine._startup_initial_fills = [{"signal_type": "open_long", "quantity": 0.08}]
+        return True
+
+    monkeypatch.setattr(engine, "run_initial_market_position", seed)
+    monkeypatch.setattr(engine, "sync_grid_orders", lambda _price: 0)
+    monkeypatch.setattr(engine, "sync_exit_coverage", lambda _price: 0)
+    monkeypatch.setattr(engine._orders, "list_open", lambda *_args, **_kwargs: [])
+    cancel_all = MagicMock()
+    rollback = MagicMock(return_value=True)
+    monkeypatch.setattr(engine, "cancel_all_orders_on_exchange", cancel_all)
+    monkeypatch.setattr(engine, "rollback_startup_initial_fills", rollback)
+    monkeypatch.setattr(
+        "app.services.grid.exchange_requirements.validate_neutral_grid_exchange_support",
+        lambda *_args, **_kwargs: (True, ""),
+    )
+    monkeypatch.setattr(
+        "app.services.grid.exchange_requirements.fetch_exchange_dual_leg_snapshot",
+        lambda *_args, **_kwargs: {
+            "long_size": 0.0,
+            "short_size": 0.0,
+            "position_mode_label": "spot",
+        },
+    )
+
+    ok, message = runner.startup(2500.0)
+
+    assert ok is False
+    assert message == "strategyRuntime.gridStartupCoverageFailedRolledBack"
+    cancel_all.assert_called_once_with()
+    rollback.assert_called_once_with(2500.0)
+
+
 def test_grid_tick_stops_processing_after_boundary_trigger(monkeypatch):
     from types import SimpleNamespace
 

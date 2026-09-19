@@ -24,7 +24,6 @@ from app.services.live_trading.gate import GateStockClient, GateUsdtFuturesClien
 from app.services.live_trading.leg_context import credential_id_from_exchange_config
 from app.services.live_trading.okx import OkxClient
 from app.services.live_trading.records import normalize_strategy_symbol, strategy_allowed_symbols
-from app.services.live_trading.strategy_position_sync import strategy_uses_fill_ledger
 from app.services.pending_orders.position_sync_cache import (
     exchange_sync_backoff_sec,
     get_position_sync_snapshot,
@@ -75,11 +74,10 @@ def _activate_position_sync_fd_backoff(reason: str) -> None:
 class PendingOrderPositionSyncMixin:
     def _sync_positions_best_effort(self, target_strategy_id: Optional[int] = None) -> None:
         """
-        Best-effort reconciliation:
-        - If exchange position is flat, delete local row from qd_strategy_positions.
-        - If exchange position size differs, update local size (optional best-effort).
+        Refresh the account-level exchange mirror without changing strategy ledgers.
 
-        This prevents "ghost positions" when positions are closed externally on the exchange.
+        L1 account positions come from exchange snapshots. L3 strategy positions are
+        produced only by strategy-owned fills, including fill-ledger strategies.
         """
         if _is_position_sync_fd_backoff_active():
             logger.debug("[PositionSync] skipped: file-descriptor backoff active")
@@ -151,17 +149,6 @@ class PendingOrderPositionSyncMixin:
             try:
                 sc = load_strategy_configs(int(sid))
                 exec_mode = (sc.get("execution_mode") or "").strip().lower()
-                bot_type = str(
-                    sc.get("bot_type")
-                    or (sc.get("trading_config") or {}).get("bot_type")
-                    or ""
-                ).strip().lower()
-                if strategy_uses_fill_ledger(sc):
-                    logger.debug(
-                        "[PositionSync] Strategy %s skipped: fill-ledger strategy (L3)",
-                        sid,
-                    )
-                    continue
                 if exec_mode != "live":
                     logger.debug(f"[PositionSync] Strategy {sid} skipped: execution_mode='{exec_mode}'")
                     continue
@@ -619,20 +606,21 @@ class PendingOrderPositionSyncMixin:
                         continue
 
                     set_position_sync_snapshot(cache_key, exch_size, exch_entry_price, exch_inst_id)
-                    try:
-                        cred_id = credential_id_from_exchange_config(exchange_config)
-                        legs = account_legs_from_exchange_maps(
-                            exch_size, exch_entry_price, exch_inst_id
-                        )
-                        sync_account_positions(
-                            user_id=int(sync_user_id),
-                            credential_id=cred_id,
-                            exchange_id=str(exchange_id or ""),
-                            market_type=str(market_type or "swap"),
-                            legs=legs,
-                        )
-                    except Exception as l1_err:
-                        logger.warning("[PositionSync] L1 account sync failed key=%s: %s", cache_key, l1_err)
+
+                try:
+                    cred_id = credential_id_from_exchange_config(exchange_config)
+                    legs = account_legs_from_exchange_maps(
+                        exch_size, exch_entry_price, exch_inst_id
+                    )
+                    sync_account_positions(
+                        user_id=int(sync_user_id),
+                        credential_id=cred_id,
+                        exchange_id=str(exchange_id or ""),
+                        market_type=str(market_type or "swap"),
+                        legs=legs,
+                    )
+                except Exception as l1_err:
+                    logger.warning("[PositionSync] L1 account sync failed key=%s: %s", cache_key, l1_err)
 
                 # [DEBUG] Log all normalized exchange keys for inspection
                 logger.debug(f"[PositionSync] Strategy {sid} Exchange Keys: {list(exch_size.keys())}")

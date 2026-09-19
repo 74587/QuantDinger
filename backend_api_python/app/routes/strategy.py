@@ -43,6 +43,7 @@ from app.services.strategy_ai_workspace import (
 )
 from app.services.strategy import redact_strategy_row
 from app.services.strategy_daily_pnl import load_strategy_daily_metrics
+from app.services.strategy_runtime.bot_type import resolve_bot_type
 from app.services.strategy_runtime.health import load_runtime_health
 from app.services.strategy_v2 import compile_strategy_v2
 from app.utils.auth import login_required
@@ -110,7 +111,13 @@ def _attach_runtime_health(rows, *, user_id: int | None = None, client_timezone:
     }
     health = load_runtime_health(statuses, strategy_statuses=statuses)
     for row in items:
-        row["runtime_health"] = health.get(int(row.get("id") or 0), {})
+        runtime_health = health.get(int(row.get("id") or 0), {})
+        row["runtime_health"] = runtime_health
+        resolved_bot_type = resolve_bot_type(row)
+        if not resolved_bot_type and str(runtime_health.get("trigger_mode") or "").strip().lower() == "exchange_resting_orders":
+            resolved_bot_type = "grid"
+        if resolved_bot_type:
+            row["resolved_bot_type"] = resolved_bot_type
     if user_id is not None:
         metrics = load_strategy_daily_metrics(
             items,

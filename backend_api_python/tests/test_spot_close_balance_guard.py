@@ -11,7 +11,7 @@ from app.services.live_trading.bybit import BybitClient
 from app.services.live_trading.gate import GateSpotClient, GateStockClient
 from app.services.live_trading.htx import HtxClient
 from app.services.live_trading.okx import OkxClient
-from app.services.live_trading.spot_sizing import clamp_spot_close_quantity
+from app.services.live_trading.spot_sizing import clamp_spot_close_quantity, get_spot_base_holding
 
 
 def spot_client(exchange, free):
@@ -73,6 +73,42 @@ def test_spot_close_missing_asset_in_valid_snapshot_is_zero():
     client, fetch = spot_client("binance", "1")
     fetch.return_value = {"balances": []}
     assert clamp_spot_close_quantity(client, symbol="BTC/USDT", requested_qty=1)[0] == 0
+
+
+def test_bybit_spot_balance_prefers_unified_account():
+    client = BybitClient(api_key="key", secret_key="secret", category="spot")
+    account_types = []
+
+    def wallet_balance(*, account_type):
+        account_types.append(account_type)
+        return {
+            "result": {
+                "list": [
+                    {
+                        "coin": [
+                            {
+                                "coin": "BTC",
+                                "walletBalance": "1.25",
+                                "locked": "0.05",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+    client.get_wallet_balance = wallet_balance
+
+    holding = get_spot_base_holding(
+        client,
+        symbol="BTC/USDT",
+        strict=True,
+        require_available=True,
+    )
+
+    assert account_types == ["UNIFIED"]
+    assert holding["total"] == 1.25
+    assert holding["available"] == 1.2
 
 
 def test_spot_close_unsupported_client_is_not_treated_as_a_valid_snapshot():

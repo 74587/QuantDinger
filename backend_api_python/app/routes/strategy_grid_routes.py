@@ -27,9 +27,16 @@ def get_grid_resting_orders():
         if not st:
             return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': {'orders': [], 'items': []}}), 404
 
+        from app.services.script_source import get_script_source_service
         from app.services.strategy_runtime.bot_type import resolve_bot_type
 
-        bot_type = resolve_bot_type(st, st.get('trading_config') or {})
+        trading_config = st.get('trading_config') or {}
+        source_id = int(st.get('script_source_id') or trading_config.get('script_source_id') or 0)
+        source_code = ''
+        if source_id:
+            source = get_script_source_service().get_source(source_id, user_id=user_id)
+            source_code = str((source or {}).get('code') or '')
+        bot_type = resolve_bot_type(st, trading_config, source_code=source_code)
         if bot_type != 'grid':
             return jsonify({'code': 0, 'msg': 'Not a grid strategy', 'data': {'orders': [], 'items': []}}), 400
 
@@ -39,14 +46,24 @@ def get_grid_resting_orders():
 
         sync_error = ''
         synced_count = 0
+        exchange_audit = {}
         if sync:
             try:
-                from app.services.grid.poller import sync_strategy_grid_orders
+                from app.services.grid.poller import get_grid_fill_poller, sync_strategy_grid_orders
 
                 synced_count = int(sync_strategy_grid_orders(int(strategy_id)) or 0)
+                exchange_audit = get_grid_fill_poller().last_strategy_audit(int(strategy_id))
+                sync_error = str(exchange_audit.get('error') or '')
             except Exception as sync_err:
                 logger.debug("grid-resting sync sid=%s: %s", strategy_id, sync_err)
                 sync_error = str(sync_err)
+        else:
+            try:
+                from app.services.grid.poller import get_grid_fill_poller
+
+                exchange_audit = get_grid_fill_poller().last_strategy_audit(int(strategy_id))
+            except Exception:
+                exchange_audit = {}
 
         from app.services.grid.resting_orders_repo import GridRestingOrderRepository
         from app.utils.trade_close_reason import label_for_reason
@@ -89,12 +106,18 @@ def get_grid_resting_orders():
         for item in out:
             key = str(item.get('status') or 'unknown')
             status_counts[key] = int(status_counts.get(key, 0)) + 1
-        verified = sum(1 for item in out if str(item.get('exchange_order_id') or '').strip())
+        id_confirmed = sum(1 for item in out if str(item.get('exchange_order_id') or '').strip())
+        audited_active = int(exchange_audit.get('active') or 0)
+        verified = min(len(out), audited_active) if exchange_audit else id_confirmed
         updated_values = [str(item.get('updated_at') or '') for item in out if item.get('updated_at')]
         summary = {
             'total': len(out),
             'verified_exchange_orders': verified,
-            'unverified_orders': len(out) - verified,
+            'unverified_orders': max(0, len(out) - verified),
+            'exchange_active_orders': audited_active if sync else None,
+            'exchange_terminal_orders': int(exchange_audit.get('terminal') or 0) if sync else None,
+            'exchange_unknown_orders': int(exchange_audit.get('unknown') or 0) if sync else None,
+            'exchange_audit_completed': bool(exchange_audit.get('completed')) if sync else False,
             'status_counts': status_counts,
             'sync_requested': sync,
             'sync_ok': not bool(sync_error),

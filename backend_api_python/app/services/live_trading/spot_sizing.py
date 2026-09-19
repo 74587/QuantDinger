@@ -251,25 +251,49 @@ def get_spot_base_holding(
         from app.services.live_trading.bybit import BybitClient
 
         if isinstance(client, BybitClient) and (getattr(client, "category", "") or "").strip().lower() == "spot":
-            raw = client.get_wallet_balance(account_type="SPOT") or {}
-            balance_read = True
-            lst = rows((raw.get("result") or {}).get("list") if isinstance(raw, dict) else None)
-            for acct in lst:
-                if not isinstance(acct, dict):
+            last_error: Optional[Exception] = None
+            for account_type in ("UNIFIED", "SPOT"):
+                try:
+                    raw = client.get_wallet_balance(account_type=account_type) or {}
+                    balance_read = True
+                except Exception as account_error:
+                    last_error = account_error
                     continue
-                for coin in rows(acct.get("coin")):
-                    if not isinstance(coin, dict):
+                lst = rows((raw.get("result") or {}).get("list") if isinstance(raw, dict) else None)
+                for acct in lst:
+                    if not isinstance(acct, dict):
                         continue
-                    if str(coin.get("coin") or "").upper() == base_u:
-                        keys = ("availableToWithdraw", "free")
-                        if not require_available:
-                            keys += ("walletBalance",)
-                        avail = available(coin, *keys)
-                        total = _pick_free_from_row(coin, "walletBalance", "equity", "availableToWithdraw")
-                        avg_cost = _pick_cost_from_row(
-                            coin, "avgPrice", "sessionAvgPrice", "accAvgPx", "avgCost"
-                        )
-                        return _spot_holding(total, avail, avg_cost)
+                    for coin in rows(acct.get("coin")):
+                        if not isinstance(coin, dict):
+                            continue
+                        if str(coin.get("coin") or "").upper() == base_u:
+                            keys = ("availableToWithdraw", "availableBalance", "free")
+                            if not require_available:
+                                keys += ("walletBalance",)
+                            total = _pick_free_from_row(
+                                coin,
+                                "walletBalance",
+                                "equity",
+                                "availableToWithdraw",
+                                "availableBalance",
+                            )
+                            try:
+                                avail = available(coin, *keys)
+                            except LiveTradingError:
+                                explicit_available = any(
+                                    key in coin
+                                    for key in ("free", "availableBalance")
+                                ) or coin.get("availableToWithdraw") not in (None, "")
+                                if account_type != "UNIFIED" or total <= 0 or explicit_available:
+                                    raise
+                                locked = _pick_free_from_row(coin, "locked", "frozen")
+                                avail = max(0.0, total - locked)
+                            avg_cost = _pick_cost_from_row(
+                                coin, "avgPrice", "sessionAvgPrice", "accAvgPx", "avgCost"
+                            )
+                            return _spot_holding(total, avail, avg_cost)
+            if strict and not balance_read and last_error is not None:
+                raise last_error
     except Exception as e:
         if strict:
             raise

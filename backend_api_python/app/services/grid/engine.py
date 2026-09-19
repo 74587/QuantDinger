@@ -88,6 +88,7 @@ class GridEngine:
         self._exchange_open_orders_cache: Optional[Tuple[float, List[Dict[str, Any]]]] = None
         self._exchange_reservation_logged: set[str] = set()
         self._last_reduce_only_conflict_ts = 0.0
+        self._startup_initial_fills: List[Dict[str, Any]] = []
 
     @property
     def stop_requested(self) -> bool:
@@ -652,6 +653,133 @@ class GridEngine:
         )
         return True
 
+    def _remember_startup_initial_fill(
+        self,
+        signal_type: str,
+        filled: float,
+        fees_by_ccy: Optional[Dict[str, float]],
+    ) -> None:
+        from app.services.pending_orders.fill_records import spot_position_fill_quantity
+
+        owned_quantity = spot_position_fill_quantity(
+            market_type=self.cfg.market_type,
+            symbol=self.symbol,
+            signal_type=signal_type,
+            gross_quantity=filled,
+            fees_by_ccy=fees_by_ccy or {},
+        )
+        self._startup_initial_fills.append(
+            {
+                "signal_type": signal_type,
+                "quantity": max(0.0, float(owned_quantity or 0.0)),
+            }
+        )
+
+    @property
+    def has_new_startup_initial_fills(self) -> bool:
+        return any(float(item.get("quantity") or 0.0) > 0 for item in self._startup_initial_fills)
+
+    def rollback_startup_initial_fills(self, current_price: float) -> bool:
+        """Close only initial inventory opened by this startup attempt."""
+        pending = list(reversed(self._startup_initial_fills))
+        if not pending:
+            return True
+        try:
+            client = self._create_client()
+        except Exception as exc:
+            logger.error("Grid startup rollback client failed sid=%s: %s", self.strategy_id, exc)
+            append_strategy_log(
+                self.strategy_id,
+                "error",
+                "strategyRuntime.gridStartupRollbackClientFailed",
+            )
+            return False
+
+        all_closed = True
+        remaining: List[Dict[str, Any]] = []
+        for item in pending:
+            opened_signal = str(item.get("signal_type") or "").strip().lower()
+            quantity = max(0.0, float(item.get("quantity") or 0.0))
+            close_signal = "close_long" if opened_signal == "open_long" else "close_short"
+            if quantity <= 0 or opened_signal not in {"open_long", "open_short"}:
+                continue
+            leg = "long" if close_signal == "close_long" else "short"
+            client_order_id = f"grb{self.strategy_id}{leg}"[:32]
+            execution = execute_grid_market_order(
+                client,
+                symbol=self.symbol,
+                signal_type=close_signal,
+                quantity=quantity,
+                market_type=self.cfg.market_type,
+                exchange_config=self.exchange_config,
+                leverage=self.cfg.leverage,
+                client_order_id=client_order_id,
+            )
+            if not execution.ok or execution.filled <= 0:
+                all_closed = False
+                remaining.append(item)
+                logger.error(
+                    "Grid startup rollback failed sid=%s signal=%s qty=%s",
+                    self.strategy_id,
+                    close_signal,
+                    quantity,
+                )
+                append_strategy_log(
+                    self.strategy_id,
+                    "error",
+                    "strategyRuntime.gridStartupRollbackFailed",
+                )
+                continue
+            record_grid_market_fill(
+                self.strategy_id,
+                self.symbol,
+                close_signal,
+                execution.filled,
+                execution.avg_price or current_price,
+                self.trading_config,
+                reason="grid_startup_rollback",
+                commission=execution.commission,
+                fees_by_ccy=execution.fees_by_ccy,
+                commission_ccy=execution.commission_ccy,
+                commission_quote=execution.commission_quote,
+                client_order_id=execution.client_order_id or client_order_id,
+                exchange_order_id=execution.exchange_order_id,
+                exchange_id=str(self.exchange_config.get("exchange_id") or ""),
+                user_id=self.user_id,
+                fee_status=execution.fee_status,
+                fee_source="rest",
+            )
+            remainder = max(0.0, quantity - float(execution.filled or 0.0))
+            if remainder > max(1e-12, quantity * 1e-6):
+                all_closed = False
+                remaining.append(
+                    {
+                        "signal_type": opened_signal,
+                        "quantity": remainder,
+                    }
+                )
+                logger.error(
+                    "Grid startup rollback partial sid=%s signal=%s remaining=%s",
+                    self.strategy_id,
+                    close_signal,
+                    remainder,
+                )
+                append_strategy_log(
+                    self.strategy_id,
+                    "error",
+                    "strategyRuntime.gridStartupRollbackPartial",
+                )
+            append_strategy_log(
+                self.strategy_id,
+                "warning",
+                "strategyRuntime.gridStartupRollbackCompleted",
+            )
+        self._startup_initial_fills = list(reversed(remaining))
+        if all_closed:
+            self._initial_done = False
+            persist_grid_resting_state(self.strategy_id, {"initial_market_done": False})
+        return all_closed
+
     def _stop_initial_market_retries(self, *, reason: str = "") -> None:
         self._initial_done = True
         persist_grid_resting_state(self.strategy_id, {"initial_market_done": True})
@@ -760,6 +888,11 @@ class GridEngine:
             user_id=self.user_id,
             fee_status=str(getattr(execution, "fee_status", "pending") or "pending"),
             fee_source="rest",
+        )
+        self._remember_startup_initial_fill(
+            signal_type,
+            filled,
+            getattr(execution, "fees_by_ccy", None),
         )
         append_strategy_log(
             self.strategy_id,
