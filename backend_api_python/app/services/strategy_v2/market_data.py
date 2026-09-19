@@ -16,6 +16,7 @@ from app.data_sources.errors import (
     classify_market_data_failure,
 )
 from app.services.backtest_cache import KlineCache
+from app.services.market_schedule import equity_data_market, equity_bar_session_date
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -82,6 +83,14 @@ def _last_completed_bar_open(
     ).tz_localize(None)
 
 
+def _market_bar_cutoff(market: str, timeframe: str, *, now=None) -> pd.Timestamp:
+    if market in {"USStock", "HKStock"} and timeframe == "1d":
+        from app.services.market_schedule import equity_daily_bar_cutoff
+
+        return equity_daily_bar_cutoff(market, now)
+    return _last_completed_bar_open(TIMEFRAME_SECONDS.get(timeframe, 86400), now=now)
+
+
 def _covers_crypto_window(
     frame: pd.DataFrame,
     requested_start: pd.Timestamp,
@@ -131,7 +140,8 @@ def _load_strategy_frame_uncached(
     normalized_timeframe = str(timeframe or "1d").strip().lower()
     timeframe_seconds = TIMEFRAME_SECONDS.get(normalized_timeframe, 86400)
     provider_timeframe = PROVIDER_TIMEFRAMES.get(normalized_timeframe, normalized_timeframe)
-    closed_bar_cutoff = _last_completed_bar_open(timeframe_seconds)
+    data_market = equity_data_market(market, product, resolved_api_family)
+    closed_bar_cutoff = _market_bar_cutoff(data_market, normalized_timeframe)
     cutoff_utc = closed_bar_cutoff.to_pydatetime().replace(tzinfo=timezone.utc)
     provider_end_utc = min(end_utc, cutoff_utc)
     total_seconds = max(1.0, (provider_end_utc - start_utc).total_seconds())
@@ -139,6 +149,7 @@ def _load_strategy_frame_uncached(
     after_time = int((start_utc - timedelta(seconds=timeframe_seconds)).timestamp())
     before_time = int((provider_end_utc + timedelta(seconds=timeframe_seconds)).timestamp())
     cache_key = ":".join((
+        "session-calendar-v2",
         str(market),
         str(symbol),
         str(timeframe),
@@ -480,20 +491,26 @@ def load_strategy_frame(
     timeframe_seconds = TIMEFRAME_SECONDS.get(normalized_timeframe, 86400)
     requested_start = pd.Timestamp(start_utc).tz_localize(None)
     requested_end = pd.Timestamp(end_utc).tz_localize(None)
-    closed_cutoff = _last_completed_bar_open(timeframe_seconds)
+    product = _resolve_catalog_product(
+        market, symbol, exchange_id=exchange_id, market_type=market_type, instrument_id=instrument_id,
+    )
+    data_market = equity_data_market(market, product, str(api_family or ""))
+    closed_cutoff = _market_bar_cutoff(data_market, normalized_timeframe)
     coverage_end = min(requested_end, closed_cutoff)
     live_request = _is_live_request(
         requested_end,
         closed_cutoff,
         timeframe_seconds,
     )
-    continuous_crypto_market = _uses_continuous_crypto_calendar(
-        market,
-        symbol,
-        exchange_id=exchange_id,
-        market_type=market_type,
-        instrument_id=instrument_id,
-        api_family=api_family,
+    continuous_crypto_market = bool(
+        str(market or "").strip().lower() == "crypto"
+        and (
+            not exchange_id
+            or _product_uses_continuous_crypto_calendar(
+                product,
+                resolved_api_family=str(api_family or (product or {}).get("api_family") or "").strip().lower(),
+            )
+        )
     )
     key = _shared_frame_key(
         market,
@@ -584,10 +601,15 @@ def load_strategy_frame(
         merged = merged[merged.index >= requested_start - overlap]
         actual_start = merged.index.min()
         actual_end = merged.index.max()
+        incomplete_equity_daily = (
+            data_market in {"USStock", "HKStock"} and normalized_timeframe == "1d"
+            and live_request
+            and equity_bar_session_date(actual_end, data_market) < equity_bar_session_date(coverage_end, data_market)
+        )
         _shared_frames[key] = _SharedFrameEntry(
             frame=merged,
             coverage_start=actual_start if continuous_crypto_market else min(actual_start, requested_start),
-            coverage_end=actual_end if continuous_crypto_market else max(actual_end, coverage_end),
+            coverage_end=actual_end if continuous_crypto_market or incomplete_equity_daily else max(actual_end, coverage_end),
         )
         _evict_shared_frame_if_needed()
         result = merged[

@@ -76,14 +76,14 @@ def test_fetch_gate_open_orders_keeps_spot_when_futures_fails(monkeypatch):
     swap = GateUsdtFuturesClient(api_key="k", secret_key="s")
     spot = GateSpotClient(api_key="k", secret_key="s")
 
-    def fail_futures(*, limit):
+    def fail_futures(*args, **kwargs):
         raise RuntimeError("futures unavailable")
 
-    monkeypatch.setattr(swap, "get_open_orders", fail_futures)
+    monkeypatch.setattr(swap, "_signed_request", fail_futures)
     monkeypatch.setattr(
         spot,
-        "get_open_orders",
-        lambda *, limit: [
+        "_signed_request",
+        lambda *args, **kwargs: [
             {
                 "currency_pair": "ETH_USDT",
                 "orders": [
@@ -126,8 +126,8 @@ def test_gate_multi_market_snapshot_includes_spot_and_futures_orders(monkeypatch
     )
     monkeypatch.setattr(
         swap,
-        "get_open_orders",
-        lambda *, limit: [
+        "_signed_request",
+        lambda *args, **kwargs: [
             {
                 "id_string": "swap-2",
                 "contract": "ETH_USDT",
@@ -144,8 +144,8 @@ def test_gate_multi_market_snapshot_includes_spot_and_futures_orders(monkeypatch
     )
     monkeypatch.setattr(
         spot,
-        "get_open_orders",
-        lambda *, limit: [
+        "_signed_request",
+        lambda *args, **kwargs: [
             {
                 "currency_pair": "BTC_USDT",
                 "orders": [

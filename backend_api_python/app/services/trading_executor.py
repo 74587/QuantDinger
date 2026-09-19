@@ -25,6 +25,8 @@ from app.services.strategy_runtime.live_portfolio import refresh_members, positi
 from app.services.strategy_runtime.cancellations import persist_cancellations
 from app.services.strategy_runtime.timeframes import (
     completed_bar_token,
+    daily_equity_execution_policy,
+    equity_daily_frames_ready,
     live_history_days,
     load_live_frequency_frames,
 )
@@ -824,16 +826,25 @@ class TradingExecutor:
                                     },
                                 })
                     if not equity_stop_reason and cycle_started >= next_signal_poll:
+                        from app.services.market_schedule import equity_daily_execution_session
+
+                        daily_policy = daily_equity_execution_policy(
+                            frequency, candidates, execution_mode=execution_mode,
+                            schedules=program.manifest.schedules,
+                        )
+                        signal_session = equity_daily_execution_session(*daily_policy) if daily_policy else None
                         current_bar_token = completed_bar_token(frequency)
+                        if signal_session is not None:
+                            current_bar_token = int(signal_session.timestamp())
                         has_new_closed_bar = (
                             initial_frames_pending
                             or current_bar_token != last_signal_bar_token
-                        )
+                        ) and (not daily_policy or signal_session is not None)
                         if has_new_closed_bar:
                             # Startup already warmed the complete frame bundle.
                             # Every later trigger extends the shared cache only
                             # for the newly completed candle window.
-                            if not initial_frames_pending:
+                            if not initial_frames_pending or daily_policy:
                                 frequency_frames = fetch_runtime_frames()
                                 frames = frequency_frames[frequency]
                             latest_frame_timestamp = _latest_frame_timestamp(frames)
@@ -846,6 +857,18 @@ class TradingExecutor:
                                     > last_processed_frame_timestamp
                                 )
                             )
+                            if daily_policy:
+                                frame_advanced = bool(
+                                    frame_advanced
+                                    and equity_daily_execution_session(*daily_policy) == signal_session
+                                    and equity_daily_frames_ready(frames, candidates, signal_session, daily_policy[0])
+                                    and all(
+                                        str(member["key"]) in active_prices
+                                        and time.monotonic() - last_price_seen_at.get(str(member["key"]), 0.0)
+                                        <= price_stale_after
+                                        for member in candidates
+                                    )
+                                )
                             if frame_advanced:
                                 intents, messages, timestamp = session.process(
                                     frames,
@@ -877,6 +900,7 @@ class TradingExecutor:
                                         trading_config=trading_config,
                                         exchange_config=exchange_config,
                                         signal_ts=self._intent_signal_timestamp(intent, timestamp),
+                                        current_price_override=active_prices.get(str(intent.symbol)) if daily_policy else None,
                                         strategy_run_id=run_id,
                                         direction_mode=direction_mode,
                                     )

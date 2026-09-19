@@ -20,6 +20,51 @@ class MarketScheduleError(RuntimeError):
     pass
 
 
+def equity_data_market(market: str, product=None, api_family: str = "") -> str:
+    """Only the stock API uses underlying exchange data; tokens use venue candles."""
+    if market == "Crypto" and str(api_family or (product or {}).get("api_family") or "").lower() == "stock":
+        underlying = str((product or {}).get("underlying_market") or "")
+        if underlying not in {"USStock", "HKStock"}:
+            raise MarketScheduleError("portfolio.marketCalendarUnsupported")
+        return underlying
+    return market
+
+
+def equity_bar_session_date(value, market: str):
+    stamp = pd.Timestamp(value)
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    return (stamp.tz_convert("Asia/Hong_Kong") if market == "HKStock" else stamp).date()
+
+
+def equity_daily_bar_cutoff(market: str, now: Optional[datetime] = None) -> pd.Timestamp:
+    """Include provider daily labels only through the last completed session."""
+    session = latest_completed_session(market, now, data_delay_minutes=15)
+    day = pd.Timestamp(session).tz_localize(None)
+    if market == "HKStock":
+        day = day.tz_localize("Asia/Hong_Kong").tz_convert("UTC").tz_localize(None)
+    return day + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+
+def equity_daily_execution_session(market: str, regular_only: bool = True, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Use the next regular open for brokers, or completed reference data for venues."""
+    current = _utc(now)
+    if not regular_only:
+        return latest_completed_session(market, current, data_delay_minutes=15)
+    calendar = _calendar(market)
+    today = pd.Timestamp(pd.Timestamp(current).tz_convert(calendar.tz).date())
+    if not calendar.is_session(today):
+        return None
+    opens = _python_utc(calendar.session_open(today)) + timedelta(minutes=5)
+    closes = _python_utc(calendar.session_close(today))
+    if not opens <= current < closes:
+        return None
+    break_start = calendar.session_break_start(today)
+    break_end = calendar.session_break_end(today)
+    if pd.notna(break_start) and _python_utc(break_start) <= current < _python_utc(break_end):
+        return None
+    return _python_utc(calendar.previous_session(today))
+
+
 def latest_completed_session(
     market: str,
     now: Optional[datetime] = None,

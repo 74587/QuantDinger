@@ -44,28 +44,8 @@ def get_grid_resting_orders():
         limit = request.args.get('limit', default=200, type=int)
         sync = request.args.get('sync', '').lower() in ('1', 'true', 'yes')
 
-        sync_error = ''
-        synced_count = 0
-        exchange_audit = {}
-        if sync:
-            try:
-                from app.services.grid.poller import get_grid_fill_poller, sync_strategy_grid_orders
-
-                synced_count = int(sync_strategy_grid_orders(int(strategy_id)) or 0)
-                exchange_audit = get_grid_fill_poller().last_strategy_audit(int(strategy_id))
-                sync_error = str(exchange_audit.get('error') or '')
-            except Exception as sync_err:
-                logger.debug("grid-resting sync sid=%s: %s", strategy_id, sync_err)
-                sync_error = str(sync_err)
-        else:
-            try:
-                from app.services.grid.poller import get_grid_fill_poller
-
-                exchange_audit = get_grid_fill_poller().last_strategy_audit(int(strategy_id))
-            except Exception:
-                exchange_audit = {}
-
         from app.services.grid.resting_orders_repo import GridRestingOrderRepository
+        from app.services.grid.order_audit import audit_grid_orders
         from app.utils.trade_close_reason import label_for_reason
 
         lang = str(request.args.get("lang") or request.headers.get("Accept-Language") or "zh")
@@ -76,9 +56,12 @@ def get_grid_resting_orders():
 
         repo = GridRestingOrderRepository()
         rows = repo.list_for_strategy(strategy_id, status=status, limit=limit or 200)
+        exchange_audit = audit_grid_orders(st, rows, user_id=user_id) if sync else {}
+        sync_error = str(exchange_audit.get('error') or '')
         out = []
         for o in rows:
             purpose = o.purpose
+            verified_order = (exchange_audit.get('orders') or {}).get(o.id) or {}
             out.append({
                 'id': o.id,
                 'strategy_id': o.strategy_id,
@@ -96,6 +79,10 @@ def get_grid_resting_orders():
                 'client_order_id': o.client_order_id,
                 'exchange_order_id': o.exchange_order_id,
                 'status': o.status,
+                'exchange_status': verified_order.get('status', 'unverified'),
+                'exchange_price': verified_order.get('price'),
+                'exchange_quantity': verified_order.get('quantity'),
+                'exchange_filled_quantity': verified_order.get('filled'),
                 'filled_quantity': o.filled_quantity,
                 'avg_fill_price': o.avg_fill_price,
                 'extra': o.extra or {},
@@ -106,24 +93,22 @@ def get_grid_resting_orders():
         for item in out:
             key = str(item.get('status') or 'unknown')
             status_counts[key] = int(status_counts.get(key, 0)) + 1
-        id_confirmed = sum(1 for item in out if str(item.get('exchange_order_id') or '').strip())
         audited_active = int(exchange_audit.get('active') or 0)
-        verified = min(len(out), audited_active) if exchange_audit else id_confirmed
-        updated_values = [str(item.get('updated_at') or '') for item in out if item.get('updated_at')]
+        verified = min(len(out), audited_active)
         summary = {
             'total': len(out),
             'verified_exchange_orders': verified,
             'unverified_orders': max(0, len(out) - verified),
             'exchange_active_orders': audited_active if sync else None,
-            'exchange_terminal_orders': int(exchange_audit.get('terminal') or 0) if sync else None,
+            'exchange_not_open_orders': sum(item['exchange_status'] == 'not_open' for item in out) if sync else None,
             'exchange_unknown_orders': int(exchange_audit.get('unknown') or 0) if sync else None,
             'exchange_audit_completed': bool(exchange_audit.get('completed')) if sync else False,
             'status_counts': status_counts,
             'sync_requested': sync,
             'sync_ok': not bool(sync_error),
             'sync_error': sync_error,
-            'synced_count': synced_count,
-            'last_reconciled_at': max(updated_values) if updated_values else None,
+            'synced_count': len(exchange_audit.get('orders') or {}),
+            'last_reconciled_at': exchange_audit.get('checked_at'),
             'generated_at': datetime.now(timezone.utc).isoformat(),
         }
         return jsonify({'code': 1, 'msg': 'success', 'data': {'orders': out, 'items': out, 'summary': summary}})

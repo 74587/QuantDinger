@@ -301,6 +301,17 @@ def _fetch_multi_crypto_snapshot(
 
     if ex in ("gate", "gateio"):
         orders.extend(_fetch_gate_open_orders(swap_client, spot_client, errors))
+    elif ex in ("bybit", "bitget"):
+        from app.services.live_trading.open_orders import fetch_exchange_open_orders
+
+        for mt, order_client in (("spot", spot_client), ("swap", swap_client)):
+            try:
+                if order_client is None:
+                    raise ValueError("missing_exchange_client")
+                orders.extend(fetch_exchange_open_orders(order_client, exchange_id=ex, market_type=mt))
+            except Exception:
+                logger.warning("%s %s open orders failed", ex, mt, exc_info=True)
+                errors.append("brokerAccounts.snapshotOrdersFailed")
 
     return swap_pos, spot_pos, orders
 
@@ -415,21 +426,17 @@ def _fetch_gate_open_orders(
     errors: List[str],
 ) -> List[Dict[str, Any]]:
     from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
+    from app.services.live_trading.open_orders import fetch_exchange_open_orders
 
     orders: List[Dict[str, Any]] = []
     if isinstance(swap_client, GateUsdtFuturesClient):
         try:
-            orders.extend(
-                _parse_gate_futures_orders(
-                    swap_client.get_open_orders(limit=100),
-                    client=swap_client,
-                )
-            )
+            orders.extend(fetch_exchange_open_orders(swap_client, exchange_id="gate", market_type="swap"))
         except Exception as e:
             _append_snapshot_error(errors, e, context="GATE 合约挂单")
     if isinstance(spot_client, GateSpotClient):
         try:
-            orders.extend(_parse_gate_spot_orders(spot_client.get_open_orders(limit=100)))
+            orders.extend(fetch_exchange_open_orders(spot_client, exchange_id="gate", market_type="spot"))
         except Exception as e:
             _append_snapshot_error(errors, e, context="GATE 现货挂单")
     return orders
@@ -539,6 +546,7 @@ def _fetch_okx_snapshot(
     client, exchange_id: str, errors: List[str]
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     from app.services.live_trading.okx import OkxClient
+    from app.services.live_trading.open_orders import fetch_exchange_open_orders
 
     if not isinstance(client, OkxClient):
         return [], [], []
@@ -560,11 +568,7 @@ def _fetch_okx_snapshot(
         ("SPOT", "spot", "OKX 现货挂单"),
     ):
         try:
-            resp = client._signed_request(
-                "GET", "/api/v5/trade/orders-pending", params={"instType": inst_type}
-            )
-            data = (resp.get("data") or []) if isinstance(resp, dict) else []
-            orders.extend(_parse_okx_orders(data, market_type=mt))
+            orders.extend(fetch_exchange_open_orders(client, exchange_id="okx", market_type=mt))
         except Exception as e:
             _append_snapshot_error(errors, e, context=label)
     return swap_pos, spot_pos, orders

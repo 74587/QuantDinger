@@ -63,6 +63,29 @@ def completed_bar_token(frequency: str, now: datetime | None = None) -> int:
     return int(current.timestamp()) // seconds - 1
 
 
+def daily_equity_execution_policy(frequency: str, candidates, *, execution_mode: str, schedules=()):
+    from app.services.market_schedule import equity_data_market
+
+    if execution_mode != "live" or frequency != "1d" or schedules or not candidates:
+        return None
+    markets = {equity_data_market(str(member.get("market") or ""), member) for member in candidates}
+    if len(markets) != 1 or not markets.issubset({"USStock", "HKStock"}):
+        return None
+    return markets.pop(), any(member.get("market") != "Crypto" for member in candidates)
+
+
+def equity_daily_frames_ready(frames, candidates, signal_session: datetime, market: str) -> bool:
+    """Do not consume a signal while any constituent still has yesterday's data."""
+    from app.services.market_schedule import equity_bar_session_date
+
+    expected = signal_session.date()
+    for member in candidates:
+        frame = frames.get(str(member["key"]))
+        if frame is None or frame.empty or equity_bar_session_date(frame.index[-1], market) != expected:
+            return False
+    return True
+
+
 def load_live_frequency_frames(
     *,
     service: StrategyV2BacktestService,
