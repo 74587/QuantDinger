@@ -397,6 +397,24 @@ class ScriptSourceService:
             cur.close()
         return self._version_row(row)
 
+    def get_latest_version(self, source_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, source_id, user_id, version_no, name, description, code,
+                       template_key, param_schema, metadata, created_at
+                FROM qd_script_source_versions
+                WHERE source_id = ? AND user_id = ?
+                ORDER BY version_no DESC
+                LIMIT 1
+                """,
+                (int(source_id), int(user_id)),
+            )
+            row = cur.fetchone()
+            cur.close()
+        return self._version_row(row)
+
     def restore_version(self, version_id: int, user_id: int) -> Optional[Dict[str, Any]]:
         with get_db_connection() as db:
             cur = db.cursor()

@@ -83,6 +83,22 @@ def test_bitget_spot_open_order_price_is_price_avg_not_execution_price():
     assert order["price"] == 3474.75
 
 
+def test_bitget_null_pending_order_list_is_empty_success():
+    client = MagicMock()
+    client._signed_request.return_value = {
+        "code": "00000",
+        "data": {"entrustedList": None, "endId": None},
+    }
+    assert fetch_exchange_open_orders(client, exchange_id="bitget", market_type="swap") == []
+
+
+def test_bitget_missing_pending_order_list_is_rejected():
+    client = MagicMock()
+    client._signed_request.return_value = {"code": "00000", "data": {"endId": None}}
+    with pytest.raises(LiveTradingError, match="invalid_open_orders_response"):
+        fetch_exchange_open_orders(client, exchange_id="bitget", market_type="swap")
+
+
 @pytest.mark.parametrize("exchange,path,symbol_key,native_symbol", [
     ("binance", "/fapi/v1/openOrders", "symbol", "ETHUSDT"),
     ("okx", "/api/v5/trade/orders-pending", "instId", "ETH-USDT-SWAP"),
@@ -153,4 +169,4 @@ def test_account_snapshot_actually_queries_both_order_markets(monkeypatch, excha
     clients["spot"]._signed_request.side_effect = RuntimeError("spot failed")
     _, _, orders = snapshots._fetch_multi_crypto_snapshot({}, exchange, errors)
     assert [o["market_type"] for o in orders] == ["swap"]
-    assert errors == ["brokerAccounts.snapshotOrdersFailed"]
+    assert errors == ["brokerAccounts.snapshotSpotOrdersFailed"]

@@ -311,7 +311,11 @@ def _fetch_multi_crypto_snapshot(
                 orders.extend(fetch_exchange_open_orders(order_client, exchange_id=ex, market_type=mt))
             except Exception:
                 logger.warning("%s %s open orders failed", ex, mt, exc_info=True)
-                errors.append("brokerAccounts.snapshotOrdersFailed")
+                errors.append(
+                    "brokerAccounts.snapshotSpotOrdersFailed"
+                    if mt == "spot"
+                    else "brokerAccounts.snapshotSwapOrdersFailed"
+                )
 
     return swap_pos, spot_pos, orders
 

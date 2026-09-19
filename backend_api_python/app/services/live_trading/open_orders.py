@@ -102,7 +102,13 @@ def fetch_exchange_open_orders(client, *, exchange_id: str, market_type: str, sy
             normalized = _compact_orders(rows, ex, mt)
         elif ex == "bitget":
             payload = raw.get("data") if isinstance(raw, dict) else None
-            rows = _rows(payload if mt == "spot" else payload.get("entrustedList") if isinstance(payload, dict) else None)
+            if mt == "spot":
+                rows = _rows(payload)
+            else:
+                if not isinstance(payload, dict) or "entrustedList" not in payload:
+                    raise LiveTradingError("invalid_open_orders_response")
+                entrusted = payload.get("entrustedList")
+                rows = _rows([] if entrusted is None else entrusted)
             more = len(rows) >= 100
             cursor = str((rows[-1].get("orderId") if mt == "spot" else payload.get("endId")) or "") if rows else ""
             normalized = _compact_orders(rows, ex, mt)

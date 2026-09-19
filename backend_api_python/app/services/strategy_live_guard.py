@@ -87,10 +87,17 @@ def resolve_strategy_direction_mode(strategy: Dict[str, Any]) -> str:
     try:
         from app.services.script_source import get_script_source_service
 
-        source = get_script_source_service().get_source(
-            source_id,
-            user_id=int(strategy.get("user_id") or 0),
+        source_version_id = int(
+            strategy.get("source_version_id")
+            or trading_config.get("script_source_version_id")
+            or 0
         )
+        source = get_script_source_service().get_version(
+            source_version_id,
+            user_id=int(strategy.get("user_id") or 0),
+        ) if source_version_id > 0 else None
+        if not source or int(source.get("source_id") or 0) != source_id:
+            return ""
         code = str((source or {}).get("code") or "")
         mode = infer_direction_mode_from_code(code)
         if mode:

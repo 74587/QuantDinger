@@ -352,7 +352,7 @@ class TradingExecutor:
             strategy = self._load_strategy(strategy_id)
             if not strategy:
                 raise RuntimeError("strategyV2.strategyNotFound")
-            source_id, code = self._load_source(strategy)
+            source_version_id, code = self._load_source(strategy)
             program = compile_strategy_v2(code)
             user_id = int(strategy.get("user_id") or 0)
             trading_config = _json_object(strategy.get("trading_config"))
@@ -472,7 +472,7 @@ class TradingExecutor:
                 user_id=user_id,
                 code=code,
                 parameter_snapshot=trading_config,
-                source_version_id=str(source_id),
+                source_version_id=str(source_version_id),
                 exchange_id=str(primary.get("exchange_id") or account_exchange),
                 credential_id=int(
                     exchange_config.get("credential_id") or 0
@@ -2110,10 +2110,19 @@ class TradingExecutor:
         source_id = int(trading_config.get("script_source_id") or 0)
         if source_id <= 0:
             raise RuntimeError("strategyV2.sourceRequired")
-        source = get_script_source_service().get_source(
-            source_id,
+        source_version_id = int(
+            strategy.get("source_version_id")
+            or trading_config.get("script_source_version_id")
+            or 0
+        )
+        if source_version_id <= 0:
+            raise RuntimeError("strategyV2.sourceVersionRequired")
+        source = get_script_source_service().get_version(
+            source_version_id,
             user_id=int(strategy.get("user_id") or 0),
         )
+        if not source or int(source.get("source_id") or 0) != source_id:
+            raise RuntimeError("strategyV2.sourceVersionNotFound")
         code = str((source or {}).get("code") or "").strip()
         if not code:
             raise RuntimeError("strategyV2.codeRequired")
@@ -2136,7 +2145,7 @@ class TradingExecutor:
                 f"Legacy {bot_type} robot allocation contract upgraded for this run",
             )
             code = migrated
-        return source_id, code
+        return source_version_id, code
 
     def _is_strategy_running(self, strategy_id: int, thread: threading.Thread) -> bool:
         if self.runtime_guard and not self.runtime_guard(strategy_id):

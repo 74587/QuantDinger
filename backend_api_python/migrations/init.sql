@@ -362,6 +362,7 @@ CREATE TABLE IF NOT EXISTS qd_strategies_trading (
     market_type VARCHAR(20) DEFAULT 'swap',
     exchange_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     trading_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    source_version_id INTEGER,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -411,6 +412,107 @@ CREATE INDEX IF NOT EXISTS idx_script_source_versions_source
 ON qd_script_source_versions(source_id, version_no DESC);
 CREATE INDEX IF NOT EXISTS idx_script_source_versions_user
 ON qd_script_source_versions(user_id);
+
+ALTER TABLE qd_strategies_trading
+ADD COLUMN IF NOT EXISTS source_version_id INTEGER;
+
+INSERT INTO qd_script_source_versions
+    (source_id, user_id, version_no, name, description, code,
+     template_key, param_schema, metadata, created_at)
+SELECT source.id,
+       source.user_id,
+       COALESCE(latest.version_no, 0) + 1,
+       source.name,
+       COALESCE(source.description, ''),
+       COALESCE(source.code, ''),
+       COALESCE(source.template_key, ''),
+       COALESCE(source.param_schema, '{}'::jsonb),
+       COALESCE(source.metadata, '{}'::jsonb),
+       NOW()
+FROM qd_script_sources AS source
+LEFT JOIN LATERAL (
+    SELECT version.id, version.version_no, version.name, version.description,
+           version.code, version.template_key, version.param_schema, version.metadata
+    FROM qd_script_source_versions AS version
+    WHERE version.source_id = source.id
+      AND version.user_id = source.user_id
+    ORDER BY version.version_no DESC
+    LIMIT 1
+) AS latest ON TRUE
+WHERE latest.id IS NULL
+   OR latest.name IS DISTINCT FROM source.name
+   OR latest.description IS DISTINCT FROM COALESCE(source.description, '')
+   OR latest.code IS DISTINCT FROM COALESCE(source.code, '')
+   OR latest.template_key IS DISTINCT FROM COALESCE(source.template_key, '')
+   OR latest.param_schema IS DISTINCT FROM COALESCE(source.param_schema, '{}'::jsonb)
+   OR latest.metadata IS DISTINCT FROM COALESCE(source.metadata, '{}'::jsonb)
+ON CONFLICT (source_id, version_no) DO NOTHING;
+
+WITH deployment_version AS (
+    SELECT deployment.id AS strategy_id,
+           COALESCE(
+               (
+                   SELECT version.id
+                   FROM qd_script_source_versions AS version
+                   WHERE version.source_id = deployment.source_id
+                     AND version.user_id = deployment.user_id
+                     AND version.created_at <= deployment.created_at
+                   ORDER BY version.created_at DESC, version.version_no DESC
+                   LIMIT 1
+               ),
+               (
+                   SELECT version.id
+                   FROM qd_script_source_versions AS version
+                   WHERE version.source_id = deployment.source_id
+                     AND version.user_id = deployment.user_id
+                   ORDER BY version.version_no DESC
+                   LIMIT 1
+               )
+           ) AS version_id
+    FROM (
+        SELECT strategy.id,
+               strategy.user_id,
+               strategy.created_at,
+               CASE
+                   WHEN COALESCE(strategy.trading_config->>'script_source_id', '') ~ '^[0-9]+$'
+                   THEN (strategy.trading_config->>'script_source_id')::INTEGER
+                   ELSE NULL
+               END AS source_id
+        FROM qd_strategies_trading AS strategy
+        WHERE strategy.source_version_id IS NULL
+    ) AS deployment
+    WHERE deployment.source_id IS NOT NULL
+)
+UPDATE qd_strategies_trading AS strategy
+SET source_version_id = deployment_version.version_id,
+    trading_config = jsonb_set(
+        COALESCE(strategy.trading_config, '{}'::jsonb),
+        '{script_source_version_id}',
+        to_jsonb(deployment_version.version_id),
+        TRUE
+    )
+FROM deployment_version
+WHERE strategy.id = deployment_version.strategy_id
+  AND deployment_version.version_id IS NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'fk_strategy_source_version'
+          AND conrelid = 'qd_strategies_trading'::regclass
+    ) THEN
+        ALTER TABLE qd_strategies_trading
+        ADD CONSTRAINT fk_strategy_source_version
+        FOREIGN KEY (source_version_id)
+        REFERENCES qd_script_source_versions(id)
+        ON DELETE RESTRICT;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_strategies_source_version
+ON qd_strategies_trading(source_version_id);
 
 CREATE TABLE IF NOT EXISTS qd_script_templates (
     id SERIAL PRIMARY KEY,

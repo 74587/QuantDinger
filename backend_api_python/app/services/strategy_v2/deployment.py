@@ -25,9 +25,20 @@ from .contract import StrategyV2ContractError, compile_strategy_v2
 class StrategyV2DeploymentService:
     def save(self, *, user_id: int, payload: dict[str, Any], strategy_id: int | None = None) -> int:
         source_id = int(payload.get("sourceId") or 0)
-        source = get_script_source_service().get_source(source_id, user_id=user_id) if source_id else None
+        source_service = get_script_source_service()
+        source = source_service.get_source(source_id, user_id=user_id) if source_id else None
         if not source:
             raise StrategyV2ContractError("strategyV2.sourceNotFound")
+        source_version = source_service.get_latest_version(source_id, user_id=user_id)
+        if not source_version:
+            raise StrategyV2ContractError("strategyV2.sourceVersionRequired")
+        source_version_id = int(source_version.get("id") or 0)
+        source = {
+            **source,
+            **source_version,
+            "id": source_id,
+            "source_version_id": source_version_id,
+        }
         program = compile_strategy_v2(str(source.get("code") or ""))
         manifest = program.manifest
         source_metadata = self._object(source.get("metadata"))
@@ -247,6 +258,7 @@ class StrategyV2DeploymentService:
         runtime_config.update({
             "api_version": 2,
             "script_source_id": source_id,
+            "script_source_version_id": source_version_id,
             "strategy_manifest": manifest_metadata,
             "initial_capital": initial_capital,
             "leverage_enabled": leverage_enabled,
@@ -276,6 +288,7 @@ class StrategyV2DeploymentService:
                 manifest_market_type,
                 json.dumps(exchange_config, ensure_ascii=False),
                 json.dumps(runtime_config, ensure_ascii=False),
+                source_version_id,
             )
             if strategy_id:
                 cur.execute(
@@ -283,7 +296,7 @@ class StrategyV2DeploymentService:
                     UPDATE qd_strategies_trading
                     SET strategy_name = ?, market_category = ?, execution_mode = ?, notification_config = ?,
                         symbol = ?, timeframe = ?, initial_capital = ?, leverage = ?, market_type = ?,
-                        exchange_config = ?, trading_config = ?, strategy_type = 'StrategyV2',
+                        exchange_config = ?, trading_config = ?, source_version_id = ?, strategy_type = 'StrategyV2',
                         updated_at = NOW()
                     WHERE id = ? AND user_id = ?
                     """,
@@ -298,8 +311,8 @@ class StrategyV2DeploymentService:
                     INSERT INTO qd_strategies_trading
                       (user_id, strategy_name, strategy_type, market_category, execution_mode,
                        notification_config, status, symbol, timeframe, initial_capital, leverage,
-                       market_type, exchange_config, trading_config, created_at, updated_at)
-                    VALUES (?, ?, 'StrategyV2', ?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                       market_type, exchange_config, trading_config, source_version_id, created_at, updated_at)
+                    VALUES (?, ?, 'StrategyV2', ?, ?, ?, 'stopped', ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
                     """,
                     (int(user_id), *values),
                 )

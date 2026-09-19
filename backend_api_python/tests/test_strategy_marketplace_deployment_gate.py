@@ -34,6 +34,11 @@ class _AdaptedSources:
             },
         }
 
+    @staticmethod
+    def get_latest_version(_source_id, user_id=None):
+        source = _AdaptedSources.get_source(_source_id, user_id=user_id)
+        return {**source, 'id': 131, 'source_id': 31}
+
 
 def test_adapted_strategy_deployment_is_blocked_without_current_backtest(monkeypatch):
     monkeypatch.setattr(deployment, 'get_script_source_service', lambda: _AdaptedSources())

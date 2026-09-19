@@ -17,24 +17,38 @@ g.target_value += float(AMOUNTS[g.next_level] or 0.0)
 
     class _Sources:
         @staticmethod
-        def get_source(_source_id, user_id=None):
-            return {"code": legacy}
+        def get_version(_version_id, user_id=None):
+            return {"id": 109, "source_id": 9, "code": legacy}
 
     logs = []
     monkeypatch.setattr(trading_executor, "get_script_source_service", lambda: _Sources())
     monkeypatch.setattr(trading_executor, "append_strategy_log", lambda *args: logs.append(args))
 
-    source_id, code = TradingExecutor._load_source({
+    source_version_id, code = TradingExecutor._load_source({
         "id": 11,
         "user_id": 7,
         "template_key": "robot_v2_layered_martingale",
-        "trading_config": {"script_source_id": 9, "executor_type": "layered_martingale"},
+        "source_version_id": 109,
+        "trading_config": {
+            "script_source_id": 9,
+            "script_source_version_id": 109,
+            "executor_type": "layered_martingale",
+        },
     })
 
-    assert source_id == 9
+    assert source_version_id == 109
     assert "AMOUNT_WEIGHTS = [0.25, 0.75]" in code
     assert "AMOUNTS" not in code
     assert logs and logs[0][0] == 11
+
+
+def test_load_source_requires_the_deployment_pinned_version():
+    with pytest.raises(RuntimeError, match="strategyV2.sourceVersionRequired"):
+        TradingExecutor._load_source({
+            "id": 11,
+            "user_id": 7,
+            "trading_config": {"script_source_id": 9},
+        })
 
 
 def test_live_history_lookback_is_frequency_aware():

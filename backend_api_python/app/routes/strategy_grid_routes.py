@@ -32,9 +32,12 @@ def get_grid_resting_orders():
 
         trading_config = st.get('trading_config') or {}
         source_id = int(st.get('script_source_id') or trading_config.get('script_source_id') or 0)
+        source_version_id = int(st.get('source_version_id') or trading_config.get('script_source_version_id') or 0)
         source_code = ''
-        if source_id:
-            source = get_script_source_service().get_source(source_id, user_id=user_id)
+        if source_id and source_version_id:
+            source = get_script_source_service().get_version(source_version_id, user_id=user_id)
+            if source and int(source.get('source_id') or 0) != source_id:
+                source = None
             source_code = str((source or {}).get('code') or '')
         bot_type = resolve_bot_type(st, trading_config, source_code=source_code)
         if bot_type != 'grid':

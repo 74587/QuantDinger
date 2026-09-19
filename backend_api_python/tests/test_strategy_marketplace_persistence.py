@@ -110,3 +110,70 @@ def test_republish_updates_listing_resolved_by_source_id(monkeypatch):
     assert any('source_script_source_id = ?' in sql and 'SELECT id' in sql for sql in statements)
     assert any('UPDATE qd_indicator_codes' in sql for sql in statements)
     assert not any('INSERT INTO qd_indicator_codes' in sql for sql in statements)
+
+
+def test_manual_marketplace_sync_uses_versioned_script_source_save(monkeypatch):
+    cursor = _Cursor()
+    cursor._fetch_results = [
+        {
+            'id': 71,
+            'price': 0,
+            'asset_name_snapshot': 'Snapshot',
+            'asset_description_snapshot': '',
+            'asset_code_snapshot': 'old',
+            'asset_type_snapshot': 'script_template',
+            'asset_preview_image_snapshot': '',
+            'asset_is_encrypted_snapshot': 0,
+        },
+        {
+            'id': 31,
+            'user_id': 4,
+            'name': 'Updated marketplace strategy',
+            'code': SOURCE,
+            'description': 'latest',
+            'preview_image': '',
+            'is_encrypted': 0,
+            'pricing_type': 'free',
+            'vip_free': False,
+            'publish_to_community': True,
+            'review_status': 'approved',
+            'updated_at': None,
+            'asset_type': 'script_template',
+        },
+        {'id': 44, 'code': 'old', 'metadata': {}},
+    ]
+    db = _Db(cursor)
+    monkeypatch.setattr(community_service, 'get_db_connection', lambda: db)
+    saved = []
+
+    class _Sources:
+        @staticmethod
+        def update_source(source_id, user_id, payload):
+            saved.append((source_id, user_id, payload))
+            return True
+
+    monkeypatch.setattr(community_service, 'get_script_source_service', lambda: _Sources())
+
+    ok, message, data = CommunityService().sync_purchased_indicator(
+        buyer_id=9,
+        indicator_id=31,
+    )
+
+    assert ok is True
+    assert message == 'success'
+    assert data == {
+        'script_source_id': 44,
+        'updated': True,
+        'indicator_name': 'Updated marketplace strategy',
+    }
+    assert saved == [(44, 9, {
+        'name': 'Updated marketplace strategy',
+        'description': 'latest',
+        'code': SOURCE,
+        'metadata': {
+            'code_hidden': False,
+            'from_marketplace': True,
+            'asset_type': 'script_template',
+        },
+    })]
+    assert not any('UPDATE qd_script_sources' in sql for sql, _params in cursor.executions)

@@ -15,6 +15,7 @@ from app.services.community_kpis import (
     summarise_backtest_runs,
 )
 from app.services.indicator_translator import pick_localized
+from app.services.script_source import get_script_source_service
 from app.services.strategy_marketplace_contract import (
     adapt_parameterized_source,
     compatibility_for_target,
@@ -1518,23 +1519,19 @@ class CommunityService:
                     metadata['code_hidden'] = original_hidden
                     metadata['from_marketplace'] = True
                     metadata['asset_type'] = 'script_template'
-                    cur.execute(
-                        """
-                        UPDATE qd_script_sources
-                        SET code = ?, name = ?, description = ?, metadata = ?::jsonb, updated_at = NOW()
-                        WHERE id = ? AND user_id = ?
-                        """,
-                        (
-                            original['code'],
-                            original['name'],
-                            original.get('description') or '',
-                            json.dumps(metadata, ensure_ascii=False),
-                            local_source['id'],
-                            buyer_id,
-                        ),
-                    )
-                    db.commit()
                     cur.close()
+                    updated = get_script_source_service().update_source(
+                        int(local_source['id']),
+                        int(buyer_id),
+                        {
+                            'name': original['name'],
+                            'description': original.get('description') or '',
+                            'code': original['code'],
+                            'metadata': metadata,
+                        },
+                    )
+                    if not updated:
+                        return False, 'local_copy_not_found', {}
                     return True, 'success', {
                         'script_source_id': local_source['id'],
                         'updated': True,
