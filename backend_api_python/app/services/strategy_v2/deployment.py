@@ -270,6 +270,7 @@ class StrategyV2DeploymentService:
             "position_side": position_side,
             "instrument_products": instrument_products,
             "quote_currency": quote_currency,
+            "ai_decision_filter": bool(payload.get("aiDecisionFilter")),
         })
         market_category = manifest.markets[0] if len(manifest.markets) == 1 else "Mixed"
         exchange_config = {"credential_id": credential_id, "exchange_id": exchange_id} if credential_id else {}

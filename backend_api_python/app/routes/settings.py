@@ -46,6 +46,7 @@ ADVANCED_KEYS = {
     'GDELT_BASE_URL', 'GDELT_TIMEOUT', 'GDELT_MAX_RESULTS',
     'ALPHA_VANTAGE_API_KEY', 'ALPHA_VANTAGE_BASE_URL', 'ALPHA_VANTAGE_TIMEOUT', 'ALPHA_VANTAGE_NEWS_LIMIT',
     'AI_CODE_GEN_MODEL', 'LLM_PROXY_URL', 'LLM_USE_SYSTEM_PROXY',
+    'JEV_BASE_URL', 'JEV_MODEL', 'JEV_TIMEOUT_SECONDS', 'AI_DECISION_TIMEOUT_SECONDS',
     'OPENAI_BASE_URL', 'DEEPSEEK_BASE_URL', 'GROK_BASE_URL', 'ATLASCLOUD_BASE_URL', 'MINIMAX_BASE_URL',
     # Trading internals
     'ORDER_MODE', 'MAKER_WAIT_SEC',
@@ -312,6 +313,36 @@ CONFIG_SCHEMA = {
         'icon': 'robot',
         'order': 2,
         'items': [
+            {
+                'key': 'JEV_API_KEY',
+                'label': 'settings.field.JEV_API_KEY',
+                'type': 'password',
+                'required': False,
+                'link': 'https://console.typesafe.ai/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'settings.desc.JEV_API_KEY'
+            },
+            {
+                'key': 'JEV_BASE_URL',
+                'label': 'settings.field.JEV_BASE_URL',
+                'type': 'text',
+                'default': 'https://api.typesafe.ai/v1',
+                'description': 'settings.desc.JEV_BASE_URL'
+            },
+            {
+                'key': 'JEV_MODEL',
+                'label': 'settings.field.JEV_MODEL',
+                'type': 'text',
+                'default': 'jev-latest',
+                'description': 'settings.desc.JEV_MODEL'
+            },
+            {
+                'key': 'JEV_TIMEOUT_SECONDS',
+                'label': 'settings.field.JEV_TIMEOUT_SECONDS',
+                'type': 'number',
+                'default': 8,
+                'description': 'settings.desc.JEV_TIMEOUT_SECONDS'
+            },
             {
                 'key': 'LLM_PROVIDER',
                 'label': 'LLM Provider',

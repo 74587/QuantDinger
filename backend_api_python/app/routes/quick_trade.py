@@ -358,6 +358,7 @@ def place_order(body):
         sl_price = float(body.get("sl_price") or 0)
         source = str(body.get("source") or "manual").strip()
         margin_mode = str(body.get("margin_mode") or body.get("marginMode") or "").strip().lower()
+        ai_decision_filter = bool(body.get("ai_decision_filter"))
         if margin_mode in ("cross", "crossed"):
             margin_mode = "cross"
         elif margin_mode in ("iso", "isolated"):
@@ -534,6 +535,67 @@ def place_order(body):
                     }), 400
             except Exception as pe:
                 logger.warning("swap margin pre-check skipped: %s", pe)
+
+        if market_type == "spot":
+            decision_action = "open_long" if side == "buy" else "close_long"
+        else:
+            decision_action = "open_long" if side == "buy" else "open_short"
+        decision_price = float(price or 0)
+        if decision_price <= 0 and base_qty > 0:
+            decision_price = float(order_notional_usdt or 0) / float(base_qty)
+        if ai_decision_filter:
+            from app.services.ai_decision_filter import AIDecisionFilter, AIDecisionRequest
+
+            ai_decision = AIDecisionFilter().evaluate(
+                AIDecisionRequest(
+                    user_id=int(user_id),
+                    source_type="quick_trade",
+                    symbol=symbol,
+                    action=decision_action,
+                    market_type=market_type,
+                    order_type=order_type,
+                    quantity=float(base_qty or 0),
+                    reference_price=decision_price,
+                    leverage=float(leverage or 1),
+                    reason=source,
+                    context={
+                        "source": source,
+                        "amount_quote": usdt_amount,
+                        "take_profit_price": tp_price,
+                        "stop_loss_price": sl_price,
+                        "margin_mode": margin_mode,
+                    },
+                ),
+                enabled=True,
+            )
+            if not ai_decision.allowed:
+                _record_quick_trade(
+                    user_id=int(user_id),
+                    credential_id=credential_id,
+                    exchange_id=exchange_id,
+                    symbol=symbol,
+                    side=side,
+                    order_type=order_type,
+                    amount=usdt_amount,
+                    price=decision_price,
+                    leverage=leverage,
+                    market_type=market_type,
+                    tp_price=tp_price,
+                    sl_price=sl_price,
+                    status="ai_rejected",
+                    exchange_order_id="",
+                    filled=0.0,
+                    avg_price=0.0,
+                    error_msg=ai_decision.reason,
+                    source=source,
+                    raw_result={"ai_decision": ai_decision.public_dict()},
+                )
+                return jsonify({
+                    "code": 0,
+                    "msg": "aiDecisionFilter.rejected",
+                    "ai_rejected": True,
+                    "data": {"ai_decision": ai_decision.public_dict()},
+                })
 
         # ---- place order ----
         # Generate client_order_id: OKX clOrdId requirements: 1-32 chars, alphanumeric, underscore, hyphen only

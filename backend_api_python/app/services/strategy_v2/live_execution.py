@@ -34,6 +34,9 @@ class LiveOrderRequest:
     protection: dict[str, Any] | None = None
     sizing: dict[str, Any] | None = None
     client_order_id: str = ""
+    ai_decision_filter: bool = False
+    strategy_type: str = ""
+    decision_context: dict[str, Any] | None = None
 
 
 class StrategyV2OrderGateway:
@@ -134,12 +137,52 @@ class StrategyV2OrderGateway:
             target_position_qty=signal.target_position_qty,
             **signal.to_order_intent_kwargs(leverage=request.leverage),
         )
+        if intent.existing and intent.status == "ai_rejected":
+            return None
         if intent.existing and intent.status not in {"failed", "cancelled", "rejected"}:
             pending_id = self._pending_id(key)
             if pending_id:
                 return pending_id
         if intent.id <= 0:
             raise RuntimeError("strategyV2.orderIntentPersistenceFailed")
+
+        if request.execution_mode == "live" and request.ai_decision_filter:
+            from app.services.ai_decision_filter import AIDecisionFilter, AIDecisionRequest
+
+            decision = AIDecisionFilter().evaluate(
+                AIDecisionRequest(
+                    user_id=request.user_id,
+                    source_type="strategy",
+                    strategy_id=request.strategy_id,
+                    strategy_run_id=request.strategy_run_id,
+                    order_intent_id=int(intent.id),
+                    symbol=request.symbol,
+                    action=request.action,
+                    market_type=request.market_type,
+                    order_type=request.order_type,
+                    quantity=request.quantity,
+                    reference_price=request.reference_price,
+                    leverage=request.leverage,
+                    reason=request.reason,
+                    strategy_type=request.strategy_type,
+                    context=dict(request.decision_context or {}),
+                ),
+                enabled=True,
+            )
+            if not decision.allowed:
+                with get_db_connection() as db:
+                    cur = db.cursor()
+                    cur.execute(
+                        """
+                        UPDATE strategy_order_intents
+                        SET status = 'ai_rejected', updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (int(intent.id),),
+                    )
+                    db.commit()
+                    cur.close()
+                return None
 
         payload = {
             "strategy_id": request.strategy_id,
@@ -165,6 +208,7 @@ class StrategyV2OrderGateway:
             "protection": request.protection or {},
             "sizing": request.sizing or {},
             "client_order_id": client_order_id,
+            "ai_decision_filter": bool(request.ai_decision_filter),
         }
         with get_db_connection() as db:
             cur = db.cursor()

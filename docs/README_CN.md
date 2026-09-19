@@ -12,6 +12,28 @@ QuantDinger 是一套可自托管的 AI 量化交易平台，覆盖行情研究�
 > 启用实盘后，系统可以提交真实订单。请先使用模拟盘，为交易凭据设置最小权限，
 > 并确认所在地区的法律、合规与运营要求。QuantDinger 不提供投资建议。
 
+## JEV 交易前决策过滤
+
+QuantDinger 可以在普通策略和闪电交易的实盘开仓指令到达交易所前，增加一层结构化
+AI 决策。开启 **AI 决策过滤** 后，系统会把订单、策略上下文、资金敞口、当前持仓和
+订单预算交给 [TypeSafe Jev](https://docs.typesafe.ai/introduction)，并记录 Choice 判断、
+概率、置信度、耗时和最终结果。被拒绝的开仓不会提交到交易所，用户可以在实盘详情的
+AI 决策时间线中查看每次判断。
+
+| 传统 LLM 决策过滤 | JEV 结构化决策过滤 |
+| --- | --- |
+| 生成自然语言或 JSON，再由业务代码解析结论 | 直接返回 Choice、完整概率分布和置信度 |
+| 单一结论难以在交易后复核 | 开仓判断与风险检查分别记录，并保留订单上下文和耗时 |
+| 服务异常可能误伤仓位管理 | 服务异常时记录并故障放行，所有退出指令始终绕过 AI |
+
+执行规则仍由 QuantDinger 控制：平仓、止损、止盈和紧急退出始终绕过过滤；首个版本
+暂不处理网格、DCA 和马丁策略。未配置 JEV 时会自动尝试系统已配置的大模型；两者均
+不可用时按故障放行并记录审计结果，避免 AI 服务异常导致已有仓位无法退出。
+
+管理员可以在 **系统设置 → AI / LLM** 中配置 `JEV_API_KEY`、`JEV_BASE_URL`、
+`JEV_MODEL` 和 `JEV_TIMEOUT_SECONDS`。JEV 使用官方
+[`POST /v1/systemone`](https://docs.typesafe.ai/introduction/quickstart) 接口。
+
 ## 观看 QuantDinger 宣传视频
 
 <p align="center">

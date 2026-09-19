@@ -78,6 +78,7 @@ def _strategy_ai_text(key: str, lang: str = "zh-CN") -> str:
 # Split route modules share this blueprint.
 from app.routes import script_source_routes  # noqa: E402,F401
 from app.routes import strategy_account_routes  # noqa: E402,F401
+from app.routes import strategy_ai_decision_routes  # noqa: E402,F401
 from app.routes import strategy_asset_routes  # noqa: E402,F401
 from app.routes import strategy_deviation_routes  # noqa: E402,F401
 from app.routes import strategy_executor_routes  # noqa: E402,F401

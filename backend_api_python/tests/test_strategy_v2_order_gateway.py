@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from app.services.strategy_v2 import live_execution
 from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2OrderGateway
 
@@ -72,3 +74,18 @@ def test_inflight_lookup_keeps_short_hedge_leg_independent(monkeypatch):
         "reduce_short",
         "close_short",
     )
+
+
+def test_submit_does_not_reconsider_an_ai_rejected_signal(monkeypatch):
+    class _IntentService:
+        def __init__(self, **_kwargs):
+            pass
+
+        def build_signal_idempotency_key(self, **_kwargs):
+            return "same-signal"
+
+        def create_intent(self, **_kwargs):
+            return SimpleNamespace(id=91, existing=True, status="ai_rejected")
+
+    monkeypatch.setattr(live_execution, "OrderIntentService", _IntentService)
+    assert StrategyV2OrderGateway().submit(_request()) is None

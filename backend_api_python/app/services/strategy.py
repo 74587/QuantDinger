@@ -277,7 +277,7 @@ class StrategyService:
         allowed = {
             "sourceId", "name", "initialCapital", "executionMode", "credentialId",
             "leverageEnabled", "leverage", "params", "notificationChannels",
-            "notificationTargets", "directionMode", "positionSide",
+            "notificationTargets", "directionMode", "positionSide", "aiDecisionFilter",
         }
         unsupported = set(payload) - allowed - {"user_id"}
         if unsupported:

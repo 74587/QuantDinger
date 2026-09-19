@@ -443,6 +443,33 @@ def place_order():
         market_type = data.get('marketType', 'USStock')
         order_type = (data.get('orderType') or 'market').lower()
 
+        if bool(data.get('ai_decision_filter')):
+            from app.services.ai_decision_filter import AIDecisionFilter, AIDecisionRequest
+
+            decision_price = float(data.get('price') or data.get('reference_price') or 0)
+            decision = AIDecisionFilter().evaluate(
+                AIDecisionRequest(
+                    user_id=int(g.user_id),
+                    source_type="quick_trade",
+                    symbol=str(symbol),
+                    action="open_long" if str(side).lower() == "buy" else "close_long",
+                    market_type=str(market_type),
+                    order_type=order_type,
+                    quantity=float(quantity),
+                    reference_price=decision_price,
+                    reason=str(data.get('source') or 'indicator'),
+                    context={"source": str(data.get('source') or 'indicator')},
+                ),
+                enabled=True,
+            )
+            if not decision.allowed:
+                return jsonify({
+                    "success": False,
+                    "ai_rejected": True,
+                    "error": "aiDecisionFilter.rejected",
+                    "data": {"ai_decision": decision.public_dict()},
+                })
+
         if order_type == 'limit':
             price = data.get('price')
             if not price or float(price) <= 0:

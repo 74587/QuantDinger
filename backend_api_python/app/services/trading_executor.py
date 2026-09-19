@@ -1272,6 +1272,34 @@ class TradingExecutor:
             maker_offset_bps=float(values.get("maker_offset_bps") or 0.0),
             protection=dict(values.get("protection") or {}),
             client_order_id=str(values.get("client_order_id") or ""),
+            ai_decision_filter=bool((_json_object(values.get("trading_config"))).get("ai_decision_filter")),
+            strategy_type=str((_json_object(values.get("trading_config"))).get("bot_type") or ""),
+            decision_context={
+                "strategy_name": str(strategy.get("strategy_name") or ""),
+                "timeframe": str(strategy.get("timeframe") or ""),
+                "direction_mode": str((_json_object(values.get("trading_config"))).get("direction_mode") or ""),
+                "protection": dict(values.get("protection") or {}),
+                "strategy_equity": strategy_equity,
+                "initial_capital": initial_capital,
+                "entry_percent": entry_pct,
+                "order_budget": dict(budget),
+                "current_positions": [
+                    {
+                        key: position.get(key)
+                        for key in (
+                            "symbol",
+                            "side",
+                            "size",
+                            "entry_price",
+                            "current_price",
+                            "highest_price",
+                            "lowest_price",
+                        )
+                    }
+                    for position in (values.get("current_positions") or ())
+                    if isinstance(position, dict)
+                ],
+            },
             sizing={
                 "initial_capital": initial_capital,
                 "entry_pct": entry_pct,
