@@ -2616,6 +2616,8 @@ CREATE TABLE IF NOT EXISTS qd_ai_decisions (
     latency_ms INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
+ALTER TABLE qd_ai_decisions
+    ADD COLUMN IF NOT EXISTS billing_json JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_ai_decisions_strategy
     ON qd_ai_decisions(source_type, source_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_decisions_user

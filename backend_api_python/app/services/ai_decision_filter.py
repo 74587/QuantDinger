@@ -628,41 +628,75 @@ class AIDecisionFilter:
                 cur = db.cursor()
                 cur.execute(
                     """
-                    INSERT INTO qd_ai_decisions
-                      (decision_uid, user_id, source_type, source_id, strategy_run_id,
-                       order_intent_id, symbol, action, market_type, provider, model,
-                       decision, allowed, confidence, reason, fallback_reason,
-                       probabilities_json, checks_json, request_snapshot, billing_json,
-                       latency_ms, created_at)
-                    VALUES
-                      (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (decision_uid) DO NOTHING
-                    """,
-                    (
-                        result.decision_id,
-                        int(request.user_id or 0),
-                        str(request.source_type or ""),
-                        int(request.source_id or request.strategy_id or 0),
-                        int(request.strategy_run_id or 0),
-                        int(request.order_intent_id or 0),
-                        str(request.symbol or ""),
-                        str(request.action or ""),
-                        str(request.market_type or ""),
-                        result.provider,
-                        result.model,
-                        result.decision,
-                        bool(result.allowed),
-                        result.confidence,
-                        result.reason,
-                        result.fallback_reason,
-                        json.dumps(result.probabilities, ensure_ascii=False, default=str),
-                        json.dumps(result.checks, ensure_ascii=False, default=str),
-                        AIDecisionFilter._state_text(request),
-                        json.dumps(result.billing, ensure_ascii=False, default=str),
-                        int(result.latency_ms),
-                    ),
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'qd_ai_decisions'
+                          AND column_name = 'billing_json'
+                    ) AS present
+                    """
                 )
+                column_row = cur.fetchone()
+                has_billing_column = bool(
+                    column_row.get("present") if isinstance(column_row, dict) else column_row and column_row[0]
+                )
+                values = (
+                    result.decision_id,
+                    int(request.user_id or 0),
+                    str(request.source_type or ""),
+                    int(request.source_id or request.strategy_id or 0),
+                    int(request.strategy_run_id or 0),
+                    int(request.order_intent_id or 0),
+                    str(request.symbol or ""),
+                    str(request.action or ""),
+                    str(request.market_type or ""),
+                    result.provider,
+                    result.model,
+                    result.decision,
+                    bool(result.allowed),
+                    result.confidence,
+                    result.reason,
+                    result.fallback_reason,
+                    json.dumps(result.probabilities, ensure_ascii=False, default=str),
+                    json.dumps(result.checks, ensure_ascii=False, default=str),
+                    AIDecisionFilter._state_text(request),
+                )
+                if has_billing_column:
+                    cur.execute(
+                        """
+                        INSERT INTO qd_ai_decisions
+                          (decision_uid, user_id, source_type, source_id, strategy_run_id,
+                           order_intent_id, symbol, action, market_type, provider, model,
+                           decision, allowed, confidence, reason, fallback_reason,
+                           probabilities_json, checks_json, request_snapshot, billing_json,
+                           latency_ms, created_at)
+                        VALUES
+                          (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (decision_uid) DO NOTHING
+                        """,
+                        values + (
+                            json.dumps(result.billing, ensure_ascii=False, default=str),
+                            int(result.latency_ms),
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO qd_ai_decisions
+                          (decision_uid, user_id, source_type, source_id, strategy_run_id,
+                           order_intent_id, symbol, action, market_type, provider, model,
+                           decision, allowed, confidence, reason, fallback_reason,
+                           probabilities_json, checks_json, request_snapshot,
+                           latency_ms, created_at)
+                        VALUES
+                          (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                        ON CONFLICT (decision_uid) DO NOTHING
+                        """,
+                        values + (int(result.latency_ms),),
+                    )
                 db.commit()
                 cur.close()
         except Exception as exc:
@@ -697,7 +731,8 @@ def list_ai_decisions(
             f"""
             SELECT decision_uid, source_type, source_id, strategy_run_id, symbol, action,
                    market_type, provider, model, decision, allowed, confidence, reason,
-                   fallback_reason, probabilities_json, checks_json, billing_json,
+                   fallback_reason, probabilities_json, checks_json,
+                   COALESCE(to_jsonb(qd_ai_decisions) -> 'billing_json', '{{}}'::jsonb) AS billing_json,
                    latency_ms, created_at
             FROM qd_ai_decisions
             WHERE {' AND '.join(clauses)}

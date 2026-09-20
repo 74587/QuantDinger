@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import pytest
 
 from app.services import ai_decision_filter as module
@@ -61,6 +63,84 @@ def _billing_receipt(**overrides):
     }
     receipt.update(overrides)
     return receipt
+
+
+class _AuditCursor:
+    def __init__(self, *, billing_column=True, rows=None):
+        self.billing_column = billing_column
+        self.rows = list(rows or [])
+        self.calls = []
+
+    def execute(self, query, params=None):
+        self.calls.append((query, params))
+
+    def fetchone(self):
+        return {"present": self.billing_column}
+
+    def fetchall(self):
+        return self.rows
+
+    def close(self):
+        return None
+
+
+class _AuditDb:
+    def __init__(self, cursor):
+        self.cursor_value = cursor
+        self.commits = 0
+
+    def cursor(self):
+        return self.cursor_value
+
+    def commit(self):
+        self.commits += 1
+
+
+def _audit_connection(db):
+    @contextmanager
+    def connect():
+        yield db
+
+    return connect
+
+
+@pytest.mark.parametrize("billing_column", [True, False])
+def test_ai_decision_audit_persists_across_schema_upgrade(monkeypatch, billing_column):
+    cursor = _AuditCursor(billing_column=billing_column)
+    db = _AuditDb(cursor)
+    monkeypatch.setattr(module, "get_db_connection", _audit_connection(db))
+    result = module.AIDecisionResult(
+        allowed=True,
+        decision="pass",
+        provider="jev",
+        reason="clear",
+        decision_id="decision-1",
+        latency_ms=12,
+        billing=_billing_receipt(),
+    )
+
+    module.AIDecisionFilter._persist(_request(), result)
+
+    insert_query, insert_params = cursor.calls[-1]
+    assert "INSERT INTO qd_ai_decisions" in insert_query
+    assert ("billing_json" in insert_query) is billing_column
+    assert len(insert_params) == (21 if billing_column else 20)
+    assert db.commits == 1
+
+
+def test_ai_decision_history_reads_legacy_schema_without_billing_column(monkeypatch):
+    row = {"decision_uid": "decision-1", "decision": "pass", "billing_json": {}}
+    cursor = _AuditCursor(rows=[row])
+    db = _AuditDb(cursor)
+    monkeypatch.setattr(module, "get_db_connection", _audit_connection(db))
+
+    rows = module.list_ai_decisions(user_id=7, source_type="strategy", source_id=12)
+
+    query, params = cursor.calls[-1]
+    assert "to_jsonb(qd_ai_decisions) -> 'billing_json'" in query
+    assert "checks_json, billing_json" not in query
+    assert params == (7, "strategy", 12, 100)
+    assert rows == [row]
 
 
 def test_exit_orders_bypass_ai(monkeypatch):
