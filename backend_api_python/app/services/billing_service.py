@@ -991,6 +991,7 @@ class BillingService:
                 'ai_code_gen': config.get('cost_ai_code_gen', 0),
                 'ai_copilot_chat': config.get('cost_ai_copilot_chat', 0),
                 'ai_copilot_image': config.get('cost_ai_copilot_image', 0),
+                'ai_decision_filter': config.get('cost_ai_decision_filter', 0),
             }
         }
 

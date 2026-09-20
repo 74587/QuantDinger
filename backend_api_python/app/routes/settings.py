@@ -1797,6 +1797,13 @@ CONFIG_SCHEMA = {
                 'description': 'Extra credits charged when a Copilot message includes chart images'
             },
             {
+                'key': 'BILLING_COST_AI_DECISION_FILTER',
+                'label': 'BILLING_COST_AI_DECISION_FILTER',
+                'type': 'number',
+                'default': '1',
+                'description': ''
+            },
+            {
                 'key': 'MARKETPLACE_PLATFORM_FEE_RATE',
                 'label': 'Marketplace Platform Fee Rate',
                 'type': 'text',

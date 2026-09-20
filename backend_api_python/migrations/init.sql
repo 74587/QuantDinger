@@ -2612,6 +2612,7 @@ CREATE TABLE IF NOT EXISTS qd_ai_decisions (
     probabilities_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     checks_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     request_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    billing_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     latency_ms INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );

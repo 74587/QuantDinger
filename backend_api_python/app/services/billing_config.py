@@ -12,6 +12,7 @@ DEFAULT_BILLING_CONFIG = {
     "cost_ai_code_gen": 30,
     "cost_ai_copilot_chat": 5,
     "cost_ai_copilot_image": 15,
+    "cost_ai_decision_filter": 1,
 }
 
 FEATURE_NAMES = {
