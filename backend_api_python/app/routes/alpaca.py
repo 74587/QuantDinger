@@ -451,6 +451,7 @@ def place_order():
                 AIDecisionRequest(
                     user_id=int(g.user_id),
                     source_type="quick_trade",
+                    source_id=int(data.get("credential_id") or 0),
                     symbol=str(symbol),
                     action="open_long" if str(side).lower() == "buy" else "close_long",
                     market_type=str(market_type),

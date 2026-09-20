@@ -72,3 +72,31 @@ def test_history_filters_by_account_symbol_and_market(monkeypatch):
     assert cursor.params == (99, 305, "BTC/USDT", "swap", 20, 0)
     assert payload["data"]["trades"][0]["credential_id"] == 305
     assert payload["data"]["trades"][0]["commission_quote"] == 0.03
+
+
+def test_ai_decision_history_is_scoped_to_selected_account(monkeypatch):
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return [{"decision_uid": "decision-1", "decision": "pass"}]
+
+    monkeypatch.setattr(quick_trade, "list_ai_decisions", fake_list)
+    app = Flask(__name__)
+    handler = inspect.unwrap(quick_trade.get_ai_decisions)
+
+    with app.test_request_context(
+        "/api/quick-trade/ai-decisions?credential_id=305&symbol=BTC/USDT&market_type=swap&limit=25"
+    ):
+        g.user_id = 99
+        response = handler()
+
+    assert captured == {
+        "user_id": 99,
+        "source_type": "quick_trade",
+        "source_id": 305,
+        "symbol": "BTC/USDT",
+        "market_type": "swap",
+        "limit": 25,
+    }
+    assert response.get_json()["data"][0]["decision_uid"] == "decision-1"

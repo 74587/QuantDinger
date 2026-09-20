@@ -7994,4 +7994,24 @@ paths:
       - QuickTrade
       operationId: getApiQuickTradeHistory
       x-visibility: private
+  /api/quick-trade/ai-decisions:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Return account-scoped AI decision audit rows for Quick Trade.
+      tags:
+      - QuickTrade
+      operationId: getApiQuickTradeAiDecisions
+      x-visibility: private
 openapi: 3.0.3

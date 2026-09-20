@@ -109,6 +109,7 @@ class AIDecisionRequest:
     source_type: str
     symbol: str
     action: str
+    source_id: int = 0
     market_type: str = ""
     order_type: str = "market"
     quantity: float = 0.0
@@ -238,7 +239,7 @@ class AIDecisionFilter:
                 "probabilities": probabilities,
             })
 
-        min_confidence = max(0.0, min(float(config.get("min_confidence") or 0.65), 1.0))
+        min_confidence = max(0.0, min(float(config.get("min_confidence") or 0.55), 1.0))
         for name in ("entry_decision", "risk_check", "execution_quality"):
             confidence = results[name][2]
             if confidence is None or confidence < min_confidence:
@@ -459,7 +460,7 @@ class AIDecisionFilter:
             "base_url": setting("JEV_BASE_URL", "https://api.typesafe.ai/v1"),
             "model": setting("JEV_MODEL", "jev-latest"),
             "timeout_seconds": setting("JEV_TIMEOUT_SECONDS", "8"),
-            "min_confidence": setting("JEV_MIN_CONFIDENCE", "0.65"),
+            "min_confidence": setting("JEV_MIN_CONFIDENCE", "0.55"),
         }
 
     @staticmethod
@@ -516,7 +517,7 @@ class AIDecisionFilter:
                         result.decision_id,
                         int(request.user_id or 0),
                         str(request.source_type or ""),
-                        int(request.strategy_id or 0),
+                        int(request.source_id or request.strategy_id or 0),
                         int(request.strategy_run_id or 0),
                         int(request.order_intent_id or 0),
                         str(request.symbol or ""),
@@ -541,13 +542,27 @@ class AIDecisionFilter:
             logger.warning("AI decision audit persistence skipped: %s", exc)
 
 
-def list_ai_decisions(*, user_id: int, source_type: str, source_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+def list_ai_decisions(
+    *,
+    user_id: int,
+    source_type: str,
+    source_id: int = 0,
+    symbol: str = "",
+    market_type: str = "",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit or 100), 500))
     clauses = ["user_id = %s", "source_type = %s"]
     params: list[Any] = [int(user_id), str(source_type)]
     if source_id:
         clauses.append("source_id = %s")
         params.append(int(source_id))
+    if symbol:
+        clauses.append("UPPER(symbol) = UPPER(%s)")
+        params.append(str(symbol))
+    if market_type:
+        clauses.append("LOWER(market_type) = LOWER(%s)")
+        params.append(str(market_type))
     params.append(limit)
     with get_db_connection() as db:
         cur = db.cursor()

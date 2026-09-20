@@ -82,6 +82,43 @@ def test_jev_rejection_blocks_entry(monkeypatch):
     assert isinstance(captured["json"]["state"], dict)
 
 
+def test_calibrated_jev_confidence_accepts_clear_entry(monkeypatch):
+    answers = _jev_answers(
+        risk_check=("clear", {"clear": 0.71, "caution": 0.2, "block": 0.05, "insufficient": 0.04}),
+        execution_quality=("clear", {"clear": 0.71, "caution": 0.2, "block": 0.05, "insufficient": 0.04}),
+    )
+    answers["risk_check"]["confidence"] = 0.57
+    answers["execution_quality"]["confidence"] = 0.56
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"answers": answers}
+
+    class LLM:
+        def __init__(self):
+            raise AssertionError("LLM fallback should not run for a valid JEV result")
+
+    monkeypatch.setattr(module.AIDecisionFilter, "_jev_config", staticmethod(lambda: {
+        "api_key": "secret",
+        "base_url": "https://api.typesafe.ai/v1",
+        "model": "jev-latest",
+        "timeout_seconds": "8",
+        "min_confidence": "0.55",
+    }))
+    monkeypatch.setattr(module.requests, "post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(module, "LLMService", LLM)
+    monkeypatch.setattr(module.AIDecisionFilter, "_persist", staticmethod(lambda request, result: None))
+
+    result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
+
+    assert result.allowed is True
+    assert result.provider == "jev"
+    assert result.decision == "pass"
+
+
 def test_malformed_jev_answer_falls_back_to_llm(monkeypatch):
     class Response:
         def raise_for_status(self):

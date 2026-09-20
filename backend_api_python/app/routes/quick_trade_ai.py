@@ -44,6 +44,7 @@ def maybe_reject_quick_trade(
         AIDecisionRequest(
             user_id=user_id,
             source_type="quick_trade",
+            source_id=int(context.get("credential_id") or 0),
             symbol=symbol,
             action=decision_action,
             market_type=market_type,

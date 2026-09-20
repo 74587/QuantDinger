@@ -347,7 +347,7 @@ CONFIG_SCHEMA = {
                 'key': 'JEV_MIN_CONFIDENCE',
                 'label': 'settings.field.JEV_MIN_CONFIDENCE',
                 'type': 'number',
-                'default': 0.65,
+                'default': 0.55,
                 'description': 'settings.desc.JEV_MIN_CONFIDENCE'
             },
             {

@@ -53,6 +53,7 @@ from app.services.live_trading.position_row_parse import (
     extract_signed_position_qty,
     infer_position_side_from_row,
 )
+from app.services.ai_decision_filter import list_ai_decisions
 from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 
 logger = get_logger(__name__)
@@ -1969,6 +1970,25 @@ def get_history():
     except Exception as e:
         logger.error(f"get_history failed: {e}")
         return jsonify({"code": 0, "msg": str(e)}), 500
+
+
+@quick_trade_blp.route('/ai-decisions', methods=['GET'])
+@login_required
+def get_ai_decisions():
+    """Return account-scoped AI decision audit rows for Quick Trade."""
+    credential_id = request.args.get("credential_id", type=int) or 0
+    symbol = str(request.args.get("symbol") or "").strip()
+    market_type = str(request.args.get("market_type") or "").strip()
+    limit = request.args.get("limit", type=int) or 100
+    rows = list_ai_decisions(
+        user_id=int(g.user_id),
+        source_type="quick_trade",
+        source_id=credential_id,
+        symbol=symbol,
+        market_type=market_type,
+        limit=limit,
+    )
+    return jsonify({"code": 1, "msg": "common.success", "data": rows})
 
 # openapi-compat: legacy import name
 quick_trade_bp = quick_trade_blp
