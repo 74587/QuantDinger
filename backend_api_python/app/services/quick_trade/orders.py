@@ -158,7 +158,17 @@ def limit_order_kwargs(client, symbol, amount, price, side, market_type, client_
     from app.services.live_trading.binance import BinanceFuturesClient
     from app.services.live_trading.binance_spot import BinanceSpotClient
     from app.services.live_trading.bybit import BybitClient
+    from app.services.live_trading.limit_price_safety import (
+        fetch_live_reference_price,
+        normalize_marketable_limit_price,
+    )
     from app.services.live_trading.okx import OkxClient
+
+    price = normalize_marketable_limit_price(
+        side=side,
+        limit_price=price,
+        reference_price=fetch_live_reference_price(client, symbol=symbol),
+    )
 
     if isinstance(client, (BinanceFuturesClient, BinanceSpotClient)):
         return {"quantity": amount, "price": price, "client_order_id": client_order_id}

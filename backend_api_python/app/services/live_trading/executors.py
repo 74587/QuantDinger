@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 from app.services.live_trading.base import LiveOrderResult, LiveTradingError
 from app.services.live_trading.contracts import ExchangeOrderAdapter, FillSnapshot, OrderIntent
 from app.services.live_trading.fill_evidence import positive_number
+from app.services.pending_orders.error_classification import is_exchange_price_band_error
 from app.services.pending_orders.sent_order_recovery import normalize_live_order_status
 
 
@@ -206,6 +207,20 @@ class LimitThenMarketExecutor:
                 deferred = _limit_result(result, fill, pending=True)
                 return replace(deferred, raw={**deferred.raw, "reconciliation_error": str(exc)})
             if isinstance(exc, LiveTradingError):
+                if self.fallback_to_market and is_exchange_price_band_error(exc):
+                    market_intent = replace(
+                        intent,
+                        price=0.0,
+                        client_order_id=intent.fallback_client_order_id or intent.client_order_id,
+                    )
+                    market = MarketOrderExecutor(self.adapter).execute(market_intent)
+                    return replace(
+                        market,
+                        raw={
+                            "limit_error": str(exc),
+                            "market": dict(market.raw or {}),
+                        },
+                    )
                 return OrderExecutionResult.rejected(exc)
             raise
 

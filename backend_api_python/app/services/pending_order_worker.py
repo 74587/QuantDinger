@@ -2110,6 +2110,7 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
         )
         try:
             limit_price = 0.0
+            limit_price_was_clamped = False
             if execution_algo == "limit" or use_limit_first:
                 explicit_limit_price = float(payload.get("limit_price") or 0.0)
                 limit_price = explicit_limit_price or maker_limit_price(
@@ -2117,6 +2118,23 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                     side=side,
                     maker_offset=maker_offset,
                 )
+                from app.services.live_trading.limit_price_safety import (
+                    normalize_marketable_limit_price,
+                )
+
+                submitted_limit_price = normalize_marketable_limit_price(
+                    side=side,
+                    limit_price=limit_price,
+                    reference_price=ref_price,
+                )
+                if submitted_limit_price != limit_price:
+                    limit_price_was_clamped = True
+                    phases["limit_price_safety"] = {
+                        "requested_price": limit_price,
+                        "reference_price": ref_price,
+                        "submitted_price": submitted_limit_price,
+                    }
+                    limit_price = submitted_limit_price
                 limit_client_oid = make_client_order_id(
                     exchange_id=exchange_id,
                     strategy_id=strategy_id,
@@ -2128,7 +2146,7 @@ class PendingOrderWorker(PendingOrderLoops, PendingOrderPositionSyncMixin):
                 exchange_id=exchange_id,
                 payload=payload,
                 exchange_config=exchange_config,
-                order_mode=order_mode,
+                order_mode="marketable_limit" if limit_price_was_clamped else order_mode,
                 ref_price=ref_price,
                 spot_quote_amt=spot_quote_amt,
                 spot_market_buy_uses_quote=spot_market_buy_uses_quote,

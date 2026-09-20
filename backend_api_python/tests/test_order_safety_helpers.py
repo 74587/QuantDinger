@@ -95,6 +95,21 @@ def test_http_502_is_not_classified_as_order_size():
     assert result["retryable"] is True
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        "OKX error: {'sCode': '51138'}",
+        'Bybit error: {"retCode": 110121}',
+        "Bitget error 25205: trading price cannot be below 5%",
+        "Gate error PRICE_TOO_DEVIATED",
+    ],
+)
+def test_dynamic_price_band_error_has_retryable_category(error):
+    result = classify_exchange_order_error(error)
+    assert result["category"] == "price_band"
+    assert result["retryable"] is True
+
+
 def test_legacy_executor_type_routes_to_grid_engine():
     assert resolve_bot_type({"trading_config": {"executor_type": "grid"}}) == "grid"
     assert resolve_bot_type({"template_key": "robot_v2_layered_martingale"}) == "layered_martingale"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.live_trading.base import LiveOrderResult
+from app.services.live_trading.base import LiveOrderResult, LiveTradingError
 from app.services.live_trading.contracts import FillSnapshot, OrderIntent
 from app.services.live_trading.executors import (
     LimitThenMarketExecutor,
@@ -127,5 +127,36 @@ def test_limit_then_market_preserves_partial_limit_fill_and_markets_remaining():
         ("cancel", "l1"),
         ("wait", "l1", 1.0),
         ("market", "SOL/USDT"),
+        ("wait", "m1", 12.0),
+    ]
+
+
+def test_limit_then_market_falls_back_after_price_band_rejection():
+    adapter = FakeAdapter()
+
+    def reject_limit(intent):
+        adapter.calls.append(("limit", intent.symbol))
+        raise LiveTradingError(
+            "Bybit error: {'retCode': 110003, 'retMsg': 'Order price exceeds the allowable range.'}"
+        )
+
+    adapter.place_limit_order = reject_limit
+    intent = OrderIntent(
+        symbol="ETH/USDT",
+        side="buy",
+        quantity=2,
+        price=2800,
+        client_order_id="limit-id",
+        fallback_client_order_id="market-id",
+    )
+
+    result = LimitThenMarketExecutor(adapter, fallback_to_market=True).execute(intent)
+
+    assert result.success is True
+    assert result.exchange_order_id == "m1"
+    assert "110003" in result.raw["limit_error"]
+    assert adapter.calls == [
+        ("limit", "ETH/USDT"),
+        ("market", "ETH/USDT"),
         ("wait", "m1", 12.0),
     ]

@@ -1,5 +1,7 @@
 """Tests for unified strategy auto-stop helpers."""
 
+import pytest
+
 from app.services.strategy_lifecycle import (
     is_fatal_exchange_error,
     is_recoverable_position_error,
@@ -32,6 +34,22 @@ def test_binance_reduce_only_conflict_is_recoverable():
     assert is_recoverable_position_error(
         'Binance HTTP 400: {"code":-2022,"msg":"ReduceOnly Order is rejected."}'
     )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "OKX error: {'sCode': '51137', 'sMsg': 'The highest price limit for the buy leg is 2,666.99.'}",
+        "OKX error: {'sCode': '51138', 'sMsg': 'The lowest price limit for the sell leg is 2,640.44.'}",
+        'Binance HTTP 400: {"code":-4016,"msg":"Price is higher than mark price multiplier cap."}',
+        'Binance HTTP 400: {"code":-4024,"msg":"Price is lower than mark price multiplier floor."}',
+        'Bybit error: {"retCode":110003,"retMsg":"Order price exceeds the allowable range."}',
+        "Bitget error 25206: ETH trading price cannot exceed 5%",
+        "Gate error PRICE_TOO_DEVIATED: Order price deviates too much from mark price",
+    ],
+)
+def test_dynamic_price_band_rejection_is_recoverable(reason):
+    assert is_recoverable_position_error(reason)
 
 
 def test_maybe_auto_stop_fatal():

@@ -16,6 +16,7 @@ from app.services.live_trading.bitget_spot import BitgetSpotClient
 from app.services.live_trading.bybit import BybitClient
 from app.services.live_trading.gate import GateSpotClient, GateUsdtFuturesClient
 from app.services.live_trading.okx import OkxClient
+from app.services.pending_orders.live_order_phases import place_live_limit_order
 
 
 @dataclass(frozen=True)
@@ -226,6 +227,28 @@ def test_place_grid_limit_order_sets_leverage_for_contract_clients():
     client.set_leverage.assert_called_once()
     assert client.set_leverage.call_args.kwargs["hold_side"] == "long"
     assert client.set_leverage.call_args.kwargs["product_type"] == "USDT-FUTURES"
+
+
+def test_marketable_bitget_limit_disables_post_only():
+    client = _make_client(BitgetMixClient)
+
+    place_live_limit_order(
+        client=client,
+        symbol="ETH/USDT",
+        side="buy",
+        amount=0.01,
+        price=2645.0,
+        reduce_only=False,
+        pos_side="long",
+        client_order_id="coid-2",
+        market_type="swap",
+        payload={},
+        exchange_config={"product_type": "USDT-FUTURES", "margin_coin": "USDT"},
+        leverage=2.0,
+        order_mode="marketable_limit",
+    )
+
+    assert client.place_limit_order.call_args.kwargs["post_only"] is False
 
 
 @pytest.mark.parametrize(

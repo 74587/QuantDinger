@@ -78,6 +78,10 @@ def is_fatal_exchange_error(msg: str) -> bool:
 
 
 def is_recoverable_position_error(reason: str) -> bool:
+    from app.services.pending_orders.error_classification import is_exchange_price_band_error
+
+    if is_exchange_price_band_error(reason):
+        return True
     return not is_fatal_exchange_error(reason) and any(code in str(reason or "").lower() for code in (
         "position_drift_detected", "minimum_trade_unit", "min_notional",
         "position_ownership_drift", "target_already_met",
