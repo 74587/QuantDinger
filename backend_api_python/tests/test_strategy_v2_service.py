@@ -418,6 +418,67 @@ def test_dynamic_universe_reference_matches_canonical_universe_code():
     )
 
 
+def test_dynamic_universe_excludes_members_without_loaded_market_data(tmp_path):
+    class DynamicUniverse:
+        @staticmethod
+        def list_universes(_user_id):
+            return [{"id": 7, "code": "sp500", "source_ref": "SP500"}]
+
+        @staticmethod
+        def candidate_members(_user_id, _universe_id, *, start, end):
+            del start, end
+            return [
+                {"market": "USStock", "symbol": "AAPL"},
+                {"market": "USStock", "symbol": "EA"},
+            ]
+
+        @staticmethod
+        def resolve_members(_user_id, _universe_id, *, as_of):
+            del as_of
+            return [
+                {"market": "USStock", "symbol": "AAPL"},
+                {"market": "USStock", "symbol": "EA"},
+            ]
+
+    def frame_fetcher(_market, symbol, *_args, **_kwargs):
+        return pd.DataFrame() if symbol == "EA" else _frame()
+
+    code = """
+def initialize(context):
+    context.set_universe(pool="sp500")
+    context.subscribe(frequency="1d")
+    run_daily(rebalance, time="09:35")
+
+def rebalance(context, data):
+    for symbol in get_universe_stocks():
+        get_history(2, "1d", "close", symbol)
+"""
+    service = StrategyV2BacktestService(
+        repository=_Repository(),
+        universe_service=DynamicUniverse(),
+        frame_fetcher=frame_fetcher,
+        snapshot_store=MarketDataSnapshotStore(tmp_path),
+    )
+
+    _, result = service.run(
+        user_id=1,
+        code=code,
+        start_date=datetime(2026, 1, 1),
+        end_date=datetime(2026, 1, 5, 23, 59),
+        initial_capital=10000,
+        persist=False,
+    )
+
+    assert result["diagnostics"]["symbolsUsed"] == 1
+    assert result["diagnostics"]["symbolsSkipped"] == [
+        {
+            "symbol": "USStock:EA",
+            "frequency": "1d",
+            "reason": "strategyV2.noMarketData",
+        }
+    ]
+
+
 def test_v2_service_accepts_a_controlled_fundamental_enricher():
     code = """
 def initialize(context):
