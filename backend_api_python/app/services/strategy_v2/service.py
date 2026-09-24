@@ -13,6 +13,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from app.data_sources.errors import MarketDataUnavailableError
+from app.services.backtest.metrics import benchmark_level_curve, calculate_information_ratio
 from app.services.backtest_limits import (
     BacktestRangeLimitError,
     backtest_warmup_calendar_days,
@@ -27,6 +28,7 @@ from app.utils.logger import get_logger
 
 from .contract import StrategyV2ContractError, compile_strategy_v2
 from .factor_research import FactorResearchEngine
+from .frequencies import normalize_frequency, periods_per_year
 from .models import InstrumentSpec, StrategyManifest
 from .market_data import load_strategy_frame
 from .runtime import StrategyV2BacktestRunner
@@ -246,6 +248,7 @@ class StrategyV2BacktestService:
         )
         benchmark_spec = _benchmark_for_manifest(manifest)
         benchmark_frame = None
+        benchmark_frequency = frequency
         benchmark_error = ""
         if benchmark_spec is not None:
             benchmark_frame = frames.get(benchmark_spec.key)
@@ -276,6 +279,16 @@ class StrategyV2BacktestService:
         )
         result.update(benchmark)
         result["excessReturn"] = float(result.get("totalReturn") or 0.0) - float(result.get("benchmarkTotalReturn") or 0.0)
+        normalized_benchmark_frequency = normalize_frequency(benchmark_frequency)
+        benchmark_markets = (benchmark_spec.market,) if benchmark_spec is not None else manifest.markets
+        result["benchmarkRelativeMetrics"] = calculate_information_ratio(
+            result.get("equityCurve") or [],
+            benchmark_level_curve(benchmark_frame),
+            benchmark=benchmark_spec.key if benchmark_spec is not None else None,
+            frequency=normalized_benchmark_frequency,
+            annualization_factor=periods_per_year(normalized_benchmark_frequency, benchmark_markets),
+            market=benchmark_spec.market if benchmark_spec is not None else "",
+        )
         timeframe_provenance = {
             item: [
                 _frame_provenance(
