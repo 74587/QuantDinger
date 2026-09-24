@@ -54,6 +54,7 @@ from app.services.live_trading.position_row_parse import (
     infer_position_side_from_row,
 )
 from app.services.ai_decision_filter import list_ai_decisions
+from app.services.event_radar import EventRadarError, get_event_radar_service
 from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 
 logger = get_logger(__name__)
@@ -1928,7 +1929,7 @@ def get_history():
                        leverage, market_type, tp_price, sl_price, status,
                        exchange_order_id, filled_amount, avg_fill_price,
                        commission, commission_ccy, commission_quote,
-                       error_msg, source, created_at
+                       error_msg, source, raw_result, created_at
                 FROM qd_quick_trades
                 WHERE {' AND '.join(filters)}
                 ORDER BY created_at DESC
@@ -1941,6 +1942,17 @@ def get_history():
 
         trades = []
         for r in rows:
+            raw_result = r.get("raw_result") or {}
+            if isinstance(raw_result, str):
+                try:
+                    raw_result = json.loads(raw_result)
+                except (TypeError, ValueError):
+                    raw_result = {}
+            quick_trade_meta = {}
+            if isinstance(raw_result, dict):
+                candidate = raw_result.get("_quick_trade")
+                if isinstance(candidate, dict):
+                    quick_trade_meta = candidate
             trades.append({
                 "id": r.get("id"),
                 "credential_id": r.get("credential_id"),
@@ -1963,6 +1975,11 @@ def get_history():
                 "commission_quote": float(r.get("commission_quote") or 0),
                 "error_msg": r.get("error_msg") or "",
                 "source": r.get("source") or "",
+                "margin_mode": quick_trade_meta.get("margin_mode") or "",
+                "requested_base_qty": float(quick_trade_meta.get("requested_base_qty") or 0),
+                "notional_usdt": float(quick_trade_meta.get("notional_usdt") or 0),
+                "amount_semantics": quick_trade_meta.get("amount_semantics") or "",
+                "client_order_id": quick_trade_meta.get("client_order_id") or "",
                 "created_at": str(r.get("created_at") or ""),
             })
 
@@ -1989,6 +2006,35 @@ def get_ai_decisions():
         limit=limit,
     )
     return jsonify({"code": 1, "msg": "common.success", "data": rows})
+
+
+@quick_trade_blp.route('/event-radar', methods=['GET'])
+@login_required
+def get_event_radar():
+    """Return Event Radar availability and the latest reference analysis."""
+    symbol = str(request.args.get("symbol") or "").strip()
+    market_type = str(request.args.get("market_type") or "").strip()
+    data = get_event_radar_service().get_status(int(g.user_id), symbol, market_type)
+    return jsonify({"code": 1, "msg": "common.success", "data": data})
+
+
+@quick_trade_blp.route('/event-radar/analyze', methods=['POST'])
+@login_required
+def analyze_event_radar():
+    """Run a paid, reference-only event analysis for the current instrument."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        data = get_event_radar_service().analyze(
+            int(g.user_id),
+            str(payload.get("symbol") or ""),
+            str(payload.get("market_type") or ""),
+        )
+        return jsonify({"code": 1, "msg": "common.success", "data": data})
+    except EventRadarError as exc:
+        return jsonify({"code": 0, "msg": exc.code, "data": exc.details}), exc.status
+    except Exception as exc:
+        logger.exception("Event Radar analysis failed")
+        return jsonify({"code": 0, "msg": "event_radar_failed", "data": {"error": str(exc)}}), 500
 
 # openapi-compat: legacy import name
 quick_trade_bp = quick_trade_blp

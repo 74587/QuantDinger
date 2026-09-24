@@ -416,6 +416,29 @@ ON qd_script_source_versions(user_id);
 ALTER TABLE qd_strategies_trading
 ADD COLUMN IF NOT EXISTS source_version_id INTEGER;
 
+DO $$
+DECLARE
+    trading_config_type TEXT;
+BEGIN
+    SELECT data_type
+    INTO trading_config_type
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'qd_strategies_trading'
+      AND column_name = 'trading_config';
+
+    IF trading_config_type IS NOT NULL AND trading_config_type <> 'jsonb' THEN
+        ALTER TABLE qd_strategies_trading
+            ALTER COLUMN trading_config DROP DEFAULT;
+        ALTER TABLE qd_strategies_trading
+            ALTER COLUMN trading_config TYPE JSONB
+            USING COALESCE(NULLIF(BTRIM(trading_config::TEXT), ''), '{}')::JSONB;
+        ALTER TABLE qd_strategies_trading
+            ALTER COLUMN trading_config SET DEFAULT '{}'::JSONB;
+    END IF;
+END
+$$;
+
 INSERT INTO qd_script_source_versions
     (source_id, user_id, version_no, name, description, code,
      template_key, param_schema, metadata, created_at)
@@ -2622,6 +2645,30 @@ CREATE INDEX IF NOT EXISTS idx_ai_decisions_strategy
     ON qd_ai_decisions(source_type, source_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_decisions_user
     ON qd_ai_decisions(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS qd_event_radar_analyses (
+    id BIGSERIAL PRIMARY KEY,
+    analysis_uid VARCHAR(64) NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    symbol VARCHAR(80) NOT NULL,
+    market_type VARCHAR(24) NOT NULL DEFAULT '',
+    direction VARCHAR(16) NOT NULL DEFAULT 'neutral',
+    confidence DECIMAL(8, 6),
+    impact VARCHAR(16) NOT NULL DEFAULT 'low',
+    relevance VARCHAR(16) NOT NULL DEFAULT 'low',
+    freshness VARCHAR(16) NOT NULL DEFAULT 'stale',
+    summary TEXT NOT NULL DEFAULT '',
+    provider VARCHAR(24) NOT NULL DEFAULT 'none',
+    model VARCHAR(120) NOT NULL DEFAULT '',
+    fallback_reason TEXT NOT NULL DEFAULT '',
+    source_status_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    events_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    billing_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_event_radar_user_symbol
+    ON qd_event_radar_analyses(user_id, symbol, market_type, created_at DESC);
 
 -- Migration: Add commission tracking columns to existing qd_quick_trades.
 -- (Introduced in v3.0.8. Pre-existing rows default to 0 / '' which is the
