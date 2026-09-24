@@ -3,7 +3,7 @@ from contextlib import contextmanager
 
 from flask import Flask, g
 
-from app.routes import quick_trade
+from app.routes import quick_trade, quick_trade_event_radar
 
 
 class _Cursor:
@@ -122,9 +122,9 @@ def test_event_radar_status_is_scoped_to_current_user(monkeypatch):
             captured.update(user_id=user_id, symbol=symbol, market_type=market_type)
             return {"enabled": True, "cost": 5, "latest": None}
 
-    monkeypatch.setattr(quick_trade, "get_event_radar_service", lambda: Service())
+    monkeypatch.setattr(quick_trade_event_radar, "get_event_radar_service", lambda: Service())
     app = Flask(__name__)
-    handler = inspect.unwrap(quick_trade.get_event_radar)
+    handler = inspect.unwrap(quick_trade_event_radar.get_event_radar)
 
     with app.test_request_context("/api/quick-trade/event-radar?symbol=BTC/USDT&market_type=swap"):
         g.user_id = 99
@@ -139,9 +139,9 @@ def test_event_radar_analysis_never_calls_order_execution(monkeypatch):
         def analyze(self, user_id, symbol, market_type):
             return {"reference_only": True, "symbol": symbol, "market_type": market_type}
 
-    monkeypatch.setattr(quick_trade, "get_event_radar_service", lambda: Service())
+    monkeypatch.setattr(quick_trade_event_radar, "get_event_radar_service", lambda: Service())
     app = Flask(__name__)
-    handler = inspect.unwrap(quick_trade.analyze_event_radar)
+    handler = inspect.unwrap(quick_trade_event_radar.analyze_event_radar)
     assert "place_order" not in inspect.getsource(handler)
 
     with app.test_request_context(

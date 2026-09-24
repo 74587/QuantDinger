@@ -81,6 +81,7 @@ def register_human_blueprints(api: Api) -> None:
     from app.routes.fast_analysis import fast_analysis_blp
     from app.routes.billing import billing_blp
     from app.routes.quick_trade import quick_trade_blp
+    from app.routes.quick_trade_event_radar import quick_trade_event_radar_blp
 
     registrations: list[tuple] = [
         (health_blp, ""),
@@ -108,6 +109,7 @@ def register_human_blueprints(api: Api) -> None:
         (fast_analysis_blp, "/api/fast-analysis"),
         (billing_blp, "/api/billing"),
         (quick_trade_blp, "/api/quick-trade"),
+        (quick_trade_event_radar_blp, "/api/quick-trade"),
     ]
 
     for blp, prefix in registrations:
