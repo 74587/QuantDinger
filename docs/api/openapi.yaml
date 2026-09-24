@@ -8014,4 +8014,44 @@ paths:
       - QuickTrade
       operationId: getApiQuickTradeAiDecisions
       x-visibility: private
+  /api/quick-trade/event-radar:
+    get:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Return Event Radar availability and the latest reference analysis.
+      tags:
+      - QuickTrade
+      operationId: getApiQuickTradeEventRadar
+      x-visibility: private
+  /api/quick-trade/event-radar/analyze:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Run a paid, reference-only event analysis for the current instrument.
+      tags:
+      - QuickTrade
+      operationId: postApiQuickTradeEventRadarAnalyze
+      x-visibility: private
 openapi: 3.0.3
