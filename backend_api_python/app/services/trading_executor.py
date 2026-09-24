@@ -874,6 +874,13 @@ class TradingExecutor:
                                     )
                                 )
                             if frame_advanced:
+                                begin_signal_cycle = getattr(
+                                    self.order_gateway,
+                                    "begin_signal_cycle",
+                                    None,
+                                )
+                                if callable(begin_signal_cycle):
+                                    begin_signal_cycle(run_id)
                                 intents, messages, timestamp = session.process(
                                     frames,
                                     frequency_frames=frequency_frames,
@@ -918,6 +925,13 @@ class TradingExecutor:
                                                 ),
                                             },
                                         })
+                                finish_signal_cycle = getattr(
+                                    self.order_gateway,
+                                    "finish_signal_cycle",
+                                    None,
+                                )
+                                if callable(finish_signal_cycle):
+                                    finish_signal_cycle(run_id)
                                 initial_frames_pending = False
                                 last_signal_bar_token = current_bar_token
                                 last_processed_frame_timestamp = latest_frame_timestamp
@@ -1027,6 +1041,13 @@ class TradingExecutor:
                 append_strategy_log(strategy_id, "error", exit_reason)
             self._mark_stopped(strategy_id)
         finally:
+            clear_signal_state = getattr(
+                self.order_gateway,
+                "clear_signal_state",
+                None,
+            )
+            if callable(clear_signal_state):
+                clear_signal_state(run_id)
             if state_store is not None:
                 state_store.flush()
             if market_price_feed is not None:

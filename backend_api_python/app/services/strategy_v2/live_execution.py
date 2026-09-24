@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +44,62 @@ class StrategyV2OrderGateway:
     """Persist idempotent orders for the existing asynchronous dispatcher."""
 
     _ACTIVE_PENDING_STATUSES = ("pending", "processing", "sent", "syncing")
+
+    def __init__(self, *, decision_filter_factory=None) -> None:
+        self._decision_filter_factory = decision_filter_factory
+        self._ai_rejection_latches: dict[int, set[tuple[str, str, str]]] = {}
+        self._ai_signal_cycle: dict[int, set[tuple[str, str, str]]] = {}
+        self._ai_latch_lock = threading.Lock()
+
+    @staticmethod
+    def _ai_signal_fingerprint(request: LiveOrderRequest) -> tuple[str, str, str]:
+        return (
+            str(request.symbol or "").strip(),
+            str(request.action or "").strip().lower(),
+            str(request.reason or "").strip(),
+        )
+
+    def begin_signal_cycle(self, strategy_run_id: int) -> None:
+        run_id = int(strategy_run_id or 0)
+        if run_id <= 0:
+            return
+        with self._ai_latch_lock:
+            self._ai_signal_cycle[run_id] = set()
+
+    def finish_signal_cycle(self, strategy_run_id: int) -> None:
+        run_id = int(strategy_run_id or 0)
+        if run_id <= 0:
+            return
+        with self._ai_latch_lock:
+            seen = self._ai_signal_cycle.pop(run_id, None)
+            if seen is None:
+                return
+            remaining = self._ai_rejection_latches.get(run_id, set()).intersection(seen)
+            if remaining:
+                self._ai_rejection_latches[run_id] = remaining
+            else:
+                self._ai_rejection_latches.pop(run_id, None)
+
+    def clear_signal_state(self, strategy_run_id: int) -> None:
+        run_id = int(strategy_run_id or 0)
+        with self._ai_latch_lock:
+            self._ai_signal_cycle.pop(run_id, None)
+            self._ai_rejection_latches.pop(run_id, None)
+
+    def _is_ai_rejection_latched(self, request: LiveOrderRequest) -> bool:
+        run_id = int(request.strategy_run_id or 0)
+        fingerprint = self._ai_signal_fingerprint(request)
+        with self._ai_latch_lock:
+            seen = self._ai_signal_cycle.get(run_id)
+            if seen is not None:
+                seen.add(fingerprint)
+            return fingerprint in self._ai_rejection_latches.get(run_id, set())
+
+    def _latch_ai_rejection(self, request: LiveOrderRequest) -> None:
+        run_id = int(request.strategy_run_id or 0)
+        fingerprint = self._ai_signal_fingerprint(request)
+        with self._ai_latch_lock:
+            self._ai_rejection_latches.setdefault(run_id, set()).add(fingerprint)
 
     @staticmethod
     def _position_lane(action: str) -> str:
@@ -98,6 +155,12 @@ class StrategyV2OrderGateway:
 
     def submit(self, request: LiveOrderRequest) -> int | None:
         request = self._validate(request)
+        if (
+            request.execution_mode == "live"
+            and request.ai_decision_filter
+            and self._is_ai_rejection_latched(request)
+        ):
+            return None
         service = OrderIntentService(
             strategy_id=request.strategy_id,
             strategy_run_id=request.strategy_run_id,
@@ -149,7 +212,12 @@ class StrategyV2OrderGateway:
         if request.execution_mode == "live" and request.ai_decision_filter:
             from app.services.ai_decision_filter import AIDecisionFilter, AIDecisionRequest
 
-            decision = AIDecisionFilter().evaluate(
+            decision_filter = (
+                self._decision_filter_factory()
+                if self._decision_filter_factory is not None
+                else AIDecisionFilter()
+            )
+            decision = decision_filter.evaluate(
                 AIDecisionRequest(
                     user_id=request.user_id,
                     source_type="strategy",
@@ -182,6 +250,7 @@ class StrategyV2OrderGateway:
                     )
                     db.commit()
                     cur.close()
+                self._latch_ai_rejection(request)
                 return None
 
         payload = {
