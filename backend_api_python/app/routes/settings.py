@@ -37,8 +37,11 @@ RESTART_REQUIRED_SETTINGS = {
 # intentional — only put truly rarely changed knobs here so the basic tab stays
 # useful for day-to-day operators.
 ADVANCED_KEYS = {
+    # Bootstrap compatibility
+    'ADMIN_USER', 'ADMIN_PASSWORD',
     # AI tuning
     'OPENROUTER_TEMPERATURE',
+    'LLM_MAX_TOKENS',
     'AI_ANALYSIS_CONSENSUS_TIMEFRAMES', 'SEARCH_MAX_RESULTS',
     'FAST_ANALYSIS_INCLUDE_GLOBAL_NEWS',
     'SEARCH_GOOGLE_API_KEY', 'SEARCH_GOOGLE_CX', 'SEARCH_BING_API_KEY', 'SERPAPI_KEYS',
@@ -344,6 +347,13 @@ CONFIG_SCHEMA = {
                 'type': 'number',
                 'default': 8,
                 'description': 'settings.desc.JEV_TIMEOUT_SECONDS'
+            },
+            {
+                'key': 'AI_DECISION_TIMEOUT_SECONDS',
+                'label': 'settings.field.AI_DECISION_TIMEOUT_SECONDS',
+                'type': 'number',
+                'default': 10,
+                'description': 'settings.desc.AI_DECISION_TIMEOUT_SECONDS'
             },
             {
                 'key': 'JEV_MIN_CONFIDENCE',
@@ -683,6 +693,13 @@ CONFIG_SCHEMA = {
                 'type': 'number',
                 'default': '0.7',
                 'description': 'Model creativity (0-1). Lower = more deterministic'
+            },
+            {
+                'key': 'LLM_MAX_TOKENS',
+                'label': 'settings.field.LLM_MAX_TOKENS',
+                'type': 'number',
+                'default': 16384,
+                'description': 'settings.desc.LLM_MAX_TOKENS'
             },
             {
                 'key': 'AI_ANALYSIS_CONSENSUS_TIMEFRAMES',
@@ -1779,6 +1796,13 @@ CONFIG_SCHEMA = {
                 'description': 'Optional. Higher TronGrid rate-limit / stability for TRC20 reconciliation. Get one at https://www.trongrid.io.'
             },
             {
+                'key': 'TRONGRID_BASE_URL',
+                'label': 'settings.field.TRONGRID_BASE_URL',
+                'type': 'text',
+                'default': 'https://api.trongrid.io',
+                'description': 'settings.desc.TRONGRID_BASE_URL'
+            },
+            {
                 'key': 'ETHERSCAN_API_KEY',
                 'label': 'Etherscan API Key',
                 'type': 'password',
@@ -1786,11 +1810,53 @@ CONFIG_SCHEMA = {
                 'description': 'Optional. Used for ERC20 reconciliation via Etherscan V2 (free plan covers Ethereum mainnet). BEP20 uses BSC RPC unless you explicitly enable explorer mode. Get a key at https://etherscan.io/myapikey.'
             },
             {
+                'key': 'ETHERSCAN_V2_BASE_URL',
+                'label': 'settings.field.ETHERSCAN_V2_BASE_URL',
+                'type': 'text',
+                'default': 'https://api.etherscan.io/v2/api',
+                'description': 'settings.desc.ETHERSCAN_V2_BASE_URL'
+            },
+            {
                 'key': 'BSC_RPC_URLS',
                 'label': 'BSC RPC URLs',
                 'type': 'text',
                 'required': False,
                 'description': 'Optional comma-separated BSC JSON-RPC endpoints for BEP20 reconciliation. Use provider URLs with API keys here if public RPCs are unstable.'
+            },
+            {
+                'key': 'ETH_RPC_URLS',
+                'label': 'settings.field.ETH_RPC_URLS',
+                'type': 'text',
+                'required': False,
+                'description': 'settings.desc.ETH_RPC_URLS'
+            },
+            {
+                'key': 'SOLANA_RPC_URL',
+                'label': 'settings.field.SOLANA_RPC_URL',
+                'type': 'text',
+                'default': 'https://api.mainnet-beta.solana.com',
+                'description': 'settings.desc.SOLANA_RPC_URL'
+            },
+            {
+                'key': 'BEP20_PREFER_EXPLORER',
+                'label': 'settings.field.BEP20_PREFER_EXPLORER',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'settings.desc.BEP20_PREFER_EXPLORER'
+            },
+            {
+                'key': 'ERC20_PREFER_EXPLORER',
+                'label': 'settings.field.ERC20_PREFER_EXPLORER',
+                'type': 'boolean',
+                'default': 'True',
+                'description': 'settings.desc.ERC20_PREFER_EXPLORER'
+            },
+            {
+                'key': 'USDT_AMOUNT_SUFFIX_DECIMALS',
+                'label': 'settings.field.USDT_AMOUNT_SUFFIX_DECIMALS',
+                'type': 'number',
+                'default': 6,
+                'description': 'settings.desc.USDT_AMOUNT_SUFFIX_DECIMALS'
             },
             {
                 'key': 'USDT_PAY_CONFIRM_SECONDS',
