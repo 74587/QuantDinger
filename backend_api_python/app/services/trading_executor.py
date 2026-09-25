@@ -62,8 +62,13 @@ class TradingExecutor:
 
     def __init__(self) -> None:
         self.running_strategies: dict[int, threading.Thread] = {}
+        self._runtime_stop_events: dict[int, threading.Event] = {}
         self.lock = threading.Lock()
         self.max_threads = max(1, int(os.getenv("STRATEGY_MAX_THREADS", "64")))
+        self.stop_join_timeout = max(
+            1.0,
+            float(os.getenv("STRATEGY_STOP_JOIN_TIMEOUT_SEC", "15")),
+        )
         self.order_gateway = StrategyV2OrderGateway()
         self._last_start_failure = ""
         self._last_exit_reason: dict[int, str] = {}
@@ -89,17 +94,20 @@ class TradingExecutor:
             if self.runtime_guard and not self.runtime_guard(strategy_id):
                 self._last_start_failure = "strategyRuntime.leaseLost"
                 return False
+            stop_event = threading.Event()
             thread = threading.Thread(
                 target=self._run_strategy_loop,
-                args=(strategy_id,),
+                args=(strategy_id, stop_event),
                 name=f"strategy-{strategy_id}",
                 daemon=True,
             )
             self.running_strategies[strategy_id] = thread
+            self._runtime_stop_events[strategy_id] = stop_event
             try:
                 thread.start()
             except Exception as exc:
                 self.running_strategies.pop(strategy_id, None)
+                self._runtime_stop_events.pop(strategy_id, None)
                 self._last_start_failure = (
                     f"Failed to start strategy thread: {exc}; {format_thread_capacity()}"
                 )
@@ -234,7 +242,21 @@ class TradingExecutor:
                     db.commit()
                     cur.close()
             with self.lock:
-                self.running_strategies.pop(strategy_id, None)
+                thread = self.running_strategies.get(strategy_id)
+                stop_event = self._runtime_stop_events.get(strategy_id)
+                if stop_event is not None:
+                    stop_event.set()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=self.stop_join_timeout)
+                if thread.is_alive():
+                    self._last_exit_reason[strategy_id] = "strategyRuntime.stopTimeout"
+                    append_strategy_log(strategy_id, "error", "strategyRuntime.stopTimeout")
+                    return False
+            with self.lock:
+                if self.running_strategies.get(strategy_id) is thread:
+                    self.running_strategies.pop(strategy_id, None)
+                if self._runtime_stop_events.get(strategy_id) is stop_event:
+                    self._runtime_stop_events.pop(strategy_id, None)
             append_strategy_log(strategy_id, "info", "Strategy stop requested")
             return True
         except Exception as exc:
@@ -342,9 +364,15 @@ class TradingExecutor:
         for strategy_id, thread in list(self.running_strategies.items()):
             if not thread.is_alive():
                 self.running_strategies.pop(strategy_id, None)
+                self._runtime_stop_events.pop(strategy_id, None)
 
-    def _run_strategy_loop(self, strategy_id: int) -> None:
+    def _run_strategy_loop(
+        self,
+        strategy_id: int,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         current = threading.current_thread()
+        stop_event = stop_event or threading.Event()
         run_id = 0
         exit_reason = "strategy stopped"
         market_price_feed = None
@@ -507,6 +535,7 @@ class TradingExecutor:
                     strategy_id=strategy_id,
                     strategy_run_id=run_id,
                     current_thread=current,
+                    stop_event=stop_event,
                     strategy_name=str(strategy.get("strategy_name") or f"strategy_{strategy_id}"),
                     primary=primary,
                     candidates=candidates,
@@ -602,7 +631,7 @@ class TradingExecutor:
                 f"Strategy runtime ready: instruments={len(candidates)}, timeframe={frequency}, mode={execution_mode}",
             )
 
-            while self._is_strategy_running(strategy_id, current):
+            while self._is_strategy_running(strategy_id, current, stop_event):
                 cycle_started = time.monotonic()
                 try:
                     references = session.context.order_references()
@@ -1030,7 +1059,7 @@ class TradingExecutor:
                         raise RuntimeError(f"strategyV2.repeatedRuntimeFailure:{exc}") from exc
                 remaining = risk_tick - (time.monotonic() - cycle_started)
                 if remaining > 0:
-                    time.sleep(remaining)
+                    stop_event.wait(remaining)
         except Exception as exc:
             exit_reason = str(exc)
             self._last_exit_reason[strategy_id] = exit_reason
@@ -1057,6 +1086,7 @@ class TradingExecutor:
             with self.lock:
                 if self.running_strategies.get(strategy_id) is current:
                     self.running_strategies.pop(strategy_id, None)
+                    self._runtime_stop_events.pop(strategy_id, None)
 
     def _execute_strategy_v2_intent(
         self,
@@ -1375,6 +1405,7 @@ class TradingExecutor:
         strategy_id: int,
         strategy_run_id: int,
         current_thread: threading.Thread,
+        stop_event: threading.Event,
         strategy_name: str,
         primary: Dict[str, Any],
         candidates: List[Dict[str, Any]],
@@ -1531,7 +1562,7 @@ class TradingExecutor:
         )
         grid_price_feed.start()
         try:
-            while self._is_strategy_running(strategy_id, current_thread):
+            while self._is_strategy_running(strategy_id, current_thread, stop_event):
                 cycle_started = time.monotonic()
                 price_snapshot = grid_price_feed.snapshot(
                     max_age_seconds=float(
@@ -2271,7 +2302,14 @@ class TradingExecutor:
             code = migrated
         return source_version_id, code
 
-    def _is_strategy_running(self, strategy_id: int, thread: threading.Thread) -> bool:
+    def _is_strategy_running(
+        self,
+        strategy_id: int,
+        thread: threading.Thread,
+        stop_event: threading.Event | None = None,
+    ) -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return False
         if self.runtime_guard and not self.runtime_guard(strategy_id):
             self._last_exit_reason[strategy_id] = "strategyRuntime.leaseLost"
             return False

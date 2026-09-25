@@ -43,7 +43,7 @@ class LiveOrderRequest:
 class StrategyV2OrderGateway:
     """Persist idempotent orders for the existing asynchronous dispatcher."""
 
-    _ACTIVE_PENDING_STATUSES = ("pending", "processing", "sent", "syncing")
+    _ACTIVE_PENDING_STATUSES = ("pending", "processing", "sent", "syncing", "reconciling")
 
     def __init__(self, *, decision_filter_factory=None) -> None:
         self._decision_filter_factory = decision_filter_factory
@@ -134,16 +134,14 @@ class StrategyV2OrderGateway:
                 SELECT id
                 FROM pending_orders
                 WHERE strategy_id = %s
-                  AND strategy_run_id = %s
                   AND symbol = %s
                   AND signal_type IN (%s, %s, %s, %s)
-                  AND status IN (%s, %s, %s, %s)
+                  AND status IN (%s, %s, %s, %s, %s)
                 ORDER BY id DESC
                 LIMIT 1
                 """,
                 (
                     int(request.strategy_id),
-                    int(request.strategy_run_id),
                     str(request.symbol or ""),
                     *lane_actions,
                     *self._ACTIVE_PENDING_STATUSES,
@@ -175,6 +173,16 @@ class StrategyV2OrderGateway:
                 symbol=request.symbol,
                 signal_type=request.action,
                 signal_ts=request.signal_timestamp,
+                signal_discriminator={
+                    "quantity": request.quantity,
+                    "reference_price": request.reference_price,
+                    "reason": request.reason,
+                    "order_type": request.order_type,
+                    "execution_algo": request.execution_algo,
+                    "limit_price": request.limit_price,
+                    "protection": request.protection or {},
+                    "sizing": request.sizing or {},
+                },
             )
         )[:180]
         signal = StrategySignal(

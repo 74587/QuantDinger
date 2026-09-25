@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from app.services.strategy_v2 import live_execution
 from app.services.strategy_v2.live_execution import LiveOrderRequest, StrategyV2OrderGateway
+from app.services.strategy_runtime.order_intents import OrderIntentService
 
 
 class _Cursor:
@@ -60,14 +61,20 @@ def test_inflight_lookup_serializes_the_same_long_position_leg(monkeypatch):
     monkeypatch.setattr(live_execution, "get_db_connection", lambda: _Db(cursor))
 
     assert StrategyV2OrderGateway().has_inflight(_request("close_long")) is True
-    assert cursor.params[:3] == (7, 42, "BTC/USDT")
-    assert cursor.params[3:7] == (
+    assert cursor.params[:2] == (7, "BTC/USDT")
+    assert cursor.params[2:6] == (
         "open_long",
         "add_long",
         "reduce_long",
         "close_long",
     )
-    assert cursor.params[7:] == ("pending", "processing", "sent", "syncing")
+    assert cursor.params[6:] == (
+        "pending",
+        "processing",
+        "sent",
+        "syncing",
+        "reconciling",
+    )
 
 
 def test_inflight_lookup_keeps_short_hedge_leg_independent(monkeypatch):
@@ -75,7 +82,7 @@ def test_inflight_lookup_keeps_short_hedge_leg_independent(monkeypatch):
     monkeypatch.setattr(live_execution, "get_db_connection", lambda: _Db(cursor))
 
     assert StrategyV2OrderGateway().has_inflight(_request("open_short")) is False
-    assert cursor.params[3:7] == (
+    assert cursor.params[2:6] == (
         "open_short",
         "add_short",
         "reduce_short",
@@ -156,3 +163,29 @@ def test_ai_rejection_is_latched_until_the_signal_disappears(monkeypatch):
     )) is None
     gateway.finish_signal_cycle(42)
     assert decisions == [("open_long", True), ("open_long", True)]
+
+
+def test_fallback_idempotency_distinguishes_different_same_second_orders():
+    common = {
+        "strategy_run_id": 42,
+        "strategy_id": 7,
+        "symbol": "BTC/USDT",
+        "signal_type": "add_long",
+        "signal_ts": 123,
+    }
+
+    first = OrderIntentService.build_signal_idempotency_key(
+        **common,
+        signal_discriminator={"quantity": 0.01, "reason": "scale-1"},
+    )
+    second = OrderIntentService.build_signal_idempotency_key(
+        **common,
+        signal_discriminator={"quantity": 0.02, "reason": "scale-2"},
+    )
+    retry = OrderIntentService.build_signal_idempotency_key(
+        **common,
+        signal_discriminator={"reason": "scale-1", "quantity": 0.01},
+    )
+
+    assert first != second
+    assert first == retry
