@@ -76,17 +76,19 @@ def dispatch_virtual_signal_order(
     attempted = list(results.keys())
     ok_channels = [channel for channel, result in results.items() if (result or {}).get("ok")]
     fail_channels = [channel for channel, result in results.items() if not (result or {}).get("ok")]
-    virtual_note = (
-        f"virtual_{virtual_fill.get('status') or 'filled'}="
-        f"{int(virtual_fill.get('virtual_order_id') or 0)}"
-    )
+    virtual_status = str(virtual_fill.get("status") or "filled").strip().lower()
+    virtual_note = f"virtual_{virtual_status}={int(virtual_fill.get('virtual_order_id') or 0)}"
 
     if ok_channels:
         note = f"{virtual_note};notified_ok={','.join(ok_channels)}"
         if fail_channels:
             note += f";fail={','.join(fail_channels)}"
         level = "signal"
-        message = "strategyRuntime.virtualFillCompleted"
+        message = (
+            "strategyRuntime.virtualLimitOrderOpened"
+            if virtual_status == "open"
+            else "strategyRuntime.virtualFillCompleted"
+        )
     else:
         first_error = next(
             (
@@ -98,14 +100,19 @@ def dispatch_virtual_signal_order(
         )
         note = f"{virtual_note};notify_failed={first_error or 'no_channel'}"
         level = "warning"
-        message = "strategyRuntime.virtualFillNotificationFailed"
+        message = (
+            "strategyRuntime.virtualLimitOrderOpenedNotificationFailed"
+            if virtual_status == "open"
+            else "strategyRuntime.virtualFillNotificationFailed"
+        )
 
     worker._mark_sent(
         order_id=order_id,
         note=note[:200],
         filled=float(virtual_fill.get("fill_quantity") or 0.0),
         avg_price=float(virtual_fill.get("fill_price") or 0.0),
-        executed_at=int(time.time()),
-        final_filled=True,
+        executed_at=int(time.time()) if virtual_status == "filled" else None,
+        final_filled=virtual_status == "filled",
+        preserve_intent_terminal=True,
     )
     append_log(int(strategy_id or 0), level, message)

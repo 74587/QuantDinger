@@ -1,9 +1,15 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from app.services import pending_order_worker as worker_module
-from app.services.virtual_trading import calculate_virtual_fill, execute_virtual_signal_order
+from app.services.virtual_trading import (
+    calculate_virtual_fill,
+    calculate_virtual_limit_fill_price,
+    execute_virtual_signal_order,
+    match_virtual_limit_orders,
+)
 from app.services.virtual_execution_costs import (
     VIRTUAL_COMMISSION_RATE,
     VIRTUAL_SLIPPAGE_RATE,
@@ -65,6 +71,77 @@ def test_virtual_fill_without_position_is_not_fabricated():
     assert result.status == "no_position"
     assert result.fill_quantity == 0
     assert result.gross_realized_pnl == 0
+
+
+def test_virtual_limit_order_waits_for_touch_and_never_fills_worse_than_limit():
+    assert calculate_virtual_limit_fill_price(
+        action="open_long", limit_price=100, market_price=101, slippage_rate=0.0005,
+    ) is None
+    assert calculate_virtual_limit_fill_price(
+        action="open_long", limit_price=100, market_price=99, slippage_rate=0.0005,
+    ) == pytest.approx(99.0495)
+    assert calculate_virtual_limit_fill_price(
+        action="open_long", limit_price=100, market_price=100, slippage_rate=0.0005,
+    ) == pytest.approx(100)
+    assert calculate_virtual_limit_fill_price(
+        action="close_long", limit_price=110, market_price=109, slippage_rate=0.0005,
+    ) is None
+    assert calculate_virtual_limit_fill_price(
+        action="close_long", limit_price=110, market_price=111, slippage_rate=0.0005,
+    ) == pytest.approx(110.9445)
+
+
+def test_virtual_limit_matcher_uses_fresh_price_and_preserves_limit(monkeypatch):
+    from app.services import virtual_trading
+
+    row = {
+        "id": 8,
+        "user_id": 7,
+        "strategy_id": 3,
+        "strategy_run_id": 4,
+        "pending_order_id": 14,
+        "order_intent_id": 22,
+        "symbol": "Crypto:BTC/USDT@spot",
+        "action": "open_long",
+        "requested_qty": 2,
+        "limit_price": 95,
+        "slippage_rate": 0.0005,
+        "payload_json": "{}",
+    }
+
+    class Cursor:
+        def execute(self, *args, **kwargs):
+            return None
+
+        def fetchall(self):
+            return [row]
+
+        def close(self):
+            return None
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    executions = []
+    monkeypatch.setattr(virtual_trading, "get_db_connection", connection)
+    monkeypatch.setattr(
+        virtual_trading,
+        "execute_virtual_signal_order",
+        lambda order, payload: executions.append((order, payload)) or {"status": "filled"},
+    )
+
+    assert match_virtual_limit_orders(3, {"Crypto:BTC/USDT@spot": 96}, strategy_run_id=4) == []
+    matched = match_virtual_limit_orders(3, {"Crypto:BTC/USDT@spot": 94}, strategy_run_id=4)
+
+    assert matched == [{"status": "filled"}]
+    assert executions[0][1]["ref_price"] == pytest.approx(94)
+    assert executions[0][1]["_virtual_fill_price"] == pytest.approx(94.047)
+    assert executions[0][1]["_virtual_fill_price"] <= row["limit_price"]
 
 
 @pytest.mark.parametrize(
@@ -203,3 +280,53 @@ def test_live_dispatch_never_calls_virtual_account(monkeypatch):
     })
 
     assert len(live_calls) == 1
+
+
+def test_signal_limit_dispatch_keeps_virtual_order_open(monkeypatch):
+    from app.services import virtual_trading
+    from app.services.strategy_runtime import cancellations
+
+    sent = []
+    monkeypatch.setattr(cancellations, "intercept_cancelled_dispatch", lambda row: False)
+    monkeypatch.setattr(worker_module, "load_strategy_configs", lambda strategy_id: {"execution_mode": "signal"})
+    monkeypatch.setattr(worker_module, "append_strategy_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        virtual_trading,
+        "execute_virtual_signal_order",
+        lambda row, payload: {
+            "virtual_order_id": 92,
+            "status": "open",
+            "fill_quantity": 0,
+            "fill_price": 0,
+            "limit_price": 95,
+        },
+    )
+
+    worker = object.__new__(worker_module.PendingOrderWorker)
+    worker._notifier = SimpleNamespace(notify_signal=lambda **kwargs: {"browser": {"ok": True}})
+    worker._load_strategy_name = lambda strategy_id: "Grid"
+    worker._load_notification_config = lambda strategy_id: {"browser": True}
+    worker._mark_sent = lambda **kwargs: sent.append(kwargs)
+    worker._mark_failed = lambda **kwargs: pytest.fail(str(kwargs))
+
+    worker._dispatch_one({
+        "id": 14,
+        "user_id": 7,
+        "strategy_id": 3,
+        "strategy_run_id": 4,
+        "execution_mode": "signal",
+        "symbol": "BTC/USDT",
+        "signal_type": "open_long",
+        "order_type": "limit",
+        "amount": 2,
+        "price": 95,
+        "payload_json": (
+            '{"strategy_id":3,"strategy_run_id":4,"execution_mode":"signal",'
+            '"symbol":"BTC/USDT","signal_type":"open_long","order_type":"limit",'
+            '"amount":2,"price":95,"limit_price":95,"ref_price":100}'
+        ),
+    })
+
+    assert sent[0]["final_filled"] is False
+    assert sent[0]["filled"] == 0
+    assert sent[0]["executed_at"] is None

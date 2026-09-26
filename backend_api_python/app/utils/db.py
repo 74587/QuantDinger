@@ -315,6 +315,12 @@ def _apply_init_sql(logger, *, strict: bool = False):
             _apply_migration_component(
                 conn,
                 logger,
+                name="signal-virtual-limit-orders-20260926",
+                path=Path(__file__).resolve().parent.parent.parent / "migrations" / "20260926_signal_virtual_limit_orders.sql",
+            )
+            _apply_migration_component(
+                conn,
+                logger,
                 name="market-symbols-master",
                 path=symbols_sql,
                 baseline_table="qd_market_symbols",

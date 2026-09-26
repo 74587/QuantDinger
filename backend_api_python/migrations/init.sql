@@ -652,6 +652,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_virtual_orders (
     requested_qty DECIMAL(24,10) NOT NULL DEFAULT 0,
     fill_qty DECIMAL(24,10) NOT NULL DEFAULT 0,
     reference_price DECIMAL(24,10) NOT NULL DEFAULT 0,
+    limit_price DECIMAL(24,10) NOT NULL DEFAULT 0,
     fill_price DECIMAL(24,10) NOT NULL DEFAULT 0,
     exchange_id VARCHAR(40) NOT NULL DEFAULT '',
     market_type VARCHAR(20) NOT NULL DEFAULT 'spot',
@@ -663,7 +664,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_virtual_orders (
     status VARCHAR(24) NOT NULL DEFAULT 'filled',
     reason VARCHAR(255) NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    filled_at TIMESTAMP DEFAULT NOW()
+    filled_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS qd_strategy_virtual_positions (
@@ -727,6 +728,7 @@ ON qd_strategy_virtual_orders(strategy_id, created_at);
 
 ALTER TABLE qd_strategy_virtual_orders
     ADD COLUMN IF NOT EXISTS exchange_id VARCHAR(40) NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS limit_price DECIMAL(24,10) NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) NOT NULL DEFAULT 'spot',
     ADD COLUMN IF NOT EXISTS leverage DECIMAL(12,4) NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS commission_rate DECIMAL(14,10) NOT NULL DEFAULT 0,

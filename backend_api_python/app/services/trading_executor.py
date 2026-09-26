@@ -225,6 +225,18 @@ class TradingExecutor:
     def stop_strategy(self, strategy_id: int, *, persist_status: bool = True) -> bool:
         strategy_id = int(strategy_id)
         try:
+            try:
+                strategy = self._load_strategy(strategy_id) or {}
+                if str(strategy.get("execution_mode") or "signal").strip().lower() == "signal":
+                    from app.services.virtual_trading import cancel_virtual_limit_orders
+
+                    cancel_virtual_limit_orders(strategy_id)
+            except Exception as exc:
+                logger.warning(
+                    "Virtual limit-order cancellation failed during strategy stop: strategy_id=%s error=%s",
+                    strategy_id,
+                    exc,
+                )
             # A resting grid owns exchange-side limit orders independently of the
             # strategy thread.  Cancelling only the local runtime would leave
             # those orders live after the UI reports the strategy as stopped.
@@ -668,6 +680,25 @@ class TradingExecutor:
                     elif stale_price_logged:
                         append_strategy_log(strategy_id, "info", "Live price feed recovered")
                         stale_price_logged = False
+                    if execution_mode == "signal" and active_prices:
+                        from app.services.virtual_trading import match_virtual_limit_orders
+
+                        virtual_fills = match_virtual_limit_orders(
+                            strategy_id,
+                            active_prices,
+                            strategy_run_id=run_id,
+                        )
+                        if virtual_fills:
+                            positions = self._positions_by_symbol(
+                                strategy_id,
+                                candidates,
+                                strategy=strategy,
+                            )
+                            references = session.context.order_references()
+                            if references:
+                                session.context.update_order_statuses(
+                                    order_intent_service.statuses_by_client_order_ids(references)
+                                )
                     equity_positions: list[dict[str, Any]] = []
                     positions_prices_fresh = True
                     for position_key, position in positions.items():

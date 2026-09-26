@@ -2881,6 +2881,7 @@ class PendingOrderWorker(
         executed_at: Optional[int] = None,
         final_filled: bool = False,
         client_order_id: str = "",
+        preserve_intent_terminal: bool = False,
     ) -> None:
         exchange_response_json = _redact_exchange_json(exchange_response_json)
         with get_db_connection() as db:
@@ -2925,6 +2926,7 @@ class PendingOrderWorker(
                 """
                 UPDATE strategy_order_intents soi
                 SET status = CASE
+                        WHEN %s AND soi.status IN ('filled', 'cancelled', 'rejected', 'failed', 'expired') THEN soi.status
                         WHEN %s THEN 'filled'
                         WHEN %s > 0 THEN 'partially_filled'
                         ELSE 'submitted'
@@ -2935,7 +2937,12 @@ class PendingOrderWorker(
                 WHERE po.id = %s
                   AND po.order_intent_id = soi.id
                 """,
-                (bool(final_filled), float(filled or 0.0), int(order_id)),
+                (
+                    bool(preserve_intent_terminal),
+                    bool(final_filled),
+                    float(filled or 0.0),
+                    int(order_id),
+                ),
             )
             db.commit()
             cur.close()
