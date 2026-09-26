@@ -81,9 +81,13 @@ def test_indicator_ai_generation_keeps_candidate_separate_from_saved_code():
     assert 'billing_feature = "ai_copilot_chat" if resolved_interaction_mode == "discussion" else "ai_code_gen"' in source
     assert 'complete_indicator_ai_discussion_turn(' in source
     assert 'complete_indicator_ai_turn(' in source
-    assert 'fit_messages_to_budget(messages, max_tokens=48000)' in source
-    assert 'item.get("message_type") or "") == "discussion"' in source
+    assert 'generate_indicator_code_candidate(' in source
     assert 'yield "data: " + _sse_json({"workspace": workspace_result})' in source
+
+    generation_path = Path(__file__).parents[1] / "app" / "services" / "indicator_ai_generation.py"
+    generation_source = generation_path.read_text(encoding="utf-8")
+    assert 'fit_messages_to_budget(messages, max_tokens=48000)' in generation_source
+    assert 'item.get("message_type") or "") == "discussion"' in generation_source
 
     workspace_path = Path(__file__).parents[1] / "app" / "services" / "indicator_ai_workspace.py"
     workspace_source = workspace_path.read_text(encoding="utf-8")

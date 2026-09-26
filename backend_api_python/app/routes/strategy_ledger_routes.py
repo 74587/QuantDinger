@@ -193,7 +193,7 @@ def get_trades():
         if is_derivatives_market(market_type):
             market_type = "swap"
 
-        if str(st.get("execution_mode") or "signal").strip().lower() == "signal":
+        if str(st.get("execution_mode") or "").strip().lower() == "signal":
             return jsonify({
                 "code": 1,
                 "msg": "success",

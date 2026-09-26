@@ -1444,97 +1444,26 @@ class PendingOrderWorker(
             pass
 
         if mode == "signal":
-            # The virtual ledger rejects live strategies and is idempotent by
-            # pending order id. It never imports or invokes a broker adapter.
-            try:
-                from app.services.virtual_trading import execute_virtual_signal_order
-
-                virtual_fill = execute_virtual_signal_order(order_row, payload)
-            except Exception as exc:
-                self._mark_failed(order_id=order_id, error=f"virtual_fill_failed:{exc}"[:500])
-                logger.exception(
-                    "Virtual fill failed: strategy_id=%s pending_id=%s signal=%s symbol=%s",
-                    strategy_id,
-                    order_id,
-                    signal_type,
-                    symbol,
-                )
-                append_strategy_log(
-                    int(strategy_id or 0),
-                    "error",
-                    "strategyRuntime.virtualFillFailed",
-                )
-                return
-
-            # notification_config is stored in payload_json at enqueue time;
-            # fall back to the strategy record when older queue rows omit it.
-            if (not notification_config) and strategy_id:
-                notification_config = self._load_notification_config(int(strategy_id))
-
-            stake_quote = calc_notional_value(float(price or 0.0), float(amount or 0.0)) or float(amount or 0.0)
-            results = self._notifier.notify_signal(
-                strategy_id=int(strategy_id or 0),
-                strategy_name=str(strategy_name or ""),
-                symbol=str(symbol or ""),
-                signal_type=str(signal_type or ""),
-                price=float(price or 0.0),
-                stake_amount=float(stake_quote),
-                direction=str(direction or "long"),
-                notification_config=notification_config if isinstance(notification_config, dict) else {},
-                extra={
-                    "pending_order_id": order_id,
-                    "mode": mode,
-                    "virtual_order_id": int(virtual_fill.get("virtual_order_id") or 0),
-                    "virtual_fill_price": float(virtual_fill.get("fill_price") or 0.0),
-                },
+            from app.services.pending_orders.signal_execution import (
+                dispatch_virtual_signal_order,
             )
 
-            attempted = list(results.keys())
-            ok_channels = [c for c, r in results.items() if (r or {}).get("ok")]
-            fail_channels = [c for c, r in results.items() if not (r or {}).get("ok")]
-
-            virtual_note = (
-                f"virtual_{virtual_fill.get('status') or 'filled'}="
-                f"{int(virtual_fill.get('virtual_order_id') or 0)}"
+            dispatch_virtual_signal_order(
+                worker=self,
+                order_row=order_row,
+                payload=payload,
+                order_id=order_id,
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                signal_type=signal_type,
+                symbol=symbol,
+                price=price,
+                amount=amount,
+                direction=direction,
+                notification_config=notification_config,
+                append_log=append_strategy_log,
+                logger=logger,
             )
-            if ok_channels:
-                note = f"{virtual_note};notified_ok={','.join(ok_channels)}"
-                if fail_channels:
-                    note += f";fail={','.join(fail_channels)}"
-                self._mark_sent(
-                    order_id=order_id,
-                    note=note[:200],
-                    filled=float(virtual_fill.get("fill_quantity") or 0.0),
-                    avg_price=float(virtual_fill.get("fill_price") or 0.0),
-                    executed_at=int(time.time()),
-                    final_filled=True,
-                )
-                append_strategy_log(
-                    int(strategy_id or 0),
-                    "signal",
-                    "strategyRuntime.virtualFillCompleted",
-                )
-            else:
-                first_err = ""
-                for c in attempted:
-                    err = (results.get(c) or {}).get("error") or ""
-                    if err:
-                        first_err = f"{c}:{err}"
-                        break
-                note = f"{virtual_note};notify_failed={first_err or 'no_channel'}"
-                self._mark_sent(
-                    order_id=order_id,
-                    note=note[:200],
-                    filled=float(virtual_fill.get("fill_quantity") or 0.0),
-                    avg_price=float(virtual_fill.get("fill_price") or 0.0),
-                    executed_at=int(time.time()),
-                    final_filled=True,
-                )
-                append_strategy_log(
-                    int(strategy_id or 0),
-                    "warning",
-                    "strategyRuntime.virtualFillNotificationFailed",
-                )
             return
 
         if mode == "live":
