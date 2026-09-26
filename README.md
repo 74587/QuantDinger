@@ -103,6 +103,20 @@ The project combines:
 It is not a black-box signal service. Strategy code, risk settings, credentials,
 and deployment remain under the operator's control.
 
+### Strategy evolution and signal-only virtual accounts
+
+- **Strategy evolution** searches declared tunable parameters with random,
+  grid, or TPE optimization, using bar-count walk-forward validation and a final
+  blind holdout. Jobs run asynchronously with per-strategy history, automatic
+  pruning, composite scoring, PBO, Deflated Sharpe, block-bootstrap Monte Carlo,
+  and transaction-cost stress tests. Results compare parameter robustness; they
+  do not forecast future returns.
+- **Signal-only virtual accounts** turn notification-mode signals into internal
+  virtual orders, fills, positions, trade records, PnL, and an equity curve. They
+  never connect to a broker or submit live orders. Each fill uses a fixed 0.05%
+  commission on executed notional and 0.05% adverse slippage; leverage is not
+  charged a second time in the commission calculation.
+
 ## What changed in v5
 
 The v5 backend is organized around explicit runtime and operational boundaries:

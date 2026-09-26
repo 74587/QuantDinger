@@ -1357,6 +1357,14 @@ class TradingExecutor:
                 "leverage": leverage,
                 "source": "strategy_v2",
                 **(
+                    {
+                        "commission_rate": float(trading_config.get("commission") or 0.0),
+                        "slippage_rate": float(trading_config.get("slippage") or 0.0),
+                    }
+                    if requested_execution_mode == "signal"
+                    else {}
+                ),
+                **(
                     {"current_equity": strategy_equity}
                     if values.get("strategy_equity") is not None
                     else {}
@@ -1364,11 +1372,7 @@ class TradingExecutor:
             },
         )
         inflight_check = getattr(self.order_gateway, "has_inflight", None)
-        if (
-            request.execution_mode == "live"
-            and callable(inflight_check)
-            and inflight_check(request)
-        ):
+        if callable(inflight_check) and inflight_check(request):
             return False
         if self.runtime_guard and not self.runtime_guard(strategy_id):
             return False
@@ -2107,27 +2111,35 @@ class TradingExecutor:
         current_prices: Optional[Mapping[str, float]] = None,
     ) -> float:
         realized = 0.0
+        strategy = self._load_strategy(strategy_id) or {}
+        is_virtual = str(strategy.get("execution_mode") or "").strip().lower() == "signal"
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
-                cur.execute(
-                    """
-                    SELECT
-                      COALESCE((
-                        SELECT SUM(COALESCE(profit, 0) - COALESCE(commission_quote, commission, 0))
-                        FROM qd_strategy_trades WHERE strategy_id = %s
-                      ), 0)
-                      + COALESCE((
-                        SELECT SUM(COALESCE(amount, 0))
-                        FROM qd_strategy_funding_fees WHERE strategy_id = %s
-                      ), 0)
-                      + COALESCE((
-                        SELECT SUM(COALESCE(amount, 0))
-                        FROM qd_strategy_broker_activities WHERE strategy_id = %s
-                      ), 0) AS realized_pnl
-                    """,
-                    (strategy_id, strategy_id, strategy_id),
-                )
+                if is_virtual:
+                    cur.execute(
+                        "SELECT COALESCE(realized_pnl, 0) AS realized_pnl FROM qd_strategy_virtual_accounts WHERE strategy_id = %s",
+                        (strategy_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT
+                          COALESCE((
+                            SELECT SUM(COALESCE(profit, 0) - COALESCE(commission_quote, commission, 0))
+                            FROM qd_strategy_trades WHERE strategy_id = %s
+                          ), 0)
+                          + COALESCE((
+                            SELECT SUM(COALESCE(amount, 0))
+                            FROM qd_strategy_funding_fees WHERE strategy_id = %s
+                          ), 0)
+                          + COALESCE((
+                            SELECT SUM(COALESCE(amount, 0))
+                            FROM qd_strategy_broker_activities WHERE strategy_id = %s
+                          ), 0) AS realized_pnl
+                        """,
+                        (strategy_id, strategy_id, strategy_id),
+                    )
                 realized = float((cur.fetchone() or {}).get("realized_pnl") or 0)
                 cur.close()
         except Exception as exc:
@@ -2338,6 +2350,11 @@ class TradingExecutor:
             logger.exception("Failed to persist stopped status for strategy %s", strategy_id)
 
     def _get_current_positions(self, strategy_id: int, symbol: str) -> list[dict[str, Any]]:
+        strategy = self._load_strategy(strategy_id) or {}
+        if str(strategy.get("execution_mode") or "").strip().lower() == "signal":
+            from app.services.virtual_trading import list_virtual_positions
+
+            return list_virtual_positions(strategy_id, symbol)
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(

@@ -17,6 +17,12 @@ from app.services.ai_generation_contracts import (
     SCRIPT_STRATEGY_REPAIR_REQUIREMENTS,
 )
 from app.services.ai_copilot_context import fit_messages_to_budget
+from app.services.ai_authoring_intent import resolve_authoring_intent
+from app.services.ai_code_edits import (
+    CODE_EDIT_SYSTEM_SUFFIX,
+    CodeEditError,
+    apply_model_code_edits,
+)
 from app.services.strategy_ai_generation import (
     apply_deterministic_strategy_edit,
     build_strategy_generation_request,
@@ -296,7 +302,7 @@ def generate_strategy():
         asset_type = normalize_asset_type(payload.get("assetType") or payload.get("asset_type"))
         generation_mode = str(payload.get("generationMode") or "authoring").strip().lower()
         context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
-        existing_code = str(payload.get("existingCode") or "").strip()
+        existing_code = str(payload.get("existingCode") or "")
         system_prompt, generation_intent = build_strategy_system_prompt(
             prompt=prompt,
             asset_type=asset_type,
@@ -304,13 +310,18 @@ def generate_strategy():
             generation_mode=generation_mode,
             context=context,
         )
+        use_patch_response = bool(existing_code.strip())
         user_prompt = build_strategy_generation_request(
             prompt=prompt,
             asset_type=asset_type,
             existing_code=existing_code,
             generation_mode=generation_mode,
             context=context,
+            response_mode="patch" if use_patch_response else "full",
         )
+        full_system_prompt = system_prompt
+        if use_patch_response:
+            system_prompt = f"{full_system_prompt}\n\n{CODE_EDIT_SYSTEM_SUFFIX}"
         accepted, message = get_billing_service().check_and_consume(
             user_id=int(g.user_id),
             feature="ai_code_gen",
@@ -324,10 +335,41 @@ def generate_strategy():
                 {"role": "user", "content": user_prompt},
             ],
             model=llm.get_code_generation_model(),
-            temperature=0.4,
-            use_json_mode=False,
+            temperature=0.2 if use_patch_response else 0.4,
+            use_json_mode=use_patch_response,
         )
-        code = _strip_code_fence(str(content or ""))
+        if use_patch_response:
+            try:
+                code, edit_plan = apply_model_code_edits(existing_code, content)
+            except CodeEditError as exc:
+                logger.warning("strategy model patch rejected, retrying full candidate: %s", exc)
+                full_request = build_strategy_generation_request(
+                    prompt=prompt,
+                    asset_type=asset_type,
+                    existing_code=existing_code,
+                    generation_mode=generation_mode,
+                    context=context,
+                    response_mode="full",
+                )
+                fallback = llm.call_llm_api(
+                    messages=[
+                        {"role": "system", "content": full_system_prompt},
+                        {"role": "user", "content": full_request},
+                    ],
+                    model=llm.get_code_generation_model(),
+                    temperature=0.25,
+                    use_json_mode=False,
+                )
+                code = _strip_code_fence(str(fallback or ""))
+                edit_plan = {
+                    "executor": "model_full_fallback",
+                    "operation": "generate_candidate",
+                    "patch_error": str(exc),
+                }
+        else:
+            code = _strip_code_fence(str(content or ""))
+            edit_plan = {"executor": "model", "operation": "generate_candidate"}
+        candidate_before_validation = code
         code, program, behavior_validation = _compile_or_repair_generated_strategy(
             llm,
             user_prompt,
@@ -335,15 +377,22 @@ def generate_strategy():
             asset_type=asset_type,
             generation_mode=generation_mode,
             context=context,
-            system_prompt=system_prompt,
+            system_prompt=full_system_prompt,
             intent=generation_intent,
         )
+        if code != candidate_before_validation and edit_plan.get("executor") == "model_patch":
+            edit_plan = {
+                "executor": "model_patch_repaired",
+                "operation": "generate_candidate",
+                "patch_operation_count": edit_plan.get("operation_count", 0),
+            }
         return _ok({
             "code": code,
             "manifest": program.manifest.metadata(),
             "validation": {
                 "success": True,
                 "behavior": behavior_validation,
+                "edit_plan": edit_plan,
             },
         })
     except Exception as exc:
@@ -519,19 +568,35 @@ def run_strategy_workspace_turn():
         user_id = int(g.user_id)
         asset_type = normalize_asset_type(payload.get("assetType") or payload.get("asset_type"))
         source_id = int(payload.get("sourceId") or payload.get("source_id") or 0)
-        existing_code = str(payload.get("existingCode") or "").strip()
+        existing_code = str(payload.get("existingCode") or "")
         context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
         requested_mode = str(payload.get("interactionMode") or "auto")
-        intent = classify_strategy_ai_intent(prompt, requested_mode)
         generation_mode = str(payload.get("generationMode") or "authoring").strip().lower()
         llm = LLMService()
         if not llm.is_configured():
             return _error("strategyV2.llmNotConfigured")
+        intent_workspace = None
         if source_id:
             # Validate ownership and source visibility before charging. Creating
             # an empty thread is harmless; a failed billing check must not add
             # a dangling user message to the conversation.
-            get_strategy_ai_workspace(user_id, source_id, asset_type)
+            intent_workspace = get_strategy_ai_workspace(user_id, source_id, asset_type)
+        intent_decision = resolve_authoring_intent(
+            prompt=prompt,
+            requested_mode=requested_mode,
+            asset_kind="portfolio_strategy" if asset_type == "portfolio_strategy" else "cta_strategy",
+            existing_code=existing_code,
+            recent_messages=(intent_workspace or {}).get("messages") or [],
+            fallback_classifier=classify_strategy_ai_intent,
+            llm=llm,
+        )
+        intent = str(intent_decision["intent"])
+        logger.info(
+            "strategy authoring intent=%s source=%s confidence=%.2f",
+            intent,
+            intent_decision.get("source"),
+            float(intent_decision.get("confidence") or 0.0),
+        )
         billing_feature = _strategy_ai_billing_feature(intent)
         accepted, message = _consume_strategy_ai_credit(
             user_id,
@@ -615,12 +680,17 @@ def run_strategy_workspace_turn():
             generation_mode=generation_mode,
             context=context,
         )
+        use_patch_response = bool(existing_code.strip())
+        full_system_prompt = system_prompt
+        if use_patch_response:
+            system_prompt = f"{full_system_prompt}\n\n{CODE_EDIT_SYSTEM_SUFFIX}"
         user_prompt = build_strategy_generation_request(
             prompt=prompt,
             asset_type=asset_type,
             existing_code=existing_code,
             generation_mode=generation_mode,
             context=context,
+            response_mode="patch" if use_patch_response else "full",
         )
         messages = [{"role": "system", "content": system_prompt}]
         if workspace:
@@ -634,6 +704,8 @@ def run_strategy_workspace_turn():
             })
             for item in workspace.get("recent_messages") or []:
                 role = str(item.get("role") or "")
+                if role == "assistant" and str(item.get("message_type") or "") == "discussion":
+                    continue
                 content = str(item.get("content") or "").strip()
                 if role in {"user", "assistant"} and content:
                     messages.append({"role": role, "content": content[:2400]})
@@ -652,11 +724,41 @@ def run_strategy_workspace_turn():
             generated = llm.call_llm_api(
                 messages=messages,
                 model=llm.get_code_generation_model(),
-                temperature=0.35,
-                use_json_mode=False,
+                temperature=0.2 if use_patch_response else 0.35,
+                use_json_mode=use_patch_response,
             )
-            candidate_code = _strip_code_fence(str(generated or ""))
-            edit_plan = {"executor": "model", "operation": "generate_candidate"}
+            if use_patch_response:
+                try:
+                    candidate_code, edit_plan = apply_model_code_edits(existing_code, generated)
+                except CodeEditError as exc:
+                    logger.warning("strategy model patch rejected, retrying full candidate: %s", exc)
+                    full_request = build_strategy_generation_request(
+                        prompt=prompt,
+                        asset_type=asset_type,
+                        existing_code=existing_code,
+                        generation_mode=generation_mode,
+                        context=context,
+                        response_mode="full",
+                    )
+                    full_messages = [dict(item) for item in messages]
+                    full_messages[0] = {"role": "system", "content": full_system_prompt}
+                    full_messages[-1] = {"role": "user", "content": full_request}
+                    fallback = llm.call_llm_api(
+                        messages=full_messages,
+                        model=llm.get_code_generation_model(),
+                        temperature=0.25,
+                        use_json_mode=False,
+                    )
+                    candidate_code = _strip_code_fence(str(fallback or ""))
+                    edit_plan = {
+                        "executor": "model_full_fallback",
+                        "operation": "generate_candidate",
+                        "patch_error": str(exc),
+                    }
+            else:
+                candidate_code = _strip_code_fence(str(generated or ""))
+                edit_plan = {"executor": "model", "operation": "generate_candidate"}
+        candidate_before_validation = candidate_code
         candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(
             llm,
             user_prompt,
@@ -664,9 +766,15 @@ def run_strategy_workspace_turn():
             asset_type=asset_type,
             generation_mode=generation_mode,
             context=context,
-            system_prompt=system_prompt,
+            system_prompt=full_system_prompt,
             intent=generation_intent,
         )
+        if candidate_code != candidate_before_validation and edit_plan.get("executor") == "model_patch":
+            edit_plan = {
+                "executor": "model_patch_repaired",
+                "operation": "generate_candidate",
+                "patch_operation_count": edit_plan.get("operation_count", 0),
+            }
         manifest = program.manifest.metadata()
         validation = {
             "success": True,

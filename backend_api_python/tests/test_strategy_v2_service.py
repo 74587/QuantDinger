@@ -559,3 +559,48 @@ def on_rebalance(context, panel):
             factor_id="momentum_20",
             groups=3,
         )
+
+
+def test_factor_research_loads_selected_fundamental_without_strategy_dependency():
+    symbols = ["A", "B", "C", "D", "E", "F"]
+    code = f"""
+def initialize(context):
+    context.set_universe({[f'USStock:{symbol}' for symbol in symbols]!r})
+    context.subscribe(frequency="1d")
+
+def on_rebalance(context, panel):
+    pass
+"""
+    index = pd.date_range("2025-01-01", periods=100, freq="B")
+    calls = []
+
+    def frame_fetcher(_market, symbol, *_args, **_kwargs):
+        offset = symbols.index(symbol)
+        prices = [100 + offset + day * (0.1 + offset * 0.02) for day in range(len(index))]
+        return pd.DataFrame({"open": prices, "close": prices}, index=index)
+
+    def enrich(frames, members):
+        calls.append((list(frames), list(members)))
+        return {
+            key: frame.assign(pe_ratio=10.0 + symbols.index(key.split(":", 1)[1]))
+            for key, frame in frames.items()
+        }
+
+    service = StrategyV2BacktestService(
+        repository=_Repository(),
+        frame_fetcher=frame_fetcher,
+        fundamental_enricher=enrich,
+    )
+    result = service.research_factor(
+        user_id=1,
+        code=code,
+        start_date=datetime(2025, 2, 10),
+        end_date=datetime(2025, 4, 30, 23, 59),
+        factor_id="value",
+        groups=3,
+        holding_period=5,
+    )
+
+    assert calls
+    assert result["factorId"] == "value"
+    assert result["icSeries"]

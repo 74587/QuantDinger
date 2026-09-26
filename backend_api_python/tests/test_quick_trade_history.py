@@ -57,6 +57,59 @@ class _Db:
         return self._cursor
 
 
+class _InsertCursor(_Cursor):
+    def fetchone(self):
+        return {"id": 17}
+
+
+class _WritableDb(_Db):
+    def __init__(self, cursor):
+        super().__init__(cursor)
+        self.committed = False
+
+    def commit(self):
+        self.committed = True
+
+
+def test_record_quick_trade_persists_client_order_id(monkeypatch):
+    cursor = _InsertCursor()
+    database = _WritableDb(cursor)
+
+    @contextmanager
+    def fake_connection():
+        yield database
+
+    monkeypatch.setattr(quick_trade, "get_db_connection", fake_connection)
+
+    trade_id = quick_trade._record_quick_trade(
+        user_id=99,
+        credential_id=305,
+        exchange_id="okx",
+        symbol="BTC/USDT",
+        side="buy",
+        order_type="market",
+        amount=0.01,
+        price=0,
+        leverage=1,
+        market_type="swap",
+        tp_price=0,
+        sl_price=0,
+        status="submitted",
+        exchange_order_id="",
+        filled=0,
+        avg_price=0,
+        error_msg="",
+        source="quick_trade",
+        raw_result={},
+        client_order_id="client-17",
+    )
+
+    assert trade_id == 17
+    assert database.committed is True
+    assert "client_order_id" in cursor.query
+    assert cursor.params[-4] == "client-17"
+
+
 def test_history_filters_by_account_symbol_and_market(monkeypatch):
     cursor = _Cursor()
 

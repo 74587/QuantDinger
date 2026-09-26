@@ -19,6 +19,7 @@ _PREFIX_TAGS: list[tuple[str, str]] = [
     ("/api/users", "Users"),
     ("/api/indicator", "Indicator"),
     ("/api/backtest", "Strategy"),
+    ("/api/strategy-evolution", "Strategy"),
     ("/api/market", "Market"),
     ("/api/universes", "Universe"),
     ("/api/factors", "Factor"),
@@ -61,6 +62,7 @@ def register_human_blueprints(api: Api) -> None:
     from app.routes.user import user_blp
     from app.routes.kline import kline_blp
     from app.routes.backtest_center import backtest_center_blp
+    from app.routes.strategy_evolution import strategy_evolution_blp
     from app.routes.market import market_blp
     from app.routes.universe import universe_blp
     from app.routes.factors import factors_blp
@@ -90,6 +92,7 @@ def register_human_blueprints(api: Api) -> None:
         (user_blp, "/api/users"),
         (kline_blp, "/api/indicator"),
         (backtest_center_blp, "/api/backtest"),
+        (strategy_evolution_blp, "/api/strategy-evolution"),
         (market_blp, "/api/market"),
         (universe_blp, "/api/universes"),
         (factors_blp, "/api/factors"),

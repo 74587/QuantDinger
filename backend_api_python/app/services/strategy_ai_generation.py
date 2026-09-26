@@ -149,7 +149,8 @@ def apply_deterministic_strategy_edit(
                 literals.append(candidate)
                 seen_locations.add(location)
 
-    lines = source.splitlines(keepends=True)
+    original_lines = source.splitlines(keepends=True)
+    lines = list(original_lines)
     replacements: list[tuple[int, int, int, str]] = []
     for node in literals:
         line_index = int(node.lineno) - 1
@@ -158,7 +159,20 @@ def apply_deterministic_strategy_edit(
         replacements.append((line_index, start, end, json.dumps(target)))
     for line_index, start, end, replacement in reversed(replacements):
         lines[line_index] = lines[line_index][:start] + replacement + lines[line_index][end:]
-    return "".join(lines), {
+    edit_operations = []
+    changed_line_indexes = sorted({line_index for line_index, _start, _end, _replacement in replacements})
+    for line_index in changed_line_indexes:
+        old_text = original_lines[line_index]
+        if source.count(old_text) != 1:
+            edit_operations = []
+            break
+        edit_operations.append({
+            "oldText": old_text,
+            "newText": lines[line_index],
+            "startLine": line_index + 1,
+            "endLine": line_index + 1,
+        })
+    edit_plan = {
         "executor": "deterministic",
         "operation": "set_single_timeframe",
         "from": previous,
@@ -167,6 +181,10 @@ def apply_deterministic_strategy_edit(
         "replacement_count": len(replacements),
         "resolved_from": source_request,
     }
+    if edit_operations:
+        edit_plan["operations"] = edit_operations
+        edit_plan["operation_count"] = len(edit_operations)
+    return "".join(lines), edit_plan
 
 
 def select_strategy_system_prompt(asset_type: str, generation_mode: str = "authoring") -> str:
@@ -213,6 +231,7 @@ def build_strategy_generation_request(
     existing_code: str = "",
     generation_mode: str = "authoring",
     context: dict | None = None,
+    response_mode: str = "full",
 ) -> str:
     normalized_type = normalize_asset_type(asset_type)
     mode = str(generation_mode or "authoring").strip().lower()
@@ -251,7 +270,12 @@ def build_strategy_generation_request(
             "# Current Strategy API V2 source (source of truth)",
             str(existing_code).strip(),
             "",
-            "Return one complete replacement candidate. Preserve behavior not explicitly changed by the user.",
+            (
+                "Return minimal exact replacements under the source edit response contract. "
+                "Preserve behavior not explicitly changed by the user."
+                if str(response_mode or "full").strip().lower() == "patch"
+                else "Return one complete replacement candidate. Preserve behavior not explicitly changed by the user."
+            ),
         ])
     else:
         parts.extend(["", "Return one complete new Strategy API V2 candidate."])

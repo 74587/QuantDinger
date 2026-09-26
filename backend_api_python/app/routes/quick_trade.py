@@ -280,8 +280,8 @@ def _record_quick_trade(
                      amount, price, leverage, market_type, tp_price, sl_price,
                      status, exchange_order_id, filled_amount, avg_fill_price,
                      commission, commission_ccy, commission_quote,
-                     error_msg, source, raw_result, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                     client_order_id, error_msg, source, raw_result, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 RETURNING id
                 """,
                 (
@@ -290,7 +290,7 @@ def _record_quick_trade(
                     status, exchange_order_id, filled, avg_price,
                     float(commission or 0.0), str(commission_ccy or "").strip().upper(),
                     float(commission_quote) if commission_quote is not None else None,
-                    error_msg, source, json.dumps(raw_result or {}),
+                    str(client_order_id or "")[:100], error_msg, source, json.dumps(raw_result or {}),
                 ),
             )
             row = cur.fetchone()
