@@ -554,11 +554,15 @@ QuantDinger/
 |   |   |-- openapi/                   OpenAPI schemas, tags, registration, and export support
 |   |   |-- services/                  Domain workflows and third-party integrations
 |   |   |   |-- backtest_engine/       Backtest execution components
+|   |   |   |-- factors/               Point-in-time factor research and diagnostics
+|   |   |   |-- strategy_evolution/    Parameter search, walk-forward validation, and robustness tests
+|   |   |   |-- pending_orders/        Queued order submission, recovery, and reconciliation
 |   |   |   |-- live_trading/          Normalized crypto exchange adapters
 |   |   |   |-- alpaca_trading/        Alpaca broker integration
 |   |   |   |-- ibkr_trading/          Interactive Brokers integration
 |   |   |   |-- strategy_runtime/      Strategy signals, intents, execution, and state
-|   |   |   `-- strategy_v2/           Versioned strategy contracts and runtime services
+|   |   |   |-- strategy_v2/           Versioned strategy contracts and runtime services
+|   |   |   `-- virtual_trading.py     Isolated signal-mode account, positions, and fills
 |   |   |-- data_sources/              Raw market-data source adapters
 |   |   |-- data_providers/            Aggregated market, macro, news, and sentiment providers
 |   |   |-- markets/                   Market and symbol normalization
@@ -577,8 +581,12 @@ QuantDinger/
 |   |-- architecture/                  Boundaries, concurrency, API, and extension design
 |   |-- deployment/                    Installation, production, and observability operations
 |   |-- trading/                       Strategy and indicator development guides
+|   |-- strategies/                    Strategy authoring and validation references
 |   |-- api/                           Human API documentation
-|   `-- agent/                         Agent Gateway and MCP documentation
+|   |-- agent/                         Agent Gateway and MCP documentation
+|   |-- getting-started/               Onboarding and first-run guides
+|   |-- product/                       Product workflows and feature documentation
+|   `-- security/                      Security model and operational guidance
 |-- mcp_server/                        Standalone QuantDinger MCP server package
 |   |-- src/quantdinger_mcp/           MCP server and security implementation
 |   `-- tests/                         MCP contract and security tests
@@ -659,25 +667,6 @@ for high-risk changes.
 
 The [public roadmap](ROADMAP.md) lists active product themes, planning stages,
 and the process for claiming scoped contributor work.
-
-## Exchange partner links
-
-These are referral links. QuantDinger may receive a commission or trading-fee
-rebate when a user registers through one of them. This does not add a separate
-charge to the user; eligibility and terms are controlled by each venue and may
-change. Always verify the destination domain before creating an account.
-
-The same links are available in the application under **Profile → Open account**
-and **Broker Accounts → Open account**.
-
-| Exchange | Signup link |
-| --- | --- |
-| Binance | [Register](https://www.bsmkweb.cc/register?ref=QUANTDINGER) |
-| Bitget | [Register](https://partner.hdmune.cn/bg/7r4xz8kd) |
-| Bybit | [Register](https://partner.bybit.com/b/DINGER) |
-| OKX | [Register](https://www.xqmnobxky.com/join/QUANTDINGER) |
-| Gate.io | [Register](https://www.gateport.business/share/DINGER) |
-| HTX | [Register](https://www.htx.com/invite/zh-cn/1f?invite_code=dinger) |
 
 ## License and commercial terms
 
@@ -774,20 +763,6 @@ QuantDinger's continued development and open-source community are supported by:
 We are grateful to [Atlas Cloud](https://www.atlascloud.ai/?utm_source=github&utm_medium=link&utm_campaign=quantdinger) for supporting AI
 model inference and to [Amazon Web Services](https://aws.amazon.com/) for
 supporting the cloud infrastructure that helps QuantDinger serve its community.
-
-## Support the project
-
-If QuantDinger is useful to you, a GitHub star, contribution, or donation helps
-fund ongoing development and infrastructure.
-
-Crypto donation address:
-
-```text
-0x96fa4962181bea077f8c7240efe46afbe73641a7
-```
-
-Crypto transfers are irreversible. Confirm the address and intended network with
-the project maintainers before sending funds.
 
 ## Acknowledgements
 
