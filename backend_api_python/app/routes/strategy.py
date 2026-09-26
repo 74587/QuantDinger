@@ -27,6 +27,7 @@ from app.services.strategy_ai_generation import (
     apply_deterministic_strategy_edit,
     build_strategy_generation_request,
     build_strategy_system_prompt,
+    resolve_strategy_validation_intent,
     select_strategy_system_prompt,
     validate_generated_strategy,
 )
@@ -370,6 +371,11 @@ def generate_strategy():
             code = _strip_code_fence(str(content or ""))
             edit_plan = {"executor": "model", "operation": "generate_candidate"}
         candidate_before_validation = code
+        validation_intent = resolve_strategy_validation_intent(
+            prompt=prompt,
+            existing_code=existing_code,
+            context=context,
+        )
         code, program, behavior_validation = _compile_or_repair_generated_strategy(
             llm,
             user_prompt,
@@ -378,7 +384,7 @@ def generate_strategy():
             generation_mode=generation_mode,
             context=context,
             system_prompt=full_system_prompt,
-            intent=generation_intent,
+            intent=validation_intent,
         )
         if code != candidate_before_validation and edit_plan.get("executor") == "model_patch":
             edit_plan = {
@@ -759,6 +765,11 @@ def run_strategy_workspace_turn():
                 candidate_code = _strip_code_fence(str(generated or ""))
                 edit_plan = {"executor": "model", "operation": "generate_candidate"}
         candidate_before_validation = candidate_code
+        validation_intent = resolve_strategy_validation_intent(
+            prompt=prompt,
+            existing_code=existing_code,
+            context=context,
+        )
         candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(
             llm,
             user_prompt,
@@ -767,7 +778,7 @@ def run_strategy_workspace_turn():
             generation_mode=generation_mode,
             context=context,
             system_prompt=full_system_prompt,
-            intent=generation_intent,
+            intent=validation_intent,
         )
         if candidate_code != candidate_before_validation and edit_plan.get("executor") == "model_patch":
             edit_plan = {

@@ -36,6 +36,14 @@ _REFERENTIAL_EDIT_RE = re.compile(
     r"(?:我让你|按(?:上面|刚才)|不要(?:再)?.{0,8}解释|直接).{0,24}(?:改|修改|写入|应用|执行)",
     re.IGNORECASE,
 )
+
+_SOURCE_PRESERVATION_CAPABILITIES = {
+    "crypto_swap",
+    "bidirectional",
+    "one_way_reversal",
+    "supertrend",
+    "technical_factors",
+}
 _OTHER_EDIT_RE = re.compile(
     r"(?:止损|止盈|仓位|杠杆|标的|多空|做多|做空|long|short|indicator|指标|信号|参数)",
     re.IGNORECASE,
@@ -185,6 +193,38 @@ def apply_deterministic_strategy_edit(
         edit_plan["operations"] = edit_operations
         edit_plan["operation_count"] = len(edit_operations)
     return "".join(lines), edit_plan
+
+
+def resolve_strategy_validation_intent(
+    *,
+    prompt: str,
+    existing_code: str = "",
+    context: dict | None = None,
+) -> StrategyAIGenerationIntent:
+    """Enforce requested contracts without retroactively blocking unrelated edits."""
+    source_intent = resolve_strategy_generation_intent(
+        prompt=prompt,
+        existing_code=existing_code,
+        context=context,
+    )
+    requested_intent = resolve_strategy_generation_intent(
+        prompt=prompt,
+        context=context,
+    )
+    capabilities = {
+        *requested_intent.capabilities,
+        *(
+            capability
+            for capability in source_intent.capabilities
+            if capability in _SOURCE_PRESERVATION_CAPABILITIES
+        ),
+    }
+    return StrategyAIGenerationIntent(
+        tuple(sorted(capabilities)),
+        source_intent.requested_direction_mode,
+        source_intent.factor_ids,
+        requested_intent.required_factor_ids,
+    )
 
 
 def select_strategy_system_prompt(asset_type: str, generation_mode: str = "authoring") -> str:
